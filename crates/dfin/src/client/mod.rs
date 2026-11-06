@@ -124,10 +124,17 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
         Some(path) => {
             let cfg = RouteConfig::from_toml_file(path)?;
             let stages = cfg.stages();
-            (args.model.clone().unwrap_or(cfg.model), cfg.head, cfg.tail, stages)
+            (
+                args.model.clone().unwrap_or(cfg.model),
+                cfg.head,
+                cfg.tail,
+                stages,
+            )
         }
         None => (
-            args.model.clone().context("--model is required (or use --route)")?,
+            args.model
+                .clone()
+                .context("--model is required (or use --route)")?,
             args.head.context("--head is required (or use --route)")?,
             args.tail.context("--tail is required (or use --route)")?,
             args.stages.clone(),

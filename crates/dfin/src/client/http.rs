@@ -1,7 +1,9 @@
 //! OpenAI-compatible HTTP API (axum). Handlers never call into llama; they
 //! submit jobs to the engine thread and relay its events.
 
-use super::engine::{ApiError, Event, FinishReason, GenParams, Job, PromptInput, StaticInfo, Stats, Usage};
+use super::engine::{
+    ApiError, Event, FinishReason, GenParams, Job, PromptInput, StaticInfo, Stats, Usage,
+};
 use super::sampling::SamplingParams;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -42,7 +44,10 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl IntoResponse for ApiError {
@@ -85,6 +90,10 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
                 "forwards": c.forwards,
                 "avg_rtt_ms": c.rtt_ms_sum / n,
                 "avg_compute_ms": c.compute_ms_sum / n,
+                "decode_forwards": c.decode_forwards,
+                "decode_avg_rtt_ms": c.decode_rtt_ms_sum / c.decode_forwards.max(1) as f64,
+                "decode_avg_compute_ms": c.decode_compute_ms_sum / c.decode_forwards.max(1) as f64,
+                "ping_ms": c.ping_ms,
                 "bytes_sent": c.bytes_sent,
                 "bytes_received": c.bytes_received,
             })
@@ -116,6 +125,11 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
             "requests": s.requests,
             "tokens_generated": s.tokens_generated,
             "avg_token_ms": s.decode_ms_sum / steps,
+            "prefill_count": s.prefill_count,
+            "avg_prefill_ms": s.prefill_ms_sum / s.prefill_count.max(1) as f64,
+            "avg_prefill_tokens": s.prefill_tokens_sum as f64 / s.prefill_count.max(1) as f64,
+            "last_prefill_ms": s.last_prefill_ms,
+            "last_prefill_tokens": s.last_prefill_tokens,
             "p50_token_ms": s.p50_token_ms(),
             "head_ms": s.head_ms_sum / steps,
             "tail_ms": s.tail_ms_sum / steps,
@@ -210,7 +224,8 @@ fn warn_ignored(extra: &Map<String, Value>) {
 }
 
 fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
-    serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))
+    serde_json::from_slice(body)
+        .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))
 }
 
 fn parse_stop(v: &Value) -> Result<Vec<String>, ApiError> {
@@ -220,12 +235,14 @@ fn parse_stop(v: &Value) -> Result<Vec<String>, ApiError> {
         Value::Array(a) => a
             .iter()
             .map(|x| {
-                x.as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| ApiError::bad_request("`stop` must be a string or an array of strings"))
+                x.as_str().map(str::to_string).ok_or_else(|| {
+                    ApiError::bad_request("`stop` must be a string or an array of strings")
+                })
             })
             .collect(),
-        _ => Err(ApiError::bad_request("`stop` must be a string or an array of strings")),
+        _ => Err(ApiError::bad_request(
+            "`stop` must be a string or an array of strings",
+        )),
     }
 }
 
@@ -252,14 +269,19 @@ fn message_content(v: &Value) -> Result<String, ApiError> {
             let mut out = String::new();
             for p in parts {
                 if let Some(t) = p.get("text").and_then(Value::as_str) {
-                    if p.get("type").and_then(Value::as_str).is_none_or(|ty| ty == "text") {
+                    if p.get("type")
+                        .and_then(Value::as_str)
+                        .is_none_or(|ty| ty == "text")
+                    {
                         out.push_str(t);
                     }
                 }
             }
             Ok(out)
         }
-        _ => Err(ApiError::bad_request("message `content` must be a string or an array of parts")),
+        _ => Err(ApiError::bad_request(
+            "message `content` must be a string or an array of parts",
+        )),
     }
 }
 
@@ -280,9 +302,12 @@ async fn completions(State(st): State<AppState>, body: Bytes) -> Response {
     warn_ignored(&req.extra);
     let prompt = match &req.prompt {
         Value::String(s) => s.clone(),
-        Value::Array(a) if a.len() == 1 && a[0].is_string() => a[0].as_str().unwrap_or_default().to_string(),
+        Value::Array(a) if a.len() == 1 && a[0].is_string() => {
+            a[0].as_str().unwrap_or_default().to_string()
+        }
         Value::Array(_) => {
-            return ApiError::bad_request("only a single string prompt is supported").into_response();
+            return ApiError::bad_request("only a single string prompt is supported")
+                .into_response();
         }
         _ => return ApiError::bad_request("`prompt` must be a string").into_response(),
     };
@@ -311,13 +336,21 @@ async fn chat_completions(State(st): State<AppState>, body: Bytes) -> Response {
     run_generation(st, Kind::Chat, PromptInput::Chat(msgs), &req.common).await
 }
 
-async fn run_generation(st: AppState, kind: Kind, prompt: PromptInput, common: &CommonFields) -> Response {
+async fn run_generation(
+    st: AppState,
+    kind: Kind,
+    prompt: PromptInput,
+    common: &CommonFields,
+) -> Response {
     let params = match gen_params(common) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
     let stream = common.stream.unwrap_or(false);
-    let include_usage = common.stream_options.as_ref().is_some_and(|o| o.include_usage);
+    let include_usage = common
+        .stream_options
+        .as_ref()
+        .is_some_and(|o| o.include_usage);
 
     let (tx, mut rx) = mpsc::channel::<Event>(256);
     let job = Job {
@@ -327,8 +360,12 @@ async fn run_generation(st: AppState, kind: Kind, prompt: PromptInput, common: &
     };
     if let Err(e) = st.jobs.try_send(job) {
         return match e {
-            mpsc::error::TrySendError::Full(_) => ApiError::overloaded("request queue full").into_response(),
-            mpsc::error::TrySendError::Closed(_) => ApiError::internal("engine stopped").into_response(),
+            mpsc::error::TrySendError::Full(_) => {
+                ApiError::overloaded("request queue full").into_response()
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                ApiError::internal("engine stopped").into_response()
+            }
         };
     }
     // Wait until the engine accepts (or rejects) the job, so errors keep their status code.
@@ -336,14 +373,21 @@ async fn run_generation(st: AppState, kind: Kind, prompt: PromptInput, common: &
         Some(Event::Started { .. }) => {}
         Some(Event::Error(e)) => return e.into_response(),
         Some(other) => {
-            return ApiError::internal(format!("unexpected first engine event {other:?}")).into_response();
+            return ApiError::internal(format!("unexpected first engine event {other:?}"))
+                .into_response();
         }
         None => return ApiError::internal("engine dropped the request").into_response(),
     }
 
     let (id, object) = match kind {
-        Kind::Completion => (format!("cmpl-{:016x}", rand::random::<u64>()), "text_completion"),
-        Kind::Chat => (format!("chatcmpl-{:016x}", rand::random::<u64>()), "chat.completion"),
+        Kind::Completion => (
+            format!("cmpl-{:016x}", rand::random::<u64>()),
+            "text_completion",
+        ),
+        Kind::Chat => (
+            format!("chatcmpl-{:016x}", rand::random::<u64>()),
+            "chat.completion",
+        ),
     };
     let created = unix_now();
     let model = st.model_name.clone();
@@ -353,9 +397,21 @@ async fn run_generation(st: AppState, kind: Kind, prompt: PromptInput, common: &
         loop {
             match rx.recv().await {
                 Some(Event::Token { text: t, .. }) => text.push_str(&t),
-                Some(Event::Done { finish_reason, usage }) => {
-                    return Json(final_body(kind, &id, object, created, &model, text, finish_reason, usage))
-                        .into_response();
+                Some(Event::Done {
+                    finish_reason,
+                    usage,
+                }) => {
+                    return Json(final_body(
+                        kind,
+                        &id,
+                        object,
+                        created,
+                        &model,
+                        text,
+                        finish_reason,
+                        usage,
+                    ))
+                    .into_response();
                 }
                 Some(Event::Error(e)) => return e.into_response(),
                 Some(Event::Started { .. }) => {}

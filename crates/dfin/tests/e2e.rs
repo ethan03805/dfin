@@ -59,7 +59,8 @@ impl Drop for Procs {
 
 impl Procs {
     fn spawn(&mut self, name: &str, args: &[String]) -> usize {
-        let log = std::env::temp_dir().join(format!("dfin-e2e-{}-{}.log", name, std::process::id()));
+        let log =
+            std::env::temp_dir().join(format!("dfin-e2e-{}-{}.log", name, std::process::id()));
         let file = std::fs::File::create(&log).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_dfin"))
             .args(args)
@@ -105,7 +106,11 @@ impl Procs {
             }
             self.check_alive(i);
             if Instant::now() > deadline {
-                panic!("{} did not listen on {addr}\n{}", self.0[i].name, self.logs());
+                panic!(
+                    "{} did not listen on {addr}\n{}",
+                    self.0[i].name,
+                    self.logs()
+                );
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -203,16 +208,29 @@ async fn exercise(procs: &Procs, base: &str, expected: &str) {
     assert_eq!(v["object"], "text_completion");
     assert!(v["id"].as_str().unwrap().starts_with("cmpl-"));
     let got = v["choices"][0]["text"].as_str().unwrap().to_string();
-    assert_eq!(got, expected, "pipelined text differs from monolithic reference");
+    assert_eq!(
+        got, expected,
+        "pipelined text differs from monolithic reference"
+    );
     let fr = v["choices"][0]["finish_reason"].as_str().unwrap();
     assert!(fr == "length" || fr == "stop", "finish_reason {fr}");
-    assert_eq!(v["usage"]["prompt_tokens"].as_u64().unwrap() + v["usage"]["completion_tokens"].as_u64().unwrap(),
-        v["usage"]["total_tokens"].as_u64().unwrap());
+    assert_eq!(
+        v["usage"]["prompt_tokens"].as_u64().unwrap()
+            + v["usage"]["completion_tokens"].as_u64().unwrap(),
+        v["usage"]["total_tokens"].as_u64().unwrap()
+    );
 
     // (2) The same request again hits the prefix cache.
     let (st, text) = post(&http, format!("{base}/v1/completions"), body.clone()).await;
     assert_eq!(st, 200, "{text}");
-    let status: Value = http.get(format!("{base}/status")).send().await.unwrap().json().await.unwrap();
+    let status: Value = http
+        .get(format!("{base}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(status["prefix_cache"]["hits"], 1, "status: {status:#}");
     assert_eq!(status["model"], MODEL_NAME);
     assert_eq!(status["n_layer"], 8);
@@ -220,7 +238,12 @@ async fn exercise(procs: &Procs, base: &str, expected: &str) {
     // (3) Streaming yields the same text.
     let mut sbody = body.clone();
     sbody["stream"] = json!(true);
-    let r = http.post(format!("{base}/v1/completions")).json(&sbody).send().await.unwrap();
+    let r = http
+        .post(format!("{base}/v1/completions"))
+        .json(&sbody)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status().as_u16(), 200);
     assert!(r
         .headers()
@@ -232,14 +255,18 @@ async fn exercise(procs: &Procs, base: &str, expected: &str) {
     let mut done = false;
     let mut finish = None;
     for line in raw.lines() {
-        let Some(data) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
+        let Some(data) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        else {
             continue;
         };
         if data.trim() == "[DONE]" {
             done = true;
             continue;
         }
-        let c: Value = serde_json::from_str(data).unwrap_or_else(|e| panic!("bad chunk {data:?}: {e}"));
+        let c: Value =
+            serde_json::from_str(data).unwrap_or_else(|e| panic!("bad chunk {data:?}: {e}"));
         assert_eq!(c["object"], "text_completion");
         streamed.push_str(c["choices"][0]["text"].as_str().unwrap_or(""));
         if let Some(f) = c["choices"][0]["finish_reason"].as_str() {
@@ -267,10 +294,21 @@ async fn exercise(procs: &Procs, base: &str, expected: &str) {
     assert!(v["usage"]["completion_tokens"].as_u64().unwrap() <= 4);
 
     // (5) /v1/models lists the model.
-    let models: Value = http.get(format!("{base}/v1/models")).send().await.unwrap().json().await.unwrap();
+    let models: Value = http
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(models["object"], "list");
     assert!(
-        models["data"].as_array().unwrap().iter().any(|m| m["id"] == MODEL_NAME),
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == MODEL_NAME),
         "{models}"
     );
 }
@@ -340,12 +378,20 @@ async fn pipeline_with_two_stages() {
 
     exercise(&procs, &base, &expected).await;
 
-    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    let status: Value = reqwest::get(format!("{base}/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let route = status["route"].as_array().unwrap();
     assert_eq!(route.len(), 4, "{status:#}");
     let stages = status["stats"]["stages"].as_array().unwrap();
     assert_eq!(stages.len(), 2);
-    assert!(stages.iter().all(|s| s["forwards"].as_u64().unwrap() > 0), "{status:#}");
+    assert!(
+        stages.iter().all(|s| s["forwards"].as_u64().unwrap() > 0),
+        "{status:#}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -385,7 +431,12 @@ async fn head_tail_only() {
 
     exercise(&procs, &base, &expected).await;
 
-    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    let status: Value = reqwest::get(format!("{base}/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(status["route"].as_array().unwrap().len(), 2, "{status:#}");
     assert_eq!(status["route"][1]["layers"], "4:8");
 }

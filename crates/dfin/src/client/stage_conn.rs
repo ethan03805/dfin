@@ -5,13 +5,17 @@ use dfin_proto::{Request, Response, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Blocking twin of `dfin_proto::write_frame`. Returns the bytes written.
 pub fn write_frame_blocking<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<usize> {
-    let body = postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let body =
+        postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if body.len() > MAX_FRAME_BYTES as usize {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut frame = Vec::with_capacity(body.len() + 4);
     frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -27,11 +31,15 @@ pub fn read_frame_blocking<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Resul
     r.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len);
     if len > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body)?;
-    let msg = postcard::from_bytes(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let msg =
+        postcard::from_bytes(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok((msg, len as usize + 4))
 }
 
@@ -51,6 +59,12 @@ pub struct StageCounters {
     pub forwards: u64,
     pub rtt_ms_sum: f64,
     pub compute_ms_sum: f64,
+    /// Single-token forwards only (decode steps), so prefill chunks do not skew the averages.
+    pub decode_forwards: u64,
+    pub decode_rtt_ms_sum: f64,
+    pub decode_compute_ms_sum: f64,
+    /// Best of five `Ping` round trips measured right after the handshake, in ms.
+    pub ping_ms: f64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
 }
@@ -95,7 +109,11 @@ impl StageConn {
     /// Open the TCP connection and perform the `Hello` handshake.
     pub fn connect(&mut self, fingerprint: &str, n_embd: u32) -> Result<(), ConnError> {
         self.stream = None;
-        let addrs: Vec<_> = self.addr.to_socket_addrs().map_err(|e| self.io_err(e))?.collect();
+        let addrs: Vec<_> = self
+            .addr
+            .to_socket_addrs()
+            .map_err(|e| self.io_err(e))?
+            .collect();
         let mut last = io::Error::new(io::ErrorKind::NotFound, "address resolved to nothing");
         let mut stream = None;
         for a in addrs {
@@ -131,7 +149,9 @@ impl StageConn {
                 backend,
             } => {
                 if stage_embd != n_embd {
-                    Err(self.proto_err(format!("n_embd mismatch: stage {stage_embd}, client {n_embd}")))
+                    Err(self.proto_err(format!(
+                        "n_embd mismatch: stage {stage_embd}, client {n_embd}"
+                    )))
                 } else if layer_begin != self.layers.begin || layer_end != self.layers.end {
                     Err(self.proto_err(format!(
                         "serves layers {layer_begin}:{layer_end}, route expects {}",
@@ -150,13 +170,34 @@ impl StageConn {
                     Ok(())
                 }
             }
-            Response::Error { code, message } => Err(self.proto_err(format!("hello rejected ({code:?}): {message}"))),
+            Response::Error { code, message } => {
+                Err(self.proto_err(format!("hello rejected ({code:?}): {message}")))
+            }
             other => Err(self.proto_err(format!("unexpected hello reply {other:?}"))),
         };
         if result.is_err() {
             self.stream = None;
+        } else {
+            self.measure_ping();
         }
         result
+    }
+
+    /// Round-trip time of the smallest request (`Ping`), best of five, in ms. This is the
+    /// floor for a decode hop: framing, TCP and the stage's request loop, without compute.
+    fn measure_ping(&mut self) {
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            let t = Instant::now();
+            match self.call(&Request::Ping) {
+                Ok(Response::Pong) => best = best.min(t.elapsed().as_secs_f64() * 1e3),
+                _ => return,
+            }
+        }
+        if best.is_finite() {
+            self.counters.ping_ms = best;
+            tracing::info!(addr = %self.addr, ping_ms = format!("{best:.2}"), "stage ping");
+        }
     }
 
     /// Send one request and read its reply. Any I/O error drops the connection.
@@ -201,7 +242,15 @@ mod tests {
         let mut cur = io::Cursor::new(buf);
         let (back, m): (Request, usize) = read_frame_blocking(&mut cur).unwrap();
         assert_eq!(m, n);
-        assert!(matches!(back, Request::Forward { session: 5, seq: 2, pos0: 3, .. }));
+        assert!(matches!(
+            back,
+            Request::Forward {
+                session: 5,
+                seq: 2,
+                pos0: 3,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

@@ -78,11 +78,18 @@ impl StopMatcher {
         }
         self.pending.push_str(text);
         // Earliest full match of any stop string.
-        let hit = self.stops.iter().filter_map(|s| self.pending.find(s.as_str())).min();
+        let hit = self
+            .stops
+            .iter()
+            .filter_map(|s| self.pending.find(s.as_str()))
+            .min();
         if let Some(i) = hit {
             let emit = self.pending[..i].to_string();
             self.pending.clear();
-            return StopPush { emit, stopped: true };
+            return StopPush {
+                emit,
+                stopped: true,
+            };
         }
         // Hold back the longest suffix that is a proper prefix of some stop string.
         let mut hold = 0usize;
@@ -102,7 +109,10 @@ impl StopMatcher {
         let cut = self.pending.len() - hold;
         let emit = self.pending[..cut].to_string();
         self.pending.drain(..cut);
-        StopPush { emit, stopped: false }
+        StopPush {
+            emit,
+            stopped: false,
+        }
     }
 
     /// Release held-back text at the end of generation.

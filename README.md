@@ -127,6 +127,11 @@ memory: roughly `(RAM in GB - 4) / (model GB / layers)` layers. On Apple Silicon
 `--n-gpu-layers -1` (Metal, unified memory) and no `--cpu-tensors`; on a PC with a small
 GPU and a big MoE model use `--n-gpu-layers -1 --cpu-tensors exps`.
 
+Recommended stage flags on a node that serves one piece: `--mlock` (lock the mapped
+weights at load; the first request is then as fast as later ones, at the cost of a longer
+start) and the default thread count. `--no-mmap` reads the weights into private memory and
+is only safe when the machine has memory to spare beyond the piece.
+
 Then point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. `GET /status`
 shows the route, per-stage round-trip and compute times, and prefix-cache hits.
 
@@ -155,6 +160,17 @@ architectures, and the protocol costs about 0.1 to 0.25 ms per hop on localhost 
 TCP, f16 conversion). It says nothing about real speeds: a 365 GB model on a LAN pod is
 dominated by memory bandwidth and network RTT, which only real hardware can measure.
 
+### Two machines over WiFi
+
+`scripts/lan-pod.sh <model.gguf> <remote host:port> <N> <LAST>` runs the head, a local stage
+and the tail here against a stage already running on another machine for layers `1:N`.
+Results for GLM-4.7-Flash with a MacBook Air (M4, 16 GB, Metal) serving layers 1:21 and this
+PC serving 21:46: 16.2 to 16.8 tok/s decode against 19.8 on one machine, identical text,
+prefill of 281 tokens in 1.6 s with the local stage locked in RAM. The gap is the WiFi round
+trip (23 ms per token on a link with a 3 ms ping floor); the protocol itself costs 0.4 ms per
+hop on loopback. Details in `docs/phase0-findings.md`, log in
+`docs/lan-pod-glm47flash-2026-11-06.log`.
+
 ### Real model on one machine
 
 `scripts/real-model-bench.sh <model.gguf> <split>` runs the same three modes on a real GGUF,
@@ -182,7 +198,8 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [ ] Tool-call parsing in the OpenAI layer (requests with `tools` are accepted, calls are not parsed)
 - [ ] Micro-batching across sessions on a stage
 - [x] Real model on one machine: GLM-4.7-Flash 30B-A3B (deepseek2 arch, MLA + MoE) split into 4 pieces, identical output, 19.5 tok/s in-process versus 19.9 monolithic; see `docs/phase0-findings.md`
-- [ ] Real model across a LAN pod of several machines (GLM-5.3 IQ4_XS is the gate)
+- [x] Real model across two machines (PC plus MacBook Air over WiFi): identical output, 16.8 tok/s against 19.8 single-machine, network-bound as predicted
+- [ ] The Phase 0 gate itself: GLM-5.3 IQ4_XS across a LAN pod of 4 to 8 machines at 3 tok/s or better
 
 ## License
 

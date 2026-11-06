@@ -110,12 +110,18 @@ pub fn plan_split(split: &[i32], n_layer: i32) -> anyhow::Result<SplitPlan> {
     }
     for &s in split {
         if s < 1 || s > n_layer - 1 {
-            bail!("--split boundary {s} is outside 1..={} (model has {n_layer} layers)", n_layer - 1);
+            bail!(
+                "--split boundary {s} is outside 1..={} (model has {n_layer} layers)",
+                n_layer - 1
+            );
         }
     }
     Ok(SplitPlan {
         head: LayerRange::new(0, split[0]),
-        stages: split.windows(2).map(|w| LayerRange::new(w[0], w[1])).collect(),
+        stages: split
+            .windows(2)
+            .map(|w| LayerRange::new(w[0], w[1]))
+            .collect(),
         tail: LayerRange::new(split[split.len() - 1], n_layer),
     })
 }
@@ -221,7 +227,11 @@ fn ensure_port_free(addr: SocketAddr) -> anyhow::Result<()> {
 }
 
 /// Poll until `addr` accepts a TCP connection, failing early if `child` exits.
-async fn wait_for_port(addr: SocketAddr, child: &mut PodChild, timeout: Duration) -> anyhow::Result<()> {
+async fn wait_for_port(
+    addr: SocketAddr,
+    child: &mut PodChild,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     let start = Instant::now();
     loop {
         if let Some(st) = child.child.try_wait()? {
@@ -231,14 +241,20 @@ async fn wait_for_port(addr: SocketAddr, child: &mut PodChild, timeout: Duration
             return Ok(());
         }
         if start.elapsed() > timeout {
-            bail!("{} did not listen on {addr} within {:?}", child.name, timeout);
+            bail!(
+                "{} did not listen on {addr} within {:?}",
+                child.name,
+                timeout
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
 async fn wait_for_health(url: &str, child: &mut PodChild, timeout: Duration) -> anyhow::Result<()> {
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
     let start = Instant::now();
     loop {
         if let Some(st) = child.child.try_wait()? {
@@ -314,7 +330,9 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
         }
         let name = format!("stage {range} @ {addr}");
         info!("starting {name}");
-        let child = cmd.spawn().with_context(|| format!("spawning {}", exe.display()))?;
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("spawning {}", exe.display()))?;
         handle.children.push(PodChild { name, child });
     }
     for (i, addr) in stage_addrs.iter().enumerate() {
@@ -350,7 +368,9 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
         cmd.arg("--threads").arg(t.to_string());
     }
     info!("starting client on {}", opts.listen);
-    let child = cmd.spawn().with_context(|| format!("spawning {}", exe.display()))?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning {}", exe.display()))?;
     handle.children.push(PodChild {
         name: format!("client @ {}", opts.listen),
         child,
@@ -363,7 +383,12 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
     };
     let api_url = format!("http://{}", SocketAddr::new(host, opts.listen.port()));
     let last = handle.children.len() - 1;
-    wait_for_health(&format!("{api_url}/health"), &mut handle.children[last], opts.ready_timeout).await?;
+    wait_for_health(
+        &format!("{api_url}/health"),
+        &mut handle.children[last],
+        opts.ready_timeout,
+    )
+    .await?;
     handle.api_url = api_url;
     Ok(handle)
 }
@@ -371,7 +396,10 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
 pub async fn run(args: PodArgs) -> anyhow::Result<()> {
     let opts = PodOptions::from_args(&args);
     let mut pod = spawn_pod(opts).await?;
-    println!("dfin pod ready: OpenAI-compatible API at {}/v1", pod.api_url);
+    println!(
+        "dfin pod ready: OpenAI-compatible API at {}/v1",
+        pod.api_url
+    );
     println!(
         "  head {} | stages {} | tail {}:end",
         pod.plan.head,

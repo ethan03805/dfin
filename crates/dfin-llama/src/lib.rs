@@ -156,6 +156,9 @@ pub struct ModelParams {
     pub layer_end: i32,
     /// Memory-map the file instead of reading it.
     pub use_mmap: bool,
+    /// Lock the weights in RAM at load (with `use_mmap`, forces every page resident so the
+    /// first request does not pay a page-fault storm). Needs enough free memory.
+    pub use_mlock: bool,
     /// Regex patterns of tensor names to keep in CPU memory even when offloading,
     /// e.g. `"exps"` keeps routed experts in RAM (the `-ot exps=CPU` pattern).
     pub cpu_tensor_patterns: Vec<String>,
@@ -170,6 +173,7 @@ impl Default for ModelParams {
             layer_begin: 0,
             layer_end: -1,
             use_mmap: true,
+            use_mlock: false,
             cpu_tensor_patterns: Vec::new(),
             vocab_only: false,
         }
@@ -237,10 +241,11 @@ impl Model {
         let mut mp = unsafe { sys::llama_model_default_params() };
         mp.n_gpu_layers = params.n_gpu_layers;
         mp.vocab_only = params.vocab_only;
-        mp.load_mode = if params.use_mmap {
-            sys::LLAMA_LOAD_MODE_MMAP
-        } else {
-            sys::LLAMA_LOAD_MODE_NONE
+        mp.load_mode = match (params.use_mmap, params.use_mlock) {
+            (true, true) => sys::LLAMA_LOAD_MODE_MMAP_MLOCK,
+            (true, false) => sys::LLAMA_LOAD_MODE_MMAP,
+            (false, true) => sys::LLAMA_LOAD_MODE_MLOCK,
+            (false, false) => sys::LLAMA_LOAD_MODE_NONE,
         };
         sys::set_layer_range(&mut mp, params.layer_begin, params.layer_end);
 

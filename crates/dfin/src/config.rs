@@ -41,10 +41,15 @@ impl FromStr for LayerRange {
         let (a, b) = s
             .split_once(':')
             .with_context(|| format!("layer range {s:?} must look like `a:b`"))?;
-        let begin: i32 = a.trim().parse().with_context(|| format!("bad layer range start {a:?}"))?;
+        let begin: i32 = a
+            .trim()
+            .parse()
+            .with_context(|| format!("bad layer range start {a:?}"))?;
         let end: i32 = match b.trim() {
             "end" | "" => -1,
-            v => v.parse().with_context(|| format!("bad layer range end {v:?}"))?,
+            v => v
+                .parse()
+                .with_context(|| format!("bad layer range end {v:?}"))?,
         };
         if begin < 0 {
             bail!("layer range start must be >= 0");
@@ -99,8 +104,10 @@ pub struct StageEndpointToml {
 
 impl RouteConfig {
     pub fn from_toml_file(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut cfg: RouteConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut cfg: RouteConfig =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         // Resolve the model path relative to the config file.
         if cfg.model.is_relative() {
             if let Some(dir) = path.parent() {
@@ -147,7 +154,10 @@ impl RouteConfig {
             cursor = s.layers.end;
         }
         if tail.begin != cursor {
-            bail!("tail starts at layer {} but the previous piece ends at {cursor}", tail.begin);
+            bail!(
+                "tail starts at layer {} but the previous piece ends at {cursor}",
+                tail.begin
+            );
         }
         Ok(())
     }
@@ -175,7 +185,10 @@ mod tests {
     #[test]
     fn parse_ranges() {
         assert_eq!("0:3".parse::<LayerRange>().unwrap(), LayerRange::new(0, 3));
-        assert_eq!("5:end".parse::<LayerRange>().unwrap(), LayerRange::new(5, -1));
+        assert_eq!(
+            "5:end".parse::<LayerRange>().unwrap(),
+            LayerRange::new(5, -1)
+        );
         assert!("3:3".parse::<LayerRange>().is_err());
         assert!("x".parse::<LayerRange>().is_err());
     }

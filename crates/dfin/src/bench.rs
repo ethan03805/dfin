@@ -43,6 +43,10 @@ pub struct BenchArgs {
     /// Skip the local-pod mode.
     #[arg(long)]
     pub skip_pod: bool,
+    /// Benchmark an already-running pipeline at this API base URL (e.g. `http://127.0.0.1:8080`)
+    /// instead of spawning a local pod.
+    #[arg(long)]
+    pub api_url: Option<String>,
 }
 
 const SENTENCE: &str =
@@ -59,7 +63,8 @@ struct Row {
 }
 
 fn fmt_opt(v: Option<f64>, prec: usize) -> String {
-    v.map(|x| format!("{x:.prec$}")).unwrap_or_else(|| "-".into())
+    v.map(|x| format!("{x:.prec$}"))
+        .unwrap_or_else(|| "-".into())
 }
 
 fn mean(v: &[f64]) -> Option<f64> {
@@ -136,9 +141,9 @@ fn load(a: &BenchArgs, begin: i32, end: i32) -> anyhow::Result<Arc<Model>> {
         cpu_tensor_patterns: a.cpu_tensors.clone(),
         ..ModelParams::range(begin, end)
     };
-    Ok(Arc::new(
-        Model::load(&a.model, &p).with_context(|| format!("loading layers {begin}:{end}"))?,
-    ))
+    Ok(Arc::new(Model::load(&a.model, &p).with_context(|| {
+        format!("loading layers {begin}:{end}")
+    })?))
 }
 
 /// Mode 1. Returns the row and the generated tokens.
@@ -197,7 +202,11 @@ fn split_step(
     let last = pieces.len() - 1;
     let mut hidden: Vec<f32> = Vec::new();
     for (i, p) in pieces.iter_mut().enumerate() {
-        let out_mode = if i == last { OutputMode::Last } else { OutputMode::All };
+        let out_mode = if i == last {
+            OutputMode::Last
+        } else {
+            OutputMode::All
+        };
         let t = Instant::now();
         if i == 0 {
             p.ctx.decode_tokens(tokens, pos, 0, out_mode)?;
@@ -222,7 +231,12 @@ fn split_step(
 }
 
 /// Mode 2.
-fn bench_split(a: &BenchArgs, plan: &SplitPlan, prompt: &[Token], reference: &[Token]) -> anyhow::Result<Row> {
+fn bench_split(
+    a: &BenchArgs,
+    plan: &SplitPlan,
+    prompt: &[Token],
+    reference: &[Token],
+) -> anyhow::Result<Row> {
     let mut row = Row {
         mode: "2 in-process split".into(),
         ..Row::default()
@@ -259,7 +273,14 @@ fn bench_split(a: &BenchArgs, plan: &SplitPlan, prompt: &[Token], reference: &[T
         p.ctx.clear();
     }
     let t = Instant::now();
-    let mut out = vec![split_step(&mut pieces, prompt, 0, a.act_dtype, false, &mut conv)?];
+    let mut out = vec![split_step(
+        &mut pieces,
+        prompt,
+        0,
+        a.act_dtype,
+        false,
+        &mut conv,
+    )?];
     let prefill = ms(t);
     let mut conv = 0.0;
     let mut steps = Vec::new();
@@ -279,7 +300,8 @@ fn bench_split(a: &BenchArgs, plan: &SplitPlan, prompt: &[Token], reference: &[T
         .map(|p| format!("{} {}", p.name, fmt_opt(mean(&p.steps), 3)))
         .chain(std::iter::once(format!("conv {:.3}", conv / n_steps)))
         .collect();
-    let differ = out.iter().zip(reference).filter(|(x, y)| x != y).count() + out.len().abs_diff(reference.len());
+    let differ = out.iter().zip(reference).filter(|(x, y)| x != y).count()
+        + out.len().abs_diff(reference.len());
     let verdict = if differ == 0 {
         "tokens == mono".to_string()
     } else {
@@ -301,7 +323,11 @@ fn free_local_port() -> anyhow::Result<u16> {
 /// Mode 3. Never fails: problems end up in the notes column.
 async fn bench_pod(a: &BenchArgs, prompt_text: &str, mono_text: &str) -> Row {
     let mut row = Row {
-        mode: "3 local pod (TCP)".into(),
+        mode: if a.api_url.is_some() {
+            "3 remote pipeline".into()
+        } else {
+            "3 local pod (TCP)".into()
+        },
         ..Row::default()
     };
     match bench_pod_inner(a, prompt_text, mono_text, &mut row).await {
@@ -322,26 +348,39 @@ fn get_f64(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(Value::as_f64)
 }
 
-async fn bench_pod_inner(a: &BenchArgs, prompt_text: &str, mono_text: &str, row: &mut Row) -> anyhow::Result<()> {
-    let need = a.prompt_tokens + a.gen_tokens + 64;
-    let n_ctx = (need.div_ceil(256) * 256).max(1024) as u32;
-    let opts = PodOptions {
-        model: a.model.clone(),
-        split: a.split.clone(),
-        listen: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), free_local_port()?),
-        base_port: a.base_port,
-        n_ctx,
-        n_seq_max: 1,
-        n_gpu_layers: a.n_gpu_layers,
-        cpu_tensors: a.cpu_tensors.clone(),
-        threads: a.threads,
-        act_dtype: a.act_dtype,
-        exe: None,
-        log: Some("warn".into()),
-        ready_timeout: Duration::from_secs(120),
+async fn bench_pod_inner(
+    a: &BenchArgs,
+    prompt_text: &str,
+    mono_text: &str,
+    row: &mut Row,
+) -> anyhow::Result<()> {
+    let (_pod, api_url) = if let Some(url) = &a.api_url {
+        (None, url.trim_end_matches('/').to_string())
+    } else {
+        let need = a.prompt_tokens + a.gen_tokens + 64;
+        let n_ctx = (need.div_ceil(256) * 256).max(1024) as u32;
+        let opts = PodOptions {
+            model: a.model.clone(),
+            split: a.split.clone(),
+            listen: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), free_local_port()?),
+            base_port: a.base_port,
+            n_ctx,
+            n_seq_max: 1,
+            n_gpu_layers: a.n_gpu_layers,
+            cpu_tensors: a.cpu_tensors.clone(),
+            threads: a.threads,
+            act_dtype: a.act_dtype,
+            exe: None,
+            log: Some("warn".into()),
+            ready_timeout: Duration::from_secs(120),
+        };
+        let pod = pod::spawn_pod(opts).await.context("starting pod")?;
+        let url = pod.api_url.clone();
+        (Some(pod), url)
     };
-    let pod = pod::spawn_pod(opts).await.context("starting pod")?;
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(600)).build()?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()?;
     let body = serde_json::json!({
         "model": "bench",
         "prompt": prompt_text,
@@ -351,7 +390,7 @@ async fn bench_pod_inner(a: &BenchArgs, prompt_text: &str, mono_text: &str, row:
     });
     let t = Instant::now();
     let resp = http
-        .post(format!("{}/v1/completions", pod.api_url))
+        .post(format!("{}/v1/completions", api_url))
         .json(&body)
         .send()
         .await
@@ -360,7 +399,10 @@ async fn bench_pod_inner(a: &BenchArgs, prompt_text: &str, mono_text: &str, row:
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
-        anyhow::bail!("HTTP {status}: {}", text.chars().take(300).collect::<String>());
+        anyhow::bail!(
+            "HTTP {status}: {}",
+            text.chars().take(300).collect::<String>()
+        );
     }
     let v: Value = serde_json::from_str(&text).context("parsing completion response")?;
     let n = v["usage"]["completion_tokens"].as_u64().unwrap_or(0);
@@ -370,7 +412,7 @@ async fn bench_pod_inner(a: &BenchArgs, prompt_text: &str, mono_text: &str, row:
         notes.push("text == mono prefix".into());
     }
 
-    match http.get(format!("{}/status", pod.api_url)).send().await {
+    match http.get(format!("{}/status", api_url)).send().await {
         Ok(r) if r.status().is_success() => {
             let s: Value = r.json().await.unwrap_or(Value::Null);
             let stats = &s["stats"];
@@ -386,7 +428,20 @@ async fn bench_pod_inner(a: &BenchArgs, prompt_text: &str, mono_text: &str, row:
                 let rtt = get_f64(st, "avg_rtt_ms");
                 let comp = get_f64(st, "avg_compute_ms");
                 if rtt.is_some() || comp.is_some() {
-                    notes.push(format!("stage{i} rtt {} compute {}", fmt_opt(rtt, 3), fmt_opt(comp, 3)));
+                    notes.push(format!(
+                        "stage{i} rtt {} compute {}",
+                        fmt_opt(rtt, 3),
+                        fmt_opt(comp, 3)
+                    ));
+                }
+                let drtt = get_f64(st, "decode_avg_rtt_ms");
+                if drtt.is_some() {
+                    notes.push(format!(
+                        "stage{i} decode-only rtt {} compute {} ping {}",
+                        fmt_opt(drtt, 3),
+                        fmt_opt(get_f64(st, "decode_avg_compute_ms"), 3),
+                        fmt_opt(get_f64(st, "ping_ms"), 2)
+                    ));
                 }
             }
             if let Some(x) = get_f64(stats, "tail_ms") {
@@ -407,12 +462,21 @@ async fn bench_pod_inner(a: &BenchArgs, prompt_text: &str, mono_text: &str, row:
     }
     row.tok_s = row.mean_ms.map(|x| 1000.0 / x);
     row.notes = notes.join("; ");
-    pod.shutdown().await;
+    if let Some(pod) = _pod {
+        pod.shutdown().await;
+    }
     Ok(())
 }
 
 fn print_table(rows: &[Row]) {
-    let header = ["mode", "prefill ms", "ms/tok mean", "ms/tok p50", "tok/s", "notes"];
+    let header = [
+        "mode",
+        "prefill ms",
+        "ms/tok mean",
+        "ms/tok p50",
+        "tok/s",
+        "notes",
+    ];
     let cells: Vec<[String; 6]> = rows
         .iter()
         .map(|r| {
@@ -487,35 +551,39 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     );
 
     let a = args.clone();
-    let (rows, prompt_text, mono_text) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let n_layer = pod::model_n_layer(&a.model)?;
-        let plan = pod::plan_split(&a.split, n_layer)?;
-        let vocab_model = Model::load(
-            &a.model,
-            &ModelParams {
-                vocab_only: true,
-                ..ModelParams::default()
-            },
-        )?;
-        let (prompt, prompt_text) = build_prompt(&vocab_model, a.prompt_tokens)?;
-        println!(
-            "model: {} layers | plan: head {} | stages {:?} | tail {}:end | prompt {} tok",
-            n_layer,
-            plan.head,
-            plan.stages.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
-            plan.tail.begin,
-            prompt.len()
-        );
-        let (mono, mono_tokens) = bench_mono(&a, &prompt)?;
-        let mono_text = vocab_model.vocab().detokenize(&mono_tokens, false, false);
-        let split = bench_split(&a, &plan, &prompt, &mono_tokens).unwrap_or_else(|e| Row {
-            mode: "2 in-process split".into(),
-            notes: format!("error: {e:#}"),
-            ..Row::default()
-        });
-        Ok((vec![mono, split], prompt_text, mono_text))
-    })
-    .await??;
+    let (rows, prompt_text, mono_text) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let n_layer = pod::model_n_layer(&a.model)?;
+            let plan = pod::plan_split(&a.split, n_layer)?;
+            let vocab_model = Model::load(
+                &a.model,
+                &ModelParams {
+                    vocab_only: true,
+                    ..ModelParams::default()
+                },
+            )?;
+            let (prompt, prompt_text) = build_prompt(&vocab_model, a.prompt_tokens)?;
+            println!(
+                "model: {} layers | plan: head {} | stages {:?} | tail {}:end | prompt {} tok",
+                n_layer,
+                plan.head,
+                plan.stages
+                    .iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>(),
+                plan.tail.begin,
+                prompt.len()
+            );
+            let (mono, mono_tokens) = bench_mono(&a, &prompt)?;
+            let mono_text = vocab_model.vocab().detokenize(&mono_tokens, false, false);
+            let split = bench_split(&a, &plan, &prompt, &mono_tokens).unwrap_or_else(|e| Row {
+                mode: "2 in-process split".into(),
+                notes: format!("error: {e:#}"),
+                ..Row::default()
+            });
+            Ok((vec![mono, split], prompt_text, mono_text))
+        })
+        .await??;
     let mut rows = rows;
 
     if args.skip_pod {

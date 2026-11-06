@@ -1,0 +1,118 @@
+### remote stage reachability
+Approximate round trip times in milli-seconds:
+    Minimum = 4ms, Maximum = 105ms, Average = 54ms
+### local stage 21:46
+local stage up after 2s
+### client: head 0:1 -> 10.0.0.38:7001=1:21 -> 127.0.0.1:7002=21:46 -> tail 46:end
+client up after 2s
+2026-11-06T06:19:15.336940Z  INFO dfin::client::stage_conn: connected to stage addr=10.0.0.38:7001 layers=1:21 n_ctx=4096 n_seq_max=2 backend=MTL0 (Apple M4), BLAS, CPU
+2026-11-06T06:19:15.353960Z  INFO dfin::client::stage_conn: stage ping addr=10.0.0.38:7001 ping_ms="3.19"
+2026-11-06T06:19:15.354444Z  INFO dfin::client::stage_conn: connected to stage addr=127.0.0.1:7002 layers=21:46 n_ctx=4096 n_seq_max=2 backend=Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) 
+2026-11-06T06:19:15.354871Z  INFO dfin::client::stage_conn: stage ping addr=127.0.0.1:7002 ping_ms="0.02"
+2026-11-06T06:19:15.355635Z  INFO dfin::client: engine ready model=zai-org_GLM-4.7-Flash-Q4_K_M route=0:1 -> 1:21 -> 21:46 -> 46:47
+### bench: local monolithic, local in-process split, remote pipeline
+layer-range patch: true | split [1, 21, 46] | act dtype f16 | n_gpu_layers -1
+model: 47 layers | plan: head 0:1 | stages ["1:21", "21:46"] | tail 46:end | prompt 256 tok
+| mode               | prefill ms | ms/tok mean | ms/tok p50 | tok/s | notes
+| 1 monolithic       |    1598.76 |      50.492 |     48.991 |  19.8 | 256 prompt tok, 64 generated
+| 2 in-process split |    1542.88 |      48.560 |     47.612 |  20.6 | tokens == mono; ms/tok: head 0:1 0.197, mid 1:21 20.108, mid 21:46 25.420, tail 46:end 1.403, conv 0.672
+| 3 remote pipeline  |          - |      61.641 |          - |  16.2 | request 8146.7 ms, 64 completion tok; text == mono prefix; head 0.539; stage0 rtt 49.019 compute 14.996; stage0 decode-only rtt 31.076 compute 6.512 ping 3.19; stage1 rtt 74.601 compute 74.193; stage1 decode-only rtt 27.603 compute 27.261 ping 0.02; tail 2.296
+### a longer generation through the LAN pipeline (128 tokens)
+{"completion_tokens": 128, "prompt_tokens": 7, "total_tokens": 135}
+ with the overthrow of the monarchy, traditionally dated to 509 BC, and ends in 27 BC with the establishment of the Roman Empire. The term "Roman Republic" refers to the period of time when the Roman state was a democratic republic, with the government being a mix of aristocratic and democratic elements. The Roman Republic was characterized by a complex system of checks and balances, including the
+### chat, two turns
+1.  **Analyze the Request:**
+    *   **Topic:** Network latency as the main cost when a model is split across homes (distributed inference).
+    *   **Constraint:** Exactly two sentences.
+
+2.  **Identify Key Concepts:**
+    *   *Splitting the model:* Requires communication between devices/nodes.
+    *   *Latency:* The time it takes for data to travel.
+    *   *Cost:* Time, money, inefficiency.
+    *   *Why it's the main cost:* Communication overhead dominates the total runtime compared to computation.
+
+3
+{"completion_tokens": 120, "prompt_tokens": 27, "total_tokens": 147}
+It predicts the next token(s) early, allowing the main model to skip validation and generate faster.
+{"completion_tokens": 20, "prompt_tokens": 52, "total_tokens": 72}
+### /status
+{"hits": 2, "misses": 2, "tokens_reused": 28}
+{"avg_token_ms": 58.759485106382996, "head_ms": 0.6629686930091184, "p50_token_ms": 54.1708, "requests": 4, "tail_ms": 2.3045063829787273, "tokens_generated": 332}
+{"addr": "10.0.0.38:7001", "avg_compute_ms": 6.7574204809672835, "avg_rtt_ms": 33.02760060060059, "bytes_received": 2642401, "bytes_sent": 2641681, "decode_avg_compute_ms": 3.7273623093645623, "decode_avg_rtt_ms": 27.010844376899705, "decode_forwards": 329, "forwards": 333, "layers": "1:21", "ping_ms": 3.1881}
+{"addr": "127.0.0.1:7002", "avg_compute_ms": 39.87452149605966, "avg_rtt_ms": 40.22852252252248, "bytes_received": 2642447, "bytes_sent": 2641682, "decode_avg_compute_ms": 28.31837177566482, "decode_avg_rtt_ms": 28.654865045592683, "decode_forwards": 329, "forwards": 333, "layers": "21:46", "ping_ms": 0.0161}
+### local processes stopped; remote stage left running
+### remote stage reachability
+Approximate round trip times in milli-seconds:
+    Minimum = 3ms, Maximum = 109ms, Average = 49ms
+### local stage 21:46
+local stage up after 2s
+### client: head 0:1 -> 10.0.0.38:7001=1:21 -> 127.0.0.1:7002=21:46 -> tail 46:end
+client up after 2s
+2026-11-06T06:22:44.540795Z  INFO dfin::client::stage_conn: connected to stage addr=10.0.0.38:7001 layers=1:21 n_ctx=4096 n_seq_max=2 backend=MTL0 (Apple M4), BLAS, CPU
+2026-11-06T06:22:44.558349Z  INFO dfin::client::stage_conn: stage ping addr=10.0.0.38:7001 ping_ms="3.10"
+2026-11-06T06:22:44.558881Z  INFO dfin::client::stage_conn: connected to stage addr=127.0.0.1:7002 layers=21:46 n_ctx=4096 n_seq_max=2 backend=Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) 
+2026-11-06T06:22:44.559349Z  INFO dfin::client::stage_conn: stage ping addr=127.0.0.1:7002 ping_ms="0.02"
+2026-11-06T06:22:44.559727Z  INFO dfin::client: engine ready model=zai-org_GLM-4.7-Flash-Q4_K_M route=0:1 -> 1:21 -> 21:46 -> 46:47
+### QUICK: one 256-token completion through the LAN pipeline
+{"completion_tokens": 32, "prompt_tokens": 281, "total_tokens": 313}
+{"avg_prefill_ms": 4238.6233, "avg_prefill_tokens": 281.0, "avg_token_ms": 61.95814838709676, "head_ms": 0.6890096774193549, "last_prefill_ms": 4238.6233, "last_prefill_tokens": 281, "p50_token_ms": 53.5833, "prefill_count": 1, "requests": 1, "tail_ms": 2.18398064516129, "tokens_generated": 32}
+{"addr": "10.0.0.38:7001", "avg_compute_ms": 3.47408464550972, "avg_rtt_ms": 48.80825000000001, "bytes_received": 1278818, "bytes_sent": 1278787, "decode_avg_compute_ms": 3.2203038123346146, "decode_avg_rtt_ms": 31.148587096774193, "decode_forwards": 31, "forwards": 32, "layers": "1:21", "ping_ms": 3.098}
+{"addr": "127.0.0.1:7002", "avg_compute_ms": 122.91339844465256, "avg_rtt_ms": 123.41947812499998, "bytes_received": 1278863, "bytes_sent": 1278787, "decode_avg_compute_ms": 27.481515884399414, "decode_avg_rtt_ms": 27.812661290322577, "decode_forwards": 31, "forwards": 32, "layers": "21:46", "ping_ms": 0.0195}
+### done (quick)
+### LAN quick run, local stage with --mlock (Mac stage warm)
+### remote stage reachability
+Approximate round trip times in milli-seconds:
+    Minimum = 4ms, Maximum = 92ms, Average = 48ms
+### local stage 21:46
+local stage up after 1s
+### client: head 0:1 -> 10.0.0.38:7001=1:21 -> 127.0.0.1:7002=21:46 -> tail 46:end
+client up after 2s
+2026-11-06T06:33:53.626576Z  INFO dfin::client::stage_conn: connected to stage addr=10.0.0.38:7001 layers=1:21 n_ctx=4096 n_seq_max=2 backend=MTL0 (Apple M4), BLAS, CPU
+2026-11-06T06:33:53.642477Z  INFO dfin::client::stage_conn: stage ping addr=10.0.0.38:7001 ping_ms="2.68"
+2026-11-06T06:33:53.642950Z  INFO dfin::client::stage_conn: connected to stage addr=127.0.0.1:7002 layers=21:46 n_ctx=4096 n_seq_max=2 backend=Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) 
+2026-11-06T06:33:53.643142Z  INFO dfin::client::stage_conn: stage ping addr=127.0.0.1:7002 ping_ms="0.02"
+2026-11-06T06:33:53.643196Z  INFO dfin::client: engine ready model=zai-org_GLM-4.7-Flash-Q4_K_M route=0:1 -> 1:21 -> 21:46 -> 46:47
+### QUICK: one 256-token completion through the LAN pipeline
+{"completion_tokens": 32, "prompt_tokens": 281, "total_tokens": 313}
+{"avg_prefill_ms": 3794.9072, "avg_prefill_tokens": 281.0, "avg_token_ms": 57.146835483870966, "head_ms": 0.6384709677419355, "last_prefill_ms": 3794.9072, "last_prefill_tokens": 281, "p50_token_ms": 54.7707, "prefill_count": 1, "requests": 1, "tail_ms": 2.265432258064516, "tokens_generated": 32}
+{"addr": "10.0.0.38:7001", "avg_compute_ms": 3.4841249361634254, "avg_rtt_ms": 56.68037499999999, "bytes_received": 1278850, "bytes_sent": 1278819, "decode_avg_compute_ms": 3.1354515398702314, "decode_avg_rtt_ms": 25.660490322580646, "decode_forwards": 31, "forwards": 32, "layers": "1:21", "ping_ms": 2.6755}
+{"addr": "127.0.0.1:7002", "avg_compute_ms": 112.43389493227005, "avg_rtt_ms": 112.78028437499997, "bytes_received": 1278895, "bytes_sent": 1278819, "decode_avg_compute_ms": 28.302919264762632, "decode_avg_rtt_ms": 28.457070967741938, "decode_forwards": 31, "forwards": 32, "layers": "21:46", "ping_ms": 0.0193}
+### done (quick)
+### LAN quick run 2, local stage with --mlock (Mac stage warm)
+### remote stage reachability
+Approximate round trip times in milli-seconds:
+    Minimum = 3ms, Maximum = 104ms, Average = 43ms
+### local stage 21:46
+local stage up after 2s
+### client: head 0:1 -> 10.0.0.38:7001=1:21 -> 127.0.0.1:7002=21:46 -> tail 46:end
+client up after 2s
+2026-11-06T06:34:49.128569Z  INFO dfin::client::stage_conn: connected to stage addr=10.0.0.38:7001 layers=1:21 n_ctx=4096 n_seq_max=2 backend=MTL0 (Apple M4), BLAS, CPU
+2026-11-06T06:34:49.148112Z  INFO dfin::client::stage_conn: stage ping addr=10.0.0.38:7001 ping_ms="3.63"
+2026-11-06T06:34:49.148928Z  INFO dfin::client::stage_conn: connected to stage addr=127.0.0.1:7002 layers=21:46 n_ctx=4096 n_seq_max=2 backend=Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) 
+2026-11-06T06:34:49.149387Z  INFO dfin::client::stage_conn: stage ping addr=127.0.0.1:7002 ping_ms="0.02"
+2026-11-06T06:34:49.149963Z  INFO dfin::client: engine ready model=zai-org_GLM-4.7-Flash-Q4_K_M route=0:1 -> 1:21 -> 21:46 -> 46:47
+### QUICK: one 256-token completion through the LAN pipeline
+{"completion_tokens": 32, "prompt_tokens": 281, "total_tokens": 313}
+{"avg_prefill_ms": 3411.535, "avg_prefill_tokens": 281.0, "avg_token_ms": 58.65300645161292, "head_ms": 0.6884516129032259, "last_prefill_ms": 3411.535, "last_prefill_tokens": 281, "p50_token_ms": 55.5751, "prefill_count": 1, "requests": 1, "tail_ms": 2.375016129032258, "tokens_generated": 32}
+{"addr": "10.0.0.38:7001", "avg_compute_ms": 3.3776197507977486, "avg_rtt_ms": 44.679640625, "bytes_received": 1278818, "bytes_sent": 1278787, "decode_avg_compute_ms": 3.1652889328618206, "decode_avg_rtt_ms": 25.49636129032258, "decode_forwards": 31, "forwards": 32, "layers": "1:21", "ping_ms": 3.6278}
+{"addr": "127.0.0.1:7002", "avg_compute_ms": 112.9227294921875, "avg_rtt_ms": 113.23244375000004, "bytes_received": 1278863, "bytes_sent": 1278787, "decode_avg_compute_ms": 29.797906691028224, "decode_avg_rtt_ms": 29.962238709677415, "decode_forwards": 31, "forwards": 32, "layers": "21:46", "ping_ms": 0.0201}
+### done (quick)
+### LAN quick run 3, local stage with --mlock (Mac stage warm)
+### remote stage reachability
+Approximate round trip times in milli-seconds:
+    Minimum = 2ms, Maximum = 114ms, Average = 26ms
+### local stage 21:46
+local stage up after 6s
+### client: head 0:1 -> 10.0.0.38:7001=1:21 -> 127.0.0.1:7002=21:46 -> tail 46:end
+client up after 2s
+2026-11-06T06:35:48.110731Z  INFO dfin::client::stage_conn: connected to stage addr=10.0.0.38:7001 layers=1:21 n_ctx=4096 n_seq_max=2 backend=MTL0 (Apple M4), BLAS, CPU
+2026-11-06T06:35:48.128803Z  INFO dfin::client::stage_conn: stage ping addr=10.0.0.38:7001 ping_ms="3.10"
+2026-11-06T06:35:48.129995Z  INFO dfin::client::stage_conn: connected to stage addr=127.0.0.1:7002 layers=21:46 n_ctx=4096 n_seq_max=2 backend=Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) 
+2026-11-06T06:35:48.130260Z  INFO dfin::client::stage_conn: stage ping addr=127.0.0.1:7002 ping_ms="0.03"
+2026-11-06T06:35:48.130730Z  INFO dfin::client: engine ready model=zai-org_GLM-4.7-Flash-Q4_K_M route=0:1 -> 1:21 -> 21:46 -> 46:47
+### QUICK: one 256-token completion through the LAN pipeline
+{"completion_tokens": 32, "prompt_tokens": 281, "total_tokens": 313}
+{"avg_prefill_ms": 1585.3343, "avg_prefill_tokens": 281.0, "avg_token_ms": 59.38957741935484, "head_ms": 0.6998935483870968, "last_prefill_ms": 1585.3343, "last_prefill_tokens": 281, "p50_token_ms": 54.7941, "prefill_count": 1, "requests": 1, "tail_ms": 2.648083870967742, "tokens_generated": 32}
+{"addr": "10.0.0.38:7001", "avg_compute_ms": 3.4069712832570076, "avg_rtt_ms": 46.684365625, "bytes_received": 1278818, "bytes_sent": 1278787, "decode_avg_compute_ms": 3.1832741229764876, "decode_avg_rtt_ms": 28.09387741935484, "decode_forwards": 31, "forwards": 32, "layers": "1:21", "ping_ms": 3.0957}
+{"addr": "127.0.0.1:7002", "avg_compute_ms": 54.80026054382324, "avg_rtt_ms": 55.169159374999985, "bytes_received": 1278863, "bytes_sent": 1278787, "decode_avg_compute_ms": 27.66253858996976, "decode_avg_rtt_ms": 27.819067741935484, "decode_forwards": 31, "forwards": 32, "layers": "21:46", "ping_ms": 0.025400000000000002}
+### done (quick)

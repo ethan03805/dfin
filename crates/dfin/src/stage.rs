@@ -12,7 +12,9 @@ use crate::config::LayerRange;
 use anyhow::{bail, Context as _};
 use clap::{Args, ValueEnum};
 use dfin_llama::{Context, ContextParams, FlashAttn, KvType, Model, ModelParams};
-use dfin_proto::{read_frame, write_frame, ActDtype, ErrorCode, Request, Response, PROTOCOL_VERSION};
+use dfin_proto::{
+    read_frame, write_frame, ActDtype, ErrorCode, Request, Response, PROTOCOL_VERSION,
+};
 use engine::{Engine, Job};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,6 +78,15 @@ pub struct StageArgs {
     /// Regex of tensor names to keep in system RAM (e.g. `exps`). Repeatable.
     #[arg(long = "cpu-tensors")]
     pub cpu_tensors: Vec<String>,
+    /// Read the weights into memory at load instead of memory-mapping the file. Slower
+    /// start, but no first-request page-fault storm; recommended for a node that runs a
+    /// single piece (llama.cpp's own advice when experts live on the CPU).
+    #[arg(long)]
+    pub no_mmap: bool,
+    /// Lock the mapped weights in RAM at load so the first request is not slowed by page
+    /// faults. Needs free memory for the whole piece.
+    #[arg(long)]
+    pub mlock: bool,
     /// Max tokens per forward request.
     #[arg(long, default_value_t = 2048)]
     pub n_batch: u32,
@@ -152,6 +163,8 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         layer_begin: args.layers.begin,
         layer_end: args.layers.end,
         cpu_tensor_patterns: args.cpu_tensors.clone(),
+        use_mmap: !args.no_mmap,
+        use_mlock: args.mlock,
         ..ModelParams::default()
     };
     log_devices();
@@ -222,13 +235,17 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         backend: backend_summary(args.n_gpu_layers),
     });
 
-    let (jobs, _engine_thread) = Engine::new(ctx, args.act_dtype, args.n_batch as usize).spawn(256)?;
+    let (jobs, _engine_thread) =
+        Engine::new(ctx, args.act_dtype, args.n_batch as usize).spawn(256)?;
 
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
     let addr = listener.local_addr()?;
-    info!("stage ready: layers {}:{} on {} ({})", layer_begin, layer_end, addr, info.backend);
+    info!(
+        "stage ready: layers {}:{} on {} ({})",
+        layer_begin, layer_end, addr, info.backend
+    );
 
     let next_conn = AtomicU64::new(1);
     let accept_loop = async {
@@ -371,16 +388,26 @@ async fn handle_conn(
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     let _ = ptx
-                        .send(Pending::Ready(error(ErrorCode::BadRequest, format!("bad frame: {e}"))))
+                        .send(Pending::Ready(error(
+                            ErrorCode::BadRequest,
+                            format!("bad frame: {e}"),
+                        )))
                         .await;
                     return Err(anyhow::Error::new(e).context("bad frame"));
                 }
                 Err(e) => return Err(e.into()),
             };
             let pending = match req {
-                Request::Hello { .. } => Pending::Ready(error(ErrorCode::BadRequest, "duplicate Hello")),
+                Request::Hello { .. } => {
+                    Pending::Ready(error(ErrorCode::BadRequest, "duplicate Hello"))
+                }
                 Request::Ping => Pending::Ready(Response::Pong),
-                Request::Forward { session, seq, pos0, act } => {
+                Request::Forward {
+                    session,
+                    seq,
+                    pos0,
+                    act,
+                } => {
                     let (reply, rx) = oneshot::channel();
                     jobs.send(Job::Forward {
                         conn,
@@ -409,9 +436,13 @@ async fn handle_conn(
                 }
                 Request::SessionClose { session } => {
                     let (reply, rx) = oneshot::channel();
-                    jobs.send(Job::Close { conn, session, reply })
-                        .await
-                        .map_err(|_| anyhow::anyhow!("engine stopped"))?;
+                    jobs.send(Job::Close {
+                        conn,
+                        session,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("engine stopped"))?;
                     Pending::Wait(rx)
                 }
             };
@@ -431,7 +462,9 @@ async fn handle_conn(
     if let Err(e) = write_result {
         if !matches!(
             e.kind(),
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
         ) {
             return Err(e.into());
         }

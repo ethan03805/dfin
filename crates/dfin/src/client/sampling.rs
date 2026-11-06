@@ -87,7 +87,9 @@ impl Sampler {
         if cand.is_empty() {
             return argmax(logits);
         }
-        let by_desc = |a: &(usize, f32), b: &(usize, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+        let by_desc = |a: &(usize, f32), b: &(usize, f32)| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
         if p.top_k > 0 && (p.top_k as usize) < cand.len() {
             let k = p.top_k as usize;
             cand.select_nth_unstable_by(k - 1, by_desc);
@@ -112,7 +114,11 @@ impl Sampler {
             }
             if p.min_p > 0.0 {
                 let threshold = probs[0] * p.min_p;
-                let n = probs.iter().take_while(|&&pr| pr >= threshold).count().max(1);
+                let n = probs
+                    .iter()
+                    .take_while(|&&pr| pr >= threshold)
+                    .count()
+                    .max(1);
                 keep = keep.min(n);
             }
             cand.truncate(keep.max(1));

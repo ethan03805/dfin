@@ -10,7 +10,10 @@ use super::stage_conn::{ConnError, StageConn, StageCounters};
 use super::text::{StopMatcher, Utf8Accumulator};
 use crate::config::{LayerRange, RouteConfig, StageEndpoint, StageEndpointToml};
 use anyhow::Context as _;
-use dfin_llama::{ChatMessage, Context, ContextParams, FlashAttn, KvType, Model, ModelParams, OutputMode, SeqId, Token};
+use dfin_llama::{
+    ChatMessage, Context, ContextParams, FlashAttn, KvType, Model, ModelParams, OutputMode, SeqId,
+    Token,
+};
 use dfin_proto::{ActDtype, Activations, Request, Response};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -105,11 +108,20 @@ impl ApiError {
 pub enum Event {
     /// The request was accepted and prefill is starting.
     #[allow(dead_code)]
-    Started { prompt_tokens: usize, cached_tokens: usize },
+    Started {
+        prompt_tokens: usize,
+        cached_tokens: usize,
+    },
     /// Newly decoded text (never empty).
     #[allow(dead_code)]
-    Token { token: Token, text: String },
-    Done { finish_reason: FinishReason, usage: Usage },
+    Token {
+        token: Token,
+        text: String,
+    },
+    Done {
+        finish_reason: FinishReason,
+        usage: Usage,
+    },
     Error(ApiError),
 }
 
@@ -165,6 +177,12 @@ pub struct Stats {
     pub tokens_generated: u64,
     pub decode_steps: u64,
     pub decode_ms_sum: f64,
+    /// Prefill passes (one per request), their wall time and the tokens they processed.
+    pub prefill_count: u64,
+    pub prefill_ms_sum: f64,
+    pub prefill_tokens_sum: u64,
+    pub last_prefill_ms: f64,
+    pub last_prefill_tokens: u64,
     pub head_ms_sum: f64,
     pub tail_ms_sum: f64,
     pub recent_token_ms: VecDeque<f64>,
@@ -266,7 +284,9 @@ pub async fn spawn(
             }
         })
         .context("spawning engine thread")?;
-    let info = ready_rx.await.context("engine thread exited during startup")??;
+    let info = ready_rx
+        .await
+        .context("engine thread exited during startup")??;
     Ok((job_tx, info))
 }
 
@@ -290,10 +310,14 @@ impl Engine {
             ..ModelParams::range(0, cfg.head.end)
         };
         tracing::info!(model = %cfg.model_path.display(), layers = %cfg.head, "loading head");
-        let head_model = Arc::new(
-            Model::load(&cfg.model_path, &head_params)
-                .with_context(|| format!("loading head layers {} of {}", cfg.head, cfg.model_path.display()))?,
-        );
+        let head_model =
+            Arc::new(Model::load(&cfg.model_path, &head_params).with_context(|| {
+                format!(
+                    "loading head layers {} of {}",
+                    cfg.head,
+                    cfg.model_path.display()
+                )
+            })?);
         let n_layer = head_model.n_layer();
         let n_embd = head_model.n_embd();
 
@@ -311,7 +335,14 @@ impl Engine {
                 .collect(),
         };
         route.validate(n_layer).context("invalid route")?;
-        let tail_range = LayerRange::new(cfg.tail.begin, if cfg.tail.end == -1 { n_layer } else { cfg.tail.end });
+        let tail_range = LayerRange::new(
+            cfg.tail.begin,
+            if cfg.tail.end == -1 {
+                n_layer
+            } else {
+                cfg.tail.end
+            },
+        );
 
         let tail_params = ModelParams {
             n_gpu_layers: cfg.n_gpu_layers,
@@ -319,10 +350,13 @@ impl Engine {
             ..ModelParams::range(cfg.tail.begin, -1)
         };
         tracing::info!(layers = %tail_range, "loading tail");
-        let tail_model = Arc::new(
-            Model::load(&cfg.model_path, &tail_params)
-                .with_context(|| format!("loading tail layers {tail_range} of {}", cfg.model_path.display()))?,
-        );
+        let tail_model =
+            Arc::new(Model::load(&cfg.model_path, &tail_params).with_context(|| {
+                format!(
+                    "loading tail layers {tail_range} of {}",
+                    cfg.model_path.display()
+                )
+            })?);
         if !head_model.has_head() {
             anyhow::bail!("head piece does not own the token embedding");
         }
@@ -378,7 +412,9 @@ impl Engine {
                 std::fs::read_to_string(t).with_context(|| format!("reading chat template {t}"))?
             }
             Some(t) => t.clone(),
-            None => head_model.chat_template().unwrap_or_else(|| "chatml".to_string()),
+            None => head_model
+                .chat_template()
+                .unwrap_or_else(|| "chatml".to_string()),
         };
         let add_bos = head_model.vocab().add_bos();
 
@@ -480,7 +516,11 @@ impl Engine {
 
     fn publish_stats(&self) {
         let mut st = self.stats.lock();
-        st.sessions_live = self.sessions.iter().filter(|s| !s.tokens.is_empty()).count();
+        st.sessions_live = self
+            .sessions
+            .iter()
+            .filter(|s| !s.tokens.is_empty())
+            .count();
         st.sessions_busy = self.sessions.iter().filter(|s| s.busy).count();
         st.stages = self.stages.iter().map(|s| s.counters.clone()).collect();
     }
@@ -562,13 +602,22 @@ impl Engine {
         let slot = self.sessions[idx].slot;
         let p0 = keep as i32;
         if !self.head.seq_rm(slot, p0, -1) || !self.tail.seq_rm(slot, p0, -1) {
-            return Err(EngineErr::Other(format!("KV rollback of slot {slot} to {keep} failed")));
+            return Err(EngineErr::Other(format!(
+                "KV rollback of slot {slot} to {keep} failed"
+            )));
         }
         for s in &mut self.stages {
-            match s.call(&Request::SeqRm { session: id, p0, p1: -1 })? {
+            match s.call(&Request::SeqRm {
+                session: id,
+                p0,
+                p1: -1,
+            })? {
                 Response::Ok => {}
                 Response::Error { code, message } => {
-                    return Err(EngineErr::Other(format!("stage {} ({code:?}): {message}", s.addr)))
+                    return Err(EngineErr::Other(format!(
+                        "stage {} ({code:?}): {message}",
+                        s.addr
+                    )))
                 }
                 other => {
                     return Err(EngineErr::Other(format!(
@@ -608,7 +657,10 @@ impl Engine {
             }
         }
         // Miss: a free slot, else the least recently used idle session.
-        let free = self.sessions.iter().position(|s| !s.busy && s.tokens.is_empty());
+        let free = self
+            .sessions
+            .iter()
+            .position(|s| !s.busy && s.tokens.is_empty());
         let lru = || {
             self.sessions
                 .iter()
@@ -689,7 +741,9 @@ impl Engine {
     }
 
     fn send(job: &Job, ev: Event) -> Result<(), EngineErr> {
-        job.events.blocking_send(ev).map_err(|_| EngineErr::Cancelled)
+        job.events
+            .blocking_send(ev)
+            .map_err(|_| EngineErr::Cancelled)
     }
 
     fn generate(
@@ -725,13 +779,23 @@ impl Engine {
                 logits = out;
             }
         }
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;
         tracing::debug!(
             prompt = prompt.len(),
             cached = common,
-            ms = t_prefill.elapsed().as_secs_f64() * 1e3,
+            ms = prefill_ms,
             "prefill done"
         );
-        let mut logits = logits.ok_or_else(|| EngineErr::Other("prefill produced no logits".into()))?;
+        {
+            let mut st = self.stats.lock();
+            st.prefill_count += 1;
+            st.prefill_ms_sum += prefill_ms;
+            st.prefill_tokens_sum += suffix.len() as u64;
+            st.last_prefill_ms = prefill_ms;
+            st.last_prefill_tokens = suffix.len() as u64;
+        }
+        let mut logits =
+            logits.ok_or_else(|| EngineErr::Other("prefill produced no logits".into()))?;
 
         let model = self.head_model.clone();
         let vocab = model.vocab();
@@ -754,7 +818,13 @@ impl Engine {
             let text = utf8.push(&piece);
             let r = stop.push(&text);
             if !r.emit.is_empty() {
-                Self::send(job, Event::Token { token: tok, text: r.emit })?;
+                Self::send(
+                    job,
+                    Event::Token {
+                        token: tok,
+                        text: r.emit,
+                    },
+                )?;
             }
             if r.stopped {
                 finish = FinishReason::Stop;
@@ -791,7 +861,13 @@ impl Engine {
                 tail_text.push_str(&stop.flush());
             }
             if !tail_text.is_empty() {
-                Self::send(job, Event::Token { token: -1, text: tail_text })?;
+                Self::send(
+                    job,
+                    Event::Token {
+                        token: -1,
+                        text: tail_text,
+                    },
+                )?;
             }
         }
         self.stats.lock().tokens_generated += completion as u64;
@@ -874,9 +950,17 @@ impl Engine {
                     stage.counters.forwards += 1;
                     stage.counters.rtt_ms_sum += rtt_ms;
                     stage.counters.compute_ms_sum += compute_ms as f64;
+                    if n == 1 {
+                        stage.counters.decode_forwards += 1;
+                        stage.counters.decode_rtt_ms_sum += rtt_ms;
+                        stage.counters.decode_compute_ms_sum += compute_ms as f64;
+                    }
                 }
                 Response::Error { code, message } => {
-                    return Err(EngineErr::Other(format!("stage {} ({code:?}): {message}", stage.addr)));
+                    return Err(EngineErr::Other(format!(
+                        "stage {} ({code:?}): {message}",
+                        stage.addr
+                    )));
                 }
                 other => {
                     return Err(EngineErr::Other(format!(
@@ -888,7 +972,11 @@ impl Engine {
         }
 
         let t = Instant::now();
-        let mode = if want_logits { OutputMode::Last } else { OutputMode::None };
+        let mode = if want_logits {
+            OutputMode::Last
+        } else {
+            OutputMode::None
+        };
         self.tail
             .decode_embd(&hidden, pos0, slot, mode)
             .map_err(|e| llama_err("tail decode", e))?;
@@ -908,7 +996,12 @@ impl Engine {
 
 /// Connect to a stage, retrying with exponential backoff until `budget` elapses.
 /// Protocol-level rejections (wrong model, wrong layers) are not retried.
-fn connect_with_backoff(s: &mut StageConn, fingerprint: &str, n_embd: u32, budget: Duration) -> Result<(), ConnError> {
+fn connect_with_backoff(
+    s: &mut StageConn,
+    fingerprint: &str,
+    n_embd: u32,
+    budget: Duration,
+) -> Result<(), ConnError> {
     let deadline = Instant::now() + budget;
     let mut delay = Duration::from_millis(250);
     loop {

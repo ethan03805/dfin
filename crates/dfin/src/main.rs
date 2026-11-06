@@ -15,7 +15,11 @@ mod stage;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "dfin", version, about = "Decentralized pipeline-parallel inference node")]
+#[command(
+    name = "dfin",
+    version,
+    about = "Decentralized pipeline-parallel inference node"
+)]
 struct Cli {
     /// Log filter, e.g. `info`, `debug`, `dfin=debug,llama=warn`.
     #[arg(long, env = "DFIN_LOG", default_value = "info", global = true)]

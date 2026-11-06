@@ -164,3 +164,91 @@ dominant WAN cost; the stock-llama.cpp baseline and the dfin monolithic number a
 wrapper adds no overhead; llama.cpp warns that CPU tensor overrides with mmap are slower than
 reading the file (`--load-mode none`), which was not tested and would be the default on nodes
 that run a single piece.
+
+## 2026-11-06: first two-machine pod, over WiFi
+
+Route: this PC runs the head (dense layer 0), a MacBook Air (Apple M4, 16 GB, Metal) serves
+layers 1:21, the PC serves layers 21:46 (attention on the RX 7800 XT, experts in RAM), and the
+PC runs the tail (layer 46 plus the LM head). The Mac was set up by its own Claude session
+from the GitHub repo; the only macOS fixes needed were executable bits on the scripts and an
+rpath entry in `.cargo/config.toml` (cargo does not forward a build script's link arguments to
+dependent crates). The Mac's stage was ready in seconds and the PC found it by scanning the
+LAN for port 7001. Link: WiFi, ping best 3.2 ms, average 20 to 54 ms with spikes above
+100 ms. Log: `docs/lan-pod-glm47flash-2026-11-06.log`.
+
+| Mode (GLM-4.7-Flash Q4_K_M, 256-token prompt, 64 generated) | ms per token | tok/s | Output |
+|---|---|---|---|
+| PC alone, monolithic | 50.5 | 19.8 | reference |
+| PC alone, four pieces in one process | 48.6 | 20.6 | identical tokens |
+| **PC head and tail, Mac layers 1:21, PC layers 21:46, over WiFi** | 61.6 | 16.2 | identical text |
+
+Per-token breakdown of the two-machine run from the client's decode-only counters
+(329 decode steps across four requests):
+
+| Piece | Where | Compute per token | Round trip seen by the client | Network and protocol |
+|---|---|---|---|---|
+| head 0:1 | PC | 0.7 ms | | |
+| stage 1:21 | Mac M4, Metal | **3.7 ms** | 27.0 ms | **23.3 ms** (WiFi; ping floor 3.2 ms) |
+| stage 21:46 | PC, Vulkan + CPU experts | 28.3 ms | 28.7 ms | 0.4 ms (loopback) |
+| tail 46:47 | PC | 2.3 ms | | |
+
+What this shows:
+
+- **The pipeline is network-bound exactly where the design says it is.** The Mac finishes
+  its 20 layers in 3.7 ms and then waits; the client sees 27 ms because every token crosses
+  the WiFi link twice. The protocol itself costs 0.4 ms on loopback. On a wired LAN (ping
+  under 1 ms) the same route would decode at about 19 tok/s, within 5 percent of the single
+  machine.
+- **Unified-memory nodes are fast stages.** The M4 runs 20 MoE layers per token about 5 times
+  faster per layer than this PC's CPU-expert path (3.7 ms versus 28 ms for 25 layers), because
+  its experts sit in 120 GB/s unified memory next to the GPU. This is the anchor argument of
+  the design in miniature: the pod would be fastest if the Mac held more layers and the PC
+  fewer, bounded by the Mac's 16 GB.
+- **Prefix caching works across machines.** The second chat turn reused 28 cached tokens on
+  both stages (`prefix_cache.hits` 2) without any rollback failure.
+- **Exactness holds over the network.** The 64-token greedy continuation matched the
+  monolithic model, f16 activations on the wire, two different GPU backends in one route
+  (Metal on the Mac, Vulkan on the PC).
+
+Caveats: the chat template path still leaks GLM's reasoning preamble into the answer, because
+llama.cpp's built-in template detection does not know this model's thinking switch; a real
+Jinja engine with `enable_thinking` is a client TODO. The Mac ran a stage binary whose
+reported compute time did not include the Metal synchronisation that happens when the result
+is read, so its 3.7 ms is a lower bound; a bandwidth estimate (about 1.4 GB of expert weights
+per token at roughly 120 GB/s) puts the true figure near 12 ms, which would leave about 15 ms
+of the 27 ms round trip to the WiFi link. The stage now times the read as well.
+
+## 2026-11-06: cold start is a load-time problem, not a request-time problem
+
+The first request through a freshly started stage was slow: 4.2 s for a 281-token prefill
+over the LAN pipeline, and 11 to 27 s for the same prompt through a single local stage
+holding 45 layers, against 1.5 s for the monolithic model. Experiments on the PC stage
+(`docs/lan-pod-glm47flash-2026-11-06.log` and the session notes):
+
+| Stage setting (45 MoE layers, experts in RAM, attention on GPU) | Load | First prefill (283 tok) | Later prefills | Decode per token | Notes |
+|---|---|---|---|---|---|
+| mmap (default) | 2 s | 11 to 27 s | 2.4 to 3.4 s | 50 to 65 ms | first request faults 16 GB of expert pages in from the page cache or disk |
+| mmap, 3 threads | 2 s | 13.5 s | 2.6 s | 68 to 90 ms | fewer threads cost 30 to 60 percent on decode |
+| no mmap (read into private memory) | 10.6 s | 0.7 s | 0.64 s | **0.8 to 1.9 s** | 17.7 GB private on a 32 GB machine: the OS paged 3.4 GB of it out, and each token touches random experts |
+| **mmap + mlock** | **43 s** | **1.7 s** | **1.5 s** | **50 to 52 ms** | every page resident at load; working set 17.4 GB; same decode as monolithic |
+
+Consequences for the design:
+
+- **A stage must make its weights resident at load, not at the first request.** `--mlock`
+  (llama.cpp's `MMAP_MLOCK`) does this; the design's cold-start gate ("20k-token prefill
+  under 30 s") is only meaningful with it. Nodes should report "ready" after locking, and
+  the directory should list a node's load time separately from its prefill speed.
+- **Reading weights into private memory is only safe with headroom.** On a node that holds
+  one piece and little else it is llama.cpp's recommended mode; on a shared machine the
+  page cache plus private copies exceed RAM and decode collapses by 20 to 40 times.
+- **Thread count is a per-node tuning knob.** Six threads for one piece on a 6-core CPU;
+  cores divided by pieces when several pieces share a machine (the local-pod case).
+- Warm prefill through a 45-layer stage is still 1.5 s for 283 tokens against 1.4 s
+  monolithic, so prefill throughput itself survives the split; the chunk transfer of 1.2 MB
+  each way is negligible on a LAN.
+- **Two-machine prefill, measured properly** (local stage locked, Mac stage warm): 1.59 s for
+  281 tokens end to end, of which 0.62 s is the Mac's round trip (compute plus 1.2 MB each
+  way over WiFi) and 0.90 s the PC stage's 25 layers; decode then ran at 59 ms per token
+  (16.8 tok/s). The same request against a freshly started, unlocked local stage took 3.4 to
+  4.2 s. For the design's cold-start budget the lesson is the same as above: lock at load.
+

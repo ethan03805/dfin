@@ -2,7 +2,9 @@
 //! layers in a spawned stage server, compared against a full in-process model.
 
 use dfin_llama::{Context, ContextParams, Model, ModelParams, OutputMode};
-use dfin_proto::{read_frame, write_frame, ActDtype, Activations, ErrorCode, Request, Response, PROTOCOL_VERSION};
+use dfin_proto::{
+    read_frame, write_frame, ActDtype, Activations, ErrorCode, Request, Response, PROTOCOL_VERSION,
+};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -16,7 +18,10 @@ fn model_path() -> PathBuf {
     if let Ok(p) = std::env::var("DFIN_TEST_MODEL") {
         return p.into();
     }
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/tiny-llama-f32.gguf"))
+    PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../models/tiny-llama-f32.gguf"
+    ))
 }
 
 /// Kills the stage process even if the test panics.
@@ -43,7 +48,10 @@ async fn wait_for_port(addr: SocketAddr, child: &mut ChildGuard) {
         if TcpStream::connect(addr).await.is_ok() {
             return;
         }
-        assert!(start.elapsed() < Duration::from_secs(60), "stage did not start listening");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "stage did not start listening"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -131,7 +139,16 @@ async fn stage_matches_full_model() {
         .arg(&path)
         .args(["--layers", &format!("{}:{}", MID.0, MID.1)])
         .args(["--listen", &addr.to_string()])
-        .args(["--n-gpu-layers", "0", "--act-dtype", "f32", "--n-ctx", "1024", "--n-seq-max", "2"])
+        .args([
+            "--n-gpu-layers",
+            "0",
+            "--act-dtype",
+            "f32",
+            "--n-ctx",
+            "1024",
+            "--n-seq-max",
+            "2",
+        ])
         .stdin(Stdio::null())
         .spawn()
         .expect("spawn dfin stage");
@@ -193,7 +210,10 @@ async fn stage_matches_full_model() {
     let (rs, rseq, act, compute_ms) = forward_ok(r);
     assert_eq!((rs, rseq), (session, 1));
     assert_eq!(act.n_tokens as usize, n);
-    eprintln!("prefill forward: {n} tokens, {} bytes, {compute_ms:.3} ms", act.byte_len());
+    eprintln!(
+        "prefill forward: {n} tokens, {} bytes, {compute_ms:.3} ms",
+        act.byte_len()
+    );
     let mid_out = act.to_f32().unwrap();
 
     // Tail locally.
@@ -241,7 +261,10 @@ async fn stage_matches_full_model() {
         .await,
     );
     assert_eq!(r2.1, 3);
-    assert_eq!(r1.2.data, r2.2.data, "rolled-back forward must reproduce the same output");
+    assert_eq!(
+        r1.2.data, r2.2.data,
+        "rolled-back forward must reproduce the same output"
+    );
 
     // Position gap is refused.
     match call(
@@ -264,16 +287,43 @@ async fn stage_matches_full_model() {
 
     // Wrong activation width is refused.
     let bad = Activations::from_f32(&vec![0.0; n_embd + 1], 1, n_embd + 1, ActDtype::F32);
-    match call(&mut s, &Request::Forward { session, seq: 5, pos0: 0, act: bad }).await {
+    match call(
+        &mut s,
+        &Request::Forward {
+            session,
+            seq: 5,
+            pos0: 0,
+            act: bad,
+        },
+    )
+    .await
+    {
         Response::Error { code, .. } => assert_eq!(code, ErrorCode::BadRequest),
         other => panic!("expected BadRequest, got {other:?}"),
     }
 
     // Ping, SeqRm, SessionClose.
     assert!(matches!(call(&mut s, &Request::Ping).await, Response::Pong));
-    let r = call(&mut s, &Request::SeqRm { session, p0: n as i32, p1: -1 }).await;
+    let r = call(
+        &mut s,
+        &Request::SeqRm {
+            session,
+            p0: n as i32,
+            p1: -1,
+        },
+    )
+    .await;
     assert!(matches!(r, Response::Ok), "SeqRm: {r:?}");
-    match call(&mut s, &Request::SeqRm { session: 999, p0: 0, p1: -1 }).await {
+    match call(
+        &mut s,
+        &Request::SeqRm {
+            session: 999,
+            p0: 0,
+            p1: -1,
+        },
+    )
+    .await
+    {
         Response::Error { code, .. } => assert_eq!(code, ErrorCode::UnknownSession),
         other => panic!("expected UnknownSession, got {other:?}"),
     }

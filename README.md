@@ -183,6 +183,23 @@ picks the chain with the fewest hops between its head and tail, keeps a copy of 
 in `--directory-cache` for when the hub is down, and when a stage dies it fetches the
 list again and moves to another chain. The hub never chooses routes for anyone.
 
+### Running a stage without opening a port
+
+An operator who does not want to expose an address runs the stage cloaked:
+
+```powershell
+dfin relay  --listen 203.0.113.5:7000 --identity relay.key --port-range 7200-7299
+dfin stage  --model model.gguf --layers 40:77 --identity node.key --cloak 203.0.113.5:7000/<relay id> --hub ... --mlock
+```
+
+The stage dials the relay, the relay allocates a public port for it and forwards that
+port's traffic through the stage's own outbound connection, and the directory lists the
+relay's address for the stage. Dialers still get a QUIC connection pinned to the stage's
+key, end to end; the relay sees ciphertext. The relay also replaces every dialer's address
+with a synthetic one before the stage sees it, so a cloaked stage learns nobody's IP, and
+nobody but the relay learns the stage's. Such a stage cannot be placed by timing, and the
+directory says so (`cloaked: true`).
+
 On a node that only serves a stage, the model file must be byte-identical to the
 client's (the handshake checks a fingerprint); each stage maps only its own layers, so a
 node needs memory for its range, not for the whole model. Pick the range by the node's
@@ -259,6 +276,7 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [x] Phase 1 transport: Ed25519 node ids, QUIC with pinned keys, sealed route records, chain forwarding stage to stage, direct, reverse and relay return modes, `dfin relay`; see `docs/phase1-protocol.md`. GLM-4.7-Flash through the chain on one machine: 16.8 tok/s in both modes, identical text, 0.7 ms of chain overhead per token (`docs/phase1-findings.md`)
 - [x] Linux build, Docker image and CI (pull request 1)
 - [x] Signed directory: `dfin hub`, stage announcements with reachability checks, client-side route choice, cache, rerouting when a stage dies
+- [x] Cloaked stages: no inbound port, reachable through a relay-allocated port over the stage's own outbound tunnel, end-to-end QUIC, synthetic peer addresses
 - [ ] MTP speculative decoding in the client tail
 - [ ] Stage state wider than `n_embd` for `glm5-next` (hyper-connections) and Kimi K3 attention residuals
 - [ ] Tool-call parsing in the OpenAI layer (requests with `tools` are accepted, calls are not parsed)
@@ -268,8 +286,8 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [ ] The scale gate: GLM-5.3 IQ4_XS across 4 to 8 machines at 3 tok/s or better (moved to phase 3 in design v0.2; needs rented hardware and sharded loading)
 
 Design v0.2 phase 1 (the encrypted chain) is under way. Done: node identities, the QUIC
-transport, chain forwarding, relays, the signed directory. Still to do in phase 1: cloaked
-nodes, per-layer weight shards, multi-tensor stage state, failover of a live session,
+transport, chain forwarding, relays, the signed directory, cloaked stages. Still to do in
+phase 1: per-layer weight shards, multi-tensor stage state, failover of a live session,
 region fencing from several vantage points, fuzzing of the decoders. Until the integrity
 checks of phase 2 exist, only run stages for clients you know, and only list stages on a
 hub you run.

@@ -158,6 +158,7 @@ async fn http_directory(State(hub): State<Arc<Hub>>) -> Json<Value> {
                 "backend": r.backend,
                 "region": r.region,
                 "attested": r.attested,
+                "cloaked": r.cloaked,
                 "hub_rtt_ms": e.hub_rtt_ms,
                 "seen_secs_ago": now.saturating_sub(e.seen_at),
                 "expires_in_secs": r.expires_at().saturating_sub(now),

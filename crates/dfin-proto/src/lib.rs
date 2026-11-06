@@ -239,6 +239,9 @@ pub enum Request {
     RelayOpen { token: [u8; 16], first_hop: NextHop },
     /// Last hop to relay: pipe my one-way streams to the client holding `token`.
     RelayAttach { token: [u8; 16] },
+    /// Cloaked node to relay: bind a public port for me and tunnel its datagrams on this
+    /// stream. The reply is `RelayListening`; the stream then carries packet frames.
+    RelayListen,
     /// Node to hub: list me. The hub verifies the signature and dials the first address.
     Announce { record: SignedRecord },
     /// Anyone to hub: the current signed directory.
@@ -273,6 +276,8 @@ pub enum Response {
         hops: Vec<HopStat>,
     },
     Pong,
+    /// The public `host:port` the relay forwards to the cloaked node.
+    RelayListening { addr: String },
     Directory { directory: SignedDirectory },
     Error { code: ErrorCode, message: String },
 }
@@ -313,6 +318,9 @@ pub struct NodeRecord {
     pub region: String,
     /// Hardware attestation; always false until phase 2.
     pub attested: bool,
+    /// The addresses belong to relays; the node itself accepts no inbound connections
+    /// and cannot be placed by timing.
+    pub cloaked: bool,
     /// Unix seconds when the record was made, and how long it is valid.
     pub issued_at: u64,
     pub ttl_secs: u32,

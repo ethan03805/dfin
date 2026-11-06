@@ -219,6 +219,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             region: String::new(),
             attested: false,
+            cloaked: false,
             issued_at: 1000,
             ttl_secs: 180,
         };

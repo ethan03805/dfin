@@ -16,6 +16,7 @@ pub mod identity;
 pub mod sealed;
 mod tls;
 pub mod transport;
+pub mod tunnel;
 
 pub use identity::{NodeId, NodeKey};
 pub use sealed::{seal, unseal};

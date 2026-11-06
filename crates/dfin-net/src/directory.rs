@@ -101,6 +101,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             region: "us".into(),
             attested: false,
+            cloaked: false,
             issued_at: 1_800_000_000,
             ttl_secs: 180,
         }

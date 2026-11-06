@@ -717,3 +717,122 @@ async fn route_from_hub_and_reroute_after_stage_death() {
     assert!(rerouted, "client did not reroute to the replacement stage\n{}", procs.logs());
     let _ = std::fs::remove_file(&cache);
 }
+
+/// A cloaked stage: no listener of its own, reachable only through a relay-allocated
+/// port, found through the hub, and the client never learns anything but the relay's
+/// address for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn cloaked_stage_through_relay() {
+    if should_skip() {
+        return;
+    }
+    let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
+    let model = model_path().display().to_string();
+    let probe = Endpoint::client(NodeKey::generate()).unwrap();
+    let mut procs = Procs::default();
+
+    let hub_port = free_udp_port();
+    let hub_http = free_port();
+    let hub_key = StageKey::new("hub");
+    let hub_addr = format!("127.0.0.1:{hub_port}");
+    let hub_args: Vec<String> = [
+        "hub",
+        "--listen",
+        &hub_addr,
+        "--identity",
+        &hub_key.path.display().to_string(),
+        "--http",
+        &format!("127.0.0.1:{hub_http}"),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let hi = procs.spawn("hub", &hub_args);
+    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(60)).await;
+    let hub_flag = format!("{hub_addr}/{}", hub_key.id);
+
+    let relay_port = free_udp_port();
+    let relay_key = StageKey::new("relay");
+    let relay_args: Vec<String> = [
+        "relay",
+        "--listen",
+        &format!("127.0.0.1:{relay_port}"),
+        "--identity",
+        &relay_key.path.display().to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let ri = procs.spawn("relay", &relay_args);
+    procs.wait_stage(ri, relay_port, relay_key.id, Duration::from_secs(60)).await;
+    let relay_flag = format!("127.0.0.1:{relay_port}/{}", relay_key.id);
+
+    let (k1, k2) = (StageKey::new("s1"), StageKey::new("s2"));
+    let p1 = free_udp_port();
+    let args1: Vec<String> = [
+        "stage", "--model", &model, "--layers", "2:4",
+        "--listen", &format!("127.0.0.1:{p1}"),
+        "--identity", &k1.path.display().to_string(),
+        "--hub", &hub_flag, "--announce-every", "5",
+        "--n-gpu-layers", "0", "--act-dtype", "f32",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let s1 = procs.spawn("stage1", &args1);
+    // The cloaked stage: no --listen at all.
+    let args2: Vec<String> = [
+        "stage", "--model", &model, "--layers", "4:6",
+        "--identity", &k2.path.display().to_string(),
+        "--cloak", &relay_flag,
+        "--hub", &hub_flag, "--announce-every", "5",
+        "--n-gpu-layers", "0", "--act-dtype", "f32",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let _s2 = procs.spawn("stage2-cloaked", &args2);
+    procs.wait_stage(s1, p1, k1.id, Duration::from_secs(120)).await;
+    wait_listed(&probe, &hub_addr, hub_key.id, 2, &procs).await;
+
+    // The hub's JSON view says which node is cloaked and where it is reached.
+    let listing: Value = reqwest::get(format!("http://127.0.0.1:{hub_http}/directory"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let nodes = listing["nodes"].as_array().unwrap();
+    let cloaked = nodes
+        .iter()
+        .find(|n| n["node_id"] == k2.id.to_string())
+        .unwrap_or_else(|| panic!("cloaked stage not listed: {listing:#}"));
+    assert_eq!(cloaked["cloaked"], true, "{listing:#}");
+    let via = cloaked["addrs"][0].as_str().unwrap().to_string();
+    assert!(via.starts_with("127.0.0.1:"), "{via}");
+    let via_port: u16 = via.rsplit(':').next().unwrap().parse().unwrap();
+    assert_ne!(via_port, relay_port, "the relay allocated a port of its own for the node");
+
+    let pc = free_port();
+    let cache = std::env::temp_dir().join(format!("dfin-e2e-cloak-{}.cache", std::process::id()));
+    let _ = std::fs::remove_file(&cache);
+    let args: Vec<String> = [
+        "client", "--model", &model, "--head", "0:2", "--tail", "6:end",
+        "--hub", &hub_flag, "--directory-cache", &cache.display().to_string(),
+        "--n-gpu-layers", "0", "--act-dtype", "f32", "--max-sessions", "2", "--n-ctx", "512",
+        "--listen", &format!("127.0.0.1:{pc}"),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let ci = procs.spawn("client", &args);
+    let base = format!("http://127.0.0.1:{pc}");
+    procs.wait_health(ci, &base, Duration::from_secs(120)).await;
+    exercise(&procs, &base, &expected).await;
+
+    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    assert_eq!(status["route"].as_array().unwrap().len(), 4, "{status:#}");
+    assert_eq!(status["route"][2]["node_id"], k2.id.to_string(), "{status:#}");
+    assert_eq!(status["route"][2]["addr"], via, "{status:#}");
+    let _ = std::fs::remove_file(&cache);
+}

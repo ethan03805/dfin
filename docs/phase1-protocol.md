@@ -51,6 +51,7 @@ Requests:
 | `RouteClose { route }` | previous hop or client | Tear the route down along the chain |
 | `Ping` | anyone | Round-trip measurement |
 | `RelayOpen { token, first_hop }`, `RelayAttach { token }` | client, last hop to relay | Section 6 |
+| `RelayListen` | cloaked node to relay | Allocate a public port for me; this stream becomes the tunnel (section 11) |
 | `Announce { record }` | node to hub | List me; `record` is a `SignedRecord` (section 10) |
 | `DirectoryGet` | anyone to hub | The current `SignedDirectory` |
 
@@ -175,20 +176,51 @@ directory again and prefers a chain that avoids every node of the broken route; 
 exists it retries the old one. `/status` shows the route in use, where the directory
 came from, how many nodes it listed and how many were usable.
 
-What the directory does not yet do: cloaked nodes (records that name a relay instead
-of an address), more than one hub, mirroring by light nodes, fetching the directory
-through a relay or Tor, attestation evidence, and any reputation.
+What the directory does not yet do: more than one hub, mirroring by light nodes,
+fetching the directory through a relay or Tor, attestation evidence, and any
+reputation.
+
+## 11. Cloaked nodes
+
+A stage started with `--cloak host:port/<relay id>` and no `--listen` opens no port.
+It dials the relay, opens one bidirectional stream, and sends `RelayListen`. The relay
+binds a UDP port on its public address, answers `RelayListening { addr }` on that
+stream without finishing it, and from then on the stream is a tunnel: every datagram
+that reaches the port goes down the stream as a frame (`u16` length, 16-byte
+IPv6-mapped address, `u16` port, payload), and every frame the node sends up goes out
+of the port to the address named in it.
+
+The address the relay attaches is **synthetic**: one from 100.64.0.0/10 allotted per
+real sender, mapped back only inside the relay. The node's QUIC endpoint runs over the
+tunnel and sees those synthetic addresses as its peers, so a cloaked node learns no
+address of any dialer, neighbour, hub or client, while dialers learn only the relay's
+address and port.
+
+Dialers need nothing new: the directory record lists `relay-host:port` as the node's
+address, with `cloaked: true`, and a dial to it is an ordinary QUIC connection pinned to
+the node's key. The handshake and every byte after it are end to end between dialer
+and node; the relay forwards ciphertext it cannot read. The hub's reachability probe
+and `hub_rtt_ms` therefore describe the path to the relay, and the client treats
+`cloaked` records as unplaceable for any region preference.
+
+A cloaked node's stage still dials out normally (to the hub, to its next hop, to the
+relay) from an ephemeral port. `--cloak` is repeatable; each relay yields one public
+address and the record lists them all. When the tunnel breaks the stage re-registers
+after five seconds, usually getting a new port, and its next announcement carries it.
+The relay refuses registrations beyond `--max-cloaked`, allocates from `--port-range`
+when one is given, and needs a public host (`--public-host`, or a specific `--listen`
+address) to name the ports by.
 
 ## 8. Status, 6 November 2026
 
 Built and tested: identities, transport, sealed records, route setup, forwarding, all
 three return modes, `dfin relay`, the signed directory with `dfin hub` and client-side
-routing with rerouting when a stage dies (section 10), the limits in section 2 except
-fuzzing. Verified with the tiny model (unit, protocol and end-to-end tests in every
-mode, including a hub and a stage killed mid-run) and on GLM-4.7-Flash on one machine
-(`docs/phase1-findings.md`). Not yet done from the phase 1 list: cloaked nodes (stages
-reachable only through relays), per-layer shards, multi-tensor stage state, replay-log
-failover of a live session, region fencing from several vantage points.
+routing with rerouting when a stage dies (section 10), cloaked nodes (section 11), the
+limits in section 2 except fuzzing. Verified with the tiny model (unit, protocol and
+end-to-end tests in every mode, including a hub, a stage killed mid-run, and a cloaked
+stage behind a relay) and on GLM-4.7-Flash on one machine (`docs/phase1-findings.md`).
+Not yet done from the phase 1 list: per-layer shards, multi-tensor stage state,
+replay-log failover of a live session, region fencing from several vantage points.
 
 ## 9. What changed from Phase 0 and why
 

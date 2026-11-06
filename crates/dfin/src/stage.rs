@@ -16,10 +16,12 @@ use clap::{Args, ValueEnum};
 use dfin_llama::{Context, ContextParams, FlashAttn, KvType, Model, ModelParams};
 use dfin_net::directory::sign_record;
 use dfin_net::transport::{reply, CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
+use dfin_net::tunnel::{pump, tunnel_socket};
 use dfin_net::{unseal, Connection, Endpoint, NetError, NodeId, NodeKey};
 use dfin_proto::{
-    forward_frame_limit, ActDtype, Activations, ErrorCode, HopRecord, HopStat, NextHop,
-    NodeRecord, Request, Response, ReturnFrame, ReturnMode, PROTOCOL_VERSION,
+    forward_frame_limit, read_frame_max, write_frame, ActDtype, Activations, ErrorCode,
+    HopRecord, HopStat, NextHop, NodeRecord, Request, Response, ReturnFrame, ReturnMode,
+    PROTOCOL_VERSION,
 };
 use engine::{Engine, Job, Reply};
 use parking_lot::Mutex;
@@ -67,9 +69,15 @@ pub struct StageArgs {
     /// embedding or the LM head (those run on the client).
     #[arg(long)]
     pub layers: LayerRange,
-    /// Address to listen on (UDP, QUIC).
-    #[arg(long, default_value = "0.0.0.0:7001")]
-    pub listen: String,
+    /// Address to listen on (UDP, QUIC). Defaults to `0.0.0.0:7001`, or to no public
+    /// listener at all when `--cloak` is given.
+    #[arg(long)]
+    pub listen: Option<String>,
+    /// Be reachable only through this relay (`host:port/<node id>`): the stage dials
+    /// the relay, which allocates a public port and tunnels its traffic here. No port
+    /// is opened on this machine and no dialer's address is ever seen. Repeatable.
+    #[arg(long = "cloak", value_parser = parse_node_addr)]
+    pub cloaks: Vec<NextHop>,
     /// Node key file (64 hex characters). Created if missing. Its public key is this
     /// node's id, which clients pin.
     #[arg(long, default_value = "dfin-stage.key")]
@@ -286,18 +294,35 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
     let (jobs, _engine_thread) =
         Engine::new(ctx, args.act_dtype, args.n_batch as usize).spawn(256)?;
 
-    let listen: SocketAddr = tokio::net::lookup_host(&args.listen)
-        .await
-        .with_context(|| format!("resolving {}", args.listen))?
-        .next()
-        .with_context(|| format!("{} resolved to nothing", args.listen))?;
-    let endpoint =
-        Endpoint::server(key, listen).with_context(|| format!("listening on {listen}"))?;
+    let listen_text = match (&args.listen, args.cloaks.is_empty()) {
+        (Some(l), _) => Some(l.clone()),
+        (None, true) => Some("0.0.0.0:7001".to_string()),
+        (None, false) => None,
+    };
+    let (endpoint, listening) = match &listen_text {
+        Some(l) => {
+            let listen: SocketAddr = tokio::net::lookup_host(l)
+                .await
+                .with_context(|| format!("resolving {l}"))?
+                .next()
+                .with_context(|| format!("{l} resolved to nothing"))?;
+            let ep = Endpoint::server(key, listen).with_context(|| format!("listening on {listen}"))?;
+            (ep, true)
+        }
+        None => (Endpoint::client(key).context("creating endpoint")?, false),
+    };
     let addr = endpoint.local_addr()?;
-    info!(
-        "stage ready: layers {}:{} on {} ({}) node {}",
-        layer_begin, layer_end, addr, info.backend, info.node_id
-    );
+    if listening {
+        info!(
+            "stage ready: layers {}:{} on {} ({}) node {}",
+            layer_begin, layer_end, addr, info.backend, info.node_id
+        );
+    } else {
+        info!(
+            "stage ready: layers {}:{} ({}) node {}, no public listener; reachable through {} relay(s)",
+            layer_begin, layer_end, info.backend, info.node_id, args.cloaks.len()
+        );
+    }
 
     let stage = Arc::new(Stage {
         info,
@@ -307,20 +332,26 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         outbound: Mutex::new(HashMap::new()),
         next_handle: AtomicU64::new(1),
         max_routes: args.max_routes.max(1),
+        cloak_addrs: Mutex::new(Vec::new()),
     });
 
+    for relay in &args.cloaks {
+        tokio::spawn(cloak_loop(stage.clone(), relay.clone()));
+    }
+
     if !args.hubs.is_empty() {
-        let advertise = match &args.advertise {
-            Some(a) => a.clone(),
-            None if !addr.ip().is_unspecified() => addr.to_string(),
-            None => bail!(
+        let advertise = match (&args.advertise, listening) {
+            (Some(a), _) => Some(a.clone()),
+            (None, true) if !addr.ip().is_unspecified() => Some(addr.to_string()),
+            (None, true) if args.cloaks.is_empty() => bail!(
                 "--hub needs --advertise host:port when --listen is {} (other nodes cannot dial an unspecified address)",
-                args.listen
+                listen_text.as_deref().unwrap_or("unspecified")
             ),
+            _ => None,
         };
         let template = NodeRecord {
             node_id: *stage.info.node_id.as_bytes(),
-            addrs: vec![advertise],
+            addrs: Vec::new(),
             model_fingerprint: stage.info.fingerprint.clone(),
             model_name: args
                 .model
@@ -338,40 +369,29 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
             protocol: PROTOCOL_VERSION,
             region: args.region.clone(),
             attested: false,
+            cloaked: !args.cloaks.is_empty(),
             issued_at: 0,
             ttl_secs: (args.announce_every.max(5) * 3).min(dfin_proto::MAX_RECORD_TTL_SECS as u64)
                 as u32,
         };
         tokio::spawn(announce_loop(
-            endpoint.clone(),
+            stage.clone(),
             args.hubs.clone(),
             template,
+            advertise,
             Duration::from_secs(args.announce_every.max(5)),
         ));
     }
 
-    let accept_loop = async {
-        while let Some(incoming) = endpoint.accept().await {
-            let conn = match incoming {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!("handshake failed: {e}");
-                    continue;
-                }
-            };
-            let stage = stage.clone();
-            tokio::spawn(async move {
-                let peer = conn.remote_address();
-                let id = conn.peer_id();
-                debug!(%peer, peer_id = %id.short(), "connection opened");
-                stage.serve_conn(conn).await;
-                debug!(%peer, peer_id = %id.short(), "connection closed");
-            });
+    let public = async {
+        if listening {
+            accept_loop(stage.clone(), endpoint.clone()).await;
+        } else {
+            std::future::pending::<()>().await;
         }
     };
-
     tokio::select! {
-        _ = accept_loop => Ok(()),
+        _ = public => Ok(()),
         r = tokio::signal::ctrl_c() => {
             r?;
             info!("ctrl-c: stage exiting");
@@ -381,6 +401,72 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Serve every connection that arrives on `endpoint`, until it closes.
+async fn accept_loop(stage: Arc<Stage>, endpoint: Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        let conn = match incoming {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("handshake failed: {e}");
+                continue;
+            }
+        };
+        let stage = stage.clone();
+        tokio::spawn(async move {
+            let peer = conn.remote_address();
+            let id = conn.peer_id();
+            debug!(%peer, peer_id = %id.short(), "connection opened");
+            stage.serve_conn(conn).await;
+            debug!(%peer, peer_id = %id.short(), "connection closed");
+        });
+    }
+}
+
+/// Stay reachable through `relay`: register, run a listener over the tunnel, and
+/// re-register after any failure.
+async fn cloak_loop(stage: Arc<Stage>, relay: NextHop) {
+    loop {
+        match cloak_once(&stage, &relay).await {
+            Ok(()) => info!(relay = %relay.addr, "relay session ended; reconnecting"),
+            Err(e) => warn!(relay = %relay.addr, "cloak: {e:#}"),
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn cloak_once(stage: &Arc<Stage>, relay: &NextHop) -> anyhow::Result<()> {
+    let conn = stage
+        .endpoint
+        .connect(&relay.addr, NodeId(relay.node_id))
+        .await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_frame(&mut send, &Request::RelayListen).await?;
+    let resp: Response = tokio::time::timeout(
+        CONTROL_TIMEOUT,
+        read_frame_max(&mut recv, MAX_CONTROL_FRAME),
+    )
+    .await
+    .context("waiting for the relay")??;
+    let public = match resp {
+        Response::RelayListening { addr } => addr,
+        Response::Error { code, message } => bail!("relay refused ({code:?}): {message}"),
+        other => bail!("unexpected relay reply {other:?}"),
+    };
+    let (sock, inbound, outbound) = tunnel_socket();
+    let ep = Endpoint::over_tunnel(stage.endpoint.key().clone(), sock)
+        .context("endpoint over the tunnel")?;
+    stage.cloak_addrs.lock().push(public.clone());
+    info!(relay = %relay.addr, public = %public, "reachable through the relay");
+    let result = tokio::select! {
+        e = pump(send, recv, inbound, outbound) => Err(anyhow::anyhow!("tunnel: {e}")),
+        _ = accept_loop(stage.clone(), ep.clone()) => Ok(()),
+    };
+    ep.close();
+    stage.cloak_addrs.lock().retain(|a| a != &public);
+    conn.close("tunnel ended");
+    result
+}
+
 fn error(code: ErrorCode, message: impl Into<String>) -> Response {
     Response::Error {
         code,
@@ -388,18 +474,28 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Response {
     }
 }
 
-/// Announce a fresh signed record to every hub, forever.
+/// Announce a fresh signed record to every hub, forever. The addresses are the
+/// advertised one plus whatever relays currently host this stage.
 async fn announce_loop(
-    endpoint: Endpoint,
+    stage: Arc<Stage>,
     hubs: Vec<NextHop>,
     template: NodeRecord,
+    advertise: Option<String>,
     every: Duration,
 ) {
+    let endpoint = stage.endpoint.clone();
     let mut conns: HashMap<NodeId, Connection> = HashMap::new();
     let mut announced: HashMap<NodeId, bool> = HashMap::new();
     loop {
         let mut record = template.clone();
         record.issued_at = crate::hub::unix_now();
+        record.addrs = advertise.iter().cloned().collect();
+        record.addrs.extend(stage.cloak_addrs.lock().iter().cloned());
+        if record.addrs.is_empty() {
+            debug!("no address to announce yet");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
         let signed = match sign_record(endpoint.key(), &record) {
             Ok(s) => s,
             Err(e) => {
@@ -531,6 +627,8 @@ struct Stage {
     outbound: Mutex<HashMap<(String, NodeId), Connection>>,
     next_handle: AtomicU64,
     max_routes: usize,
+    /// Public addresses relays currently forward to this stage.
+    cloak_addrs: Mutex<Vec<String>>,
 }
 
 /// How a request frame failed to arrive.
@@ -703,6 +801,7 @@ impl Stage {
             }
             Request::RelayOpen { .. }
             | Request::RelayAttach { .. }
+            | Request::RelayListen
             | Request::Announce { .. }
             | Request::DirectoryGet => {
                 error(ErrorCode::BadRequest, "this node is a stage, not a relay or hub")

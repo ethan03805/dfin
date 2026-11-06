@@ -83,11 +83,23 @@ identical output. Protocol section 10 has the details. On the tiny model the who
 sequence (hub up, two stages listed, requests, a third stage listed, the kill, the
 reroute) takes under 30 seconds.
 
-## 6. Phase 1 scope still open
+## 6. Cloaked nodes (6 November 2026, evening)
 
-Cloaked nodes (stages reachable only through relays), per-layer weight shards with peer
-seeding, multi-tensor stage state for `glm5-next` and Kimi K3, failover of a live
-session without losing its context, region fencing from several vantage points, fuzzing
-of the frame decoders. The Linux build, a CPU-only container image (136 MB)
+A stage with `--cloak` and no listener runs its QUIC endpoint over a stream to the
+relay; the relay binds a public UDP port and shuttles datagrams, substituting synthetic
+addresses for the real senders. The end-to-end test puts a cloaked stage behind a
+relay, lets the hub probe and list it, and routes a client through it from the
+directory alone, with identical output; the whole run takes six seconds on the tiny
+model. Two things learned: a reply helper that finishes the stream cannot be used for a
+message that opens a tunnel, and quinn's abstract socket interface makes a tunnelled
+endpoint about 150 lines, so no second encryption layer was needed. The cost of
+cloaking is one extra UDP hop through the relay for every packet to and from that
+stage; on a frontier route that is tens of kilobytes per token.
+
+## 7. Phase 1 scope still open
+
+Per-layer weight shards with peer seeding, multi-tensor stage state for `glm5-next`
+and Kimi K3, failover of a live session without losing its context, region fencing
+from several vantage points, fuzzing of the frame decoders. The Linux build, a CPU-only container image (136 MB)
 and continuous integration on GitHub Actions landed in pull request 1 (6.5 minutes
 cold; the Windows-generated bindings compile unchanged on Linux x86-64).

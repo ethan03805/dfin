@@ -2,7 +2,9 @@
 
 Pipeline-parallel inference of large open models across several consumer machines,
 with the privacy-relevant pieces (token embedding, first layers, last layer, LM head)
-running on the user's own machine. Design: [docs/design-v0.1.md](docs/design-v0.1.md).
+running on the user's own machine. Design: [docs/design-v0.2.md](docs/design-v0.2.md)
+(threat model, trust tiers, attested and open nodes, anonymity, money, phases), with the
+model physics and execution model in [docs/design-v0.1.md](docs/design-v0.1.md).
 Prior art and the current state of llama.cpp: [docs/prior-art-2026-11.md](docs/prior-art-2026-11.md).
 
 Phase 0 is **one LAN pod**: a stage runtime that runs a contiguous layer range of a GGUF,
@@ -199,7 +201,12 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [ ] Micro-batching across sessions on a stage
 - [x] Real model on one machine: GLM-4.7-Flash 30B-A3B (deepseek2 arch, MLA + MoE) split into 4 pieces, identical output, 19.5 tok/s in-process versus 19.9 monolithic; see `docs/phase0-findings.md`
 - [x] Real model across two machines (PC plus MacBook Air over WiFi): identical output, 16.8 tok/s against 19.8 single-machine, network-bound as predicted
-- [ ] The Phase 0 gate itself: GLM-5.3 IQ4_XS across a LAN pod of 4 to 8 machines at 3 tok/s or better
+- [ ] The scale gate: GLM-5.3 IQ4_XS across 4 to 8 machines at 3 tok/s or better (moved to phase 3 in design v0.2; needs rented hardware and sharded loading)
+
+What comes next is design v0.2 phase 1, the encrypted chain: transport with node keys in
+place of raw TCP, stage-to-stage forwarding with the client touching only the ends through
+relays, cloaked nodes, a signed directory, per-layer weight shards, multi-tensor stage state,
+a verified Linux build. Nothing in this repository is safe to expose to the internet yet.
 
 ## License
 

@@ -239,7 +239,8 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [x] `dfin client` daemon: local head and tail, OpenAI API with streaming, prefix cache, sampler
 - [x] `dfin pod` and `dfin bench`
 - [x] Verified on tiny synthetic `glm-dsa` and `kimi-k3` models (MLA, indexer, MoE, KDA paths); see `docs/phase0-findings.md` for what each architecture needs at a stage boundary
-- [x] Phase 1 transport: Ed25519 node ids, QUIC with pinned keys, sealed route records, chain forwarding stage to stage, direct, reverse and relay return modes, `dfin relay`; see `docs/phase1-protocol.md`
+- [x] Phase 1 transport: Ed25519 node ids, QUIC with pinned keys, sealed route records, chain forwarding stage to stage, direct, reverse and relay return modes, `dfin relay`; see `docs/phase1-protocol.md`. GLM-4.7-Flash through the chain on one machine: 16.8 tok/s in both modes, identical text, 0.7 ms of chain overhead per token (`docs/phase1-findings.md`)
+- [x] Linux build, Docker image and CI (pull request 1)
 - [ ] MTP speculative decoding in the client tail
 - [ ] Stage state wider than `n_embd` for `glm5-next` (hyper-connections) and Kimi K3 attention residuals
 - [ ] Tool-call parsing in the OpenAI layer (requests with `tools` are accepted, calls are not parsed)

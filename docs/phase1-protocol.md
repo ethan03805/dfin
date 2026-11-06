@@ -50,6 +50,9 @@ Requests:
 | `SessionClose { route, session }` | previous hop or client | Free a session along the chain |
 | `RouteClose { route }` | previous hop or client | Tear the route down along the chain |
 | `Ping` | anyone | Round-trip measurement |
+| `RelayOpen { token, first_hop }`, `RelayAttach { token }` | client, last hop to relay | Section 6 |
+| `Announce { record }` | node to hub | List me; `record` is a `SignedRecord` (section 10) |
+| `DirectoryGet` | anyone to hub | The current `SignedDirectory` |
 
 Replies: `HelloOk { layer_begin, layer_end, n_embd, n_ctx, n_seq_max, backend, node_id }`,
 `RouteOk { hops }` (number of hops that acknowledged), `Ack`, `ForwardOk { session, seq,
@@ -140,14 +143,52 @@ per session, as in Phase 0). When an incoming connection closes, every route it
 opened is torn down along the chain and every session freed. Stages never persist
 any of this.
 
+## 10. Directory
+
+A **node record** is what a stage says about itself: node id, dialable addresses, model
+fingerprint and name, layer range, `n_layer`, `n_embd`, KV capacity per session, session
+slots, activation type, backend, protocol version, a free-text region claim, an
+`attested` flag (always false in phase 1), `issued_at` (unix seconds) and `ttl_secs`. The
+stage signs the postcard bytes of the record with its Ed25519 key under the domain
+`dfin-node-record-v1`, and announces the `SignedRecord` to each hub it was given
+(`--hub`, repeatable; `--advertise` names the address others should dial) every
+`--announce-every` seconds, with a lifetime of three announcement periods.
+
+The **hub** (`dfin hub`) verifies the signature, checks the record's bounds (protocol
+version, one to eight addresses, text lengths, a middle layer range inside the model, a
+lifetime of at most an hour, a time stamp within ten minutes of its clock), dials the
+first address pinned to the node id and pings it three times, and refuses the
+announcement if it does not answer (`Unreachable`). It keeps the best ping as
+`hub_rtt_ms`, the first evidence for region fencing. Records are dropped when they
+expire. `DirectoryGet` returns a `Directory` (hub id, `issued_at`, entries sorted by node
+id, each a signed record plus the hub's observations) signed by the hub under the domain
+`dfin-directory-v1`. With `--http`, the same list is served as JSON for people.
+
+The hub never assigns routes. A **client** given `--hub host:port/<node id>` and no
+`--stage` fetches the directory, verifies the hub's signature against the pinned id and
+every record's signature against the node id inside it, drops records for other models,
+other protocol versions or that have expired, and chooses a chain that tiles the layers
+between its head and tail exactly: fewest hops, then the lowest sum of hub-measured
+round trips, then chance. It writes the verified directory to `--directory-cache` and
+reads it back when the hub is unreachable. When the route drops, the client fetches the
+directory again and prefers a chain that avoids every node of the broken route; if none
+exists it retries the old one. `/status` shows the route in use, where the directory
+came from, how many nodes it listed and how many were usable.
+
+What the directory does not yet do: cloaked nodes (records that name a relay instead
+of an address), more than one hub, mirroring by light nodes, fetching the directory
+through a relay or Tor, attestation evidence, and any reputation.
+
 ## 8. Status, 6 November 2026
 
 Built and tested: identities, transport, sealed records, route setup, forwarding, all
-three return modes, `dfin relay`, the limits in section 2 except fuzzing. Verified with
-the tiny model (unit, protocol and end-to-end tests in every mode) and on GLM-4.7-Flash
-on one machine (`docs/phase1-findings.md`). Not yet done from the phase 1 list: cloaked
-nodes (stages reachable only through relays), the signed directory, per-layer shards,
-multi-tensor stage state, replay-log failover, region fencing.
+three return modes, `dfin relay`, the signed directory with `dfin hub` and client-side
+routing with rerouting when a stage dies (section 10), the limits in section 2 except
+fuzzing. Verified with the tiny model (unit, protocol and end-to-end tests in every
+mode, including a hub and a stage killed mid-run) and on GLM-4.7-Flash on one machine
+(`docs/phase1-findings.md`). Not yet done from the phase 1 list: cloaked nodes (stages
+reachable only through relays), per-layer shards, multi-tensor stage state, replay-log
+failover of a live session, region fencing from several vantage points.
 
 ## 9. What changed from Phase 0 and why
 

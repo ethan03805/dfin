@@ -145,6 +145,12 @@ pub enum ErrorCode {
     Downstream,
     /// The last hop has no connection to deliver results on.
     NoReturnPath,
+    /// A signature did not verify.
+    BadSignature,
+    /// The hub could not reach the announced address.
+    Unreachable,
+    /// A record's time stamp or lifetime is out of bounds.
+    BadTimestamp,
 }
 
 /// Address and identity of a node to dial.
@@ -233,6 +239,10 @@ pub enum Request {
     RelayOpen { token: [u8; 16], first_hop: NextHop },
     /// Last hop to relay: pipe my one-way streams to the client holding `token`.
     RelayAttach { token: [u8; 16] },
+    /// Node to hub: list me. The hub verifies the signature and dials the first address.
+    Announce { record: SignedRecord },
+    /// Anyone to hub: the current signed directory.
+    DirectoryGet,
 }
 
 impl Request {
@@ -263,6 +273,7 @@ pub enum Response {
         hops: Vec<HopStat>,
     },
     Pong,
+    Directory { directory: SignedDirectory },
     Error { code: ErrorCode, message: String },
 }
 
@@ -275,6 +286,86 @@ pub struct ReturnFrame {
     /// `ForwardOk` or `Error`.
     pub body: Response,
 }
+
+// ------------------------------------------------------------------------------------------
+// Directory: what a node says about itself, signed by its key, and what a hub publishes.
+
+/// A node's self-description. Signed by the node (see `dfin-net`'s `directory` module).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NodeRecord {
+    pub node_id: [u8; 32],
+    /// Addresses (`host:port`) the node can be dialled at, best first.
+    pub addrs: Vec<String>,
+    pub model_fingerprint: String,
+    /// Human-readable model description (file stem or architecture summary).
+    pub model_name: String,
+    pub layer_begin: i32,
+    pub layer_end: i32,
+    pub n_layer: i32,
+    pub n_embd: u32,
+    /// KV capacity per session and concurrent sessions.
+    pub n_ctx_seq: u32,
+    pub n_seq_max: u32,
+    pub act_dtype: ActDtype,
+    pub backend: String,
+    pub protocol: u32,
+    /// The operator's own claim; verified by nobody in phase 1.
+    pub region: String,
+    /// Hardware attestation; always false until phase 2.
+    pub attested: bool,
+    /// Unix seconds when the record was made, and how long it is valid.
+    pub issued_at: u64,
+    pub ttl_secs: u32,
+}
+
+impl NodeRecord {
+    pub fn expires_at(&self) -> u64 {
+        self.issued_at.saturating_add(self.ttl_secs as u64)
+    }
+}
+
+/// A postcard-encoded `NodeRecord` and the node's Ed25519 signature over those bytes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SignedRecord {
+    #[serde(with = "serde_bytes")]
+    pub body: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// One directory line: a node's signed record plus what the hub observed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub record: SignedRecord,
+    /// Best of a few pings from the hub to the node's first address, in ms.
+    pub hub_rtt_ms: f32,
+    /// Unix seconds when the hub last accepted an announcement from this node.
+    pub seen_at: u64,
+}
+
+/// The hub's list. Signed by the hub (`SignedDirectory`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Directory {
+    pub hub_id: [u8; 32],
+    pub issued_at: u64,
+    pub entries: Vec<DirectoryEntry>,
+}
+
+/// A postcard-encoded `Directory` and the hub's signature over those bytes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SignedDirectory {
+    #[serde(with = "serde_bytes")]
+    pub body: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// Largest directory frame a client will accept.
+pub const MAX_DIRECTORY_BYTES: u32 = 16 << 20;
+/// Longest a record may claim to be valid.
+pub const MAX_RECORD_TTL_SECS: u32 = 3600;
+/// How far a record's `issued_at` may be from the hub's clock.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 600;
 
 /// Bytes a `Forward` or `ForwardOk` frame may carry for `n_tokens * n_embd` values,
 /// with headroom for the envelope and hop stats.

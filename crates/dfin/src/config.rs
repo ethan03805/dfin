@@ -217,6 +217,21 @@ pub mod layer_range_str {
     }
 }
 
+/// Parse `host:port/<node id>` into a dialable hop (relays, hubs).
+pub fn parse_node_addr(s: &str) -> Result<dfin_proto::NextHop, String> {
+    let (addr, id) = s
+        .rsplit_once('/')
+        .ok_or_else(|| format!("{s:?} must look like host:port/<node id>"))?;
+    if addr.is_empty() {
+        return Err(format!("{s:?} has an empty address"));
+    }
+    let node_id: NodeId = id.parse().map_err(|e| format!("{s:?}: {e}"))?;
+    Ok(dfin_proto::NextHop {
+        addr: addr.to_string(),
+        node_id: *node_id.as_bytes(),
+    })
+}
+
 /// Serde adapter: `NodeId` as 64 hex characters.
 pub mod node_id_str {
     use dfin_net::NodeId;

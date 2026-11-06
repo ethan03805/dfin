@@ -172,6 +172,10 @@ impl Route {
         &self.hops[0].addr
     }
 
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
     fn hello(&self, conn: &Connection, hop: &StageEndpoint) -> Result<String, RouteError> {
         let req = Request::Hello {
             version: PROTOCOL_VERSION,

@@ -78,7 +78,21 @@ async fn models(State(st): State<AppState>) -> Json<Value> {
 async fn status(State(st): State<AppState>) -> Json<Value> {
     let s = st.stats.lock().clone();
     let steps = s.decode_steps.max(1) as f64;
-    let stage_entries: Vec<_> = st.info.route.iter().filter(|r| r.kind == "stage").collect();
+    let route_now = if s.current_route.is_empty() {
+        st.info.route.clone()
+    } else {
+        s.current_route.clone()
+    };
+    let stage_entries: Vec<_> = route_now.iter().filter(|r| r.kind == "stage").collect();
+    let directory = s.directory.as_ref().map(|d| {
+        json!({
+            "hub": d.hub,
+            "issued_at": d.issued_at,
+            "from_cache": d.from_cache,
+            "nodes_listed": d.nodes_listed,
+            "nodes_usable": d.nodes_usable,
+        })
+    });
     let stages: Vec<Value> = stage_entries
         .iter()
         .zip(s.hops.iter())
@@ -106,7 +120,8 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
         "n_layer": st.info.n_layer,
         "n_embd": st.info.n_embd,
         "act_dtype": act_dtype,
-        "route": st.info.route,
+        "route": route_now,
+        "directory": directory,
         "sessions": {
             "max": st.info.max_sessions,
             "live": s.sessions_live,

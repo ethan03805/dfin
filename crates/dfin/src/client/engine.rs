@@ -6,6 +6,7 @@
 //! per-job channel (`blocking_send`).
 
 use super::sampling::{Sampler, SamplingParams};
+use super::directory::{self, DirectoryInfo};
 use super::route::{HopCounters, ReturnPolicy, Route, RouteCounters, RouteError};
 use super::text::{StopMatcher, Utf8Accumulator};
 use crate::config::{LayerRange, RouteConfig, StageEndpoint, StageEndpointToml};
@@ -14,11 +15,11 @@ use dfin_llama::{
     ChatMessage, Context, ContextParams, FlashAttn, KvType, Model, ModelParams, OutputMode, SeqId,
     Token,
 };
-use dfin_net::{Endpoint, NodeKey};
-use dfin_proto::{ActDtype, Activations};
+use dfin_net::{Endpoint, NodeId, NodeKey};
+use dfin_proto::{ActDtype, Activations, NextHop};
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -134,8 +135,11 @@ pub struct EngineConfig {
     pub model_path: PathBuf,
     pub head: LayerRange,
     pub tail: LayerRange,
+    /// Explicit stages; empty means "ask the hub" (or head and tail only without a hub).
     pub stages: Vec<StageEndpoint>,
     pub return_policy: ReturnPolicy,
+    pub hub: Option<NextHop>,
+    pub directory_cache: Option<PathBuf>,
     pub n_ctx: u32,
     pub n_gpu_layers: i32,
     /// Tensor-name regexes kept on the CPU buffer type (MoE experts in RAM).
@@ -198,6 +202,9 @@ pub struct Stats {
     pub sessions_busy: usize,
     pub hops: Vec<HopCounters>,
     pub chain: RouteCounters,
+    /// The route in use now (changes when the directory supplies a new one).
+    pub current_route: Vec<RouteEntry>,
+    pub directory: Option<DirectoryInfo>,
 }
 
 impl Stats {
@@ -250,12 +257,88 @@ fn llama_err(what: &str, e: dfin_llama::Error) -> EngineErr {
     EngineErr::Other(format!("{what}: {e}"))
 }
 
+/// Where routes come from when the user named a hub instead of stages.
+struct Resolver {
+    hub: NextHop,
+    cache: Option<PathBuf>,
+    fingerprint: String,
+    n_embd: u32,
+    begin: i32,
+    end: i32,
+    info: DirectoryInfo,
+}
+
+impl Resolver {
+    /// Fetch the directory (falling back to the cache) and choose a chain, avoiding
+    /// `exclude` when any other chain exists.
+    fn resolve(
+        &mut self,
+        rt: &tokio::runtime::Handle,
+        endpoint: &Endpoint,
+        exclude: &HashSet<NodeId>,
+    ) -> Result<Vec<StageEndpoint>, String> {
+        let now = crate::hub::unix_now();
+        let (dir, from_cache) = match directory::fetch(rt, endpoint, &self.hub) {
+            Ok((signed, dir)) => {
+                if let Some(c) = &self.cache {
+                    directory::save_cache(c, &signed);
+                }
+                (dir, false)
+            }
+            Err(e) => {
+                tracing::warn!("{e}; trying the cached directory");
+                match self.cache.as_ref().and_then(|c| directory::load_cache(c, &self.hub)) {
+                    Some(dir) => (dir, true),
+                    None => return Err(e),
+                }
+            }
+        };
+        let (route, listed, usable) = directory::select_route(
+            &dir,
+            now,
+            &self.fingerprint,
+            self.n_embd,
+            self.begin,
+            self.end,
+            exclude,
+        );
+        self.info = DirectoryInfo {
+            hub: self.hub.addr.clone(),
+            issued_at: dir.issued_at,
+            from_cache,
+            nodes_listed: listed,
+            nodes_usable: usable,
+        };
+        let route = route.ok_or_else(|| {
+            format!(
+                "no chain of stages in the directory covers layers {}:{} for this model ({usable} usable of {listed} listed)",
+                self.begin, self.end
+            )
+        })?;
+        tracing::info!(
+            hub = %self.hub.addr,
+            from_cache,
+            listed,
+            usable,
+            route = %route.iter().map(|s| format!("{}@{}", s.layers, s.addr)).collect::<Vec<_>>().join(" -> "),
+            "route chosen from the directory"
+        );
+        Ok(route)
+    }
+}
+
 struct Engine {
     head_model: Arc<Model>,
     head: Context,
     tail: Context,
     /// `None` when the route is head and tail only.
     route: Option<Route>,
+    resolver: Option<Resolver>,
+    endpoint: Endpoint,
+    rt: tokio::runtime::Handle,
+    return_policy: ReturnPolicy,
+    head_range: LayerRange,
+    tail_range: LayerRange,
     sessions: Vec<Session>,
     act_dtype: ActDtype,
     prefill_chunk: usize,
@@ -335,12 +418,37 @@ impl Engine {
         let n_layer = head_model.n_layer();
         let n_embd = head_model.n_embd();
 
+        // Stages come from the flags, or from the hub's directory.
+        let fingerprint = if cfg.stages.is_empty() && cfg.hub.is_none() {
+            String::new()
+        } else {
+            dfin_proto::model_fingerprint(&cfg.model_path).context("fingerprinting model")?
+        };
+        let (stages, resolver) = if !cfg.stages.is_empty() {
+            (cfg.stages.clone(), None)
+        } else if let Some(hub) = &cfg.hub {
+            let mut res = Resolver {
+                hub: hub.clone(),
+                cache: cfg.directory_cache.clone(),
+                fingerprint: fingerprint.clone(),
+                n_embd: n_embd as u32,
+                begin: cfg.head.end,
+                end: cfg.tail.begin,
+                info: DirectoryInfo::default(),
+            };
+            let stages = res
+                .resolve(&rt, &endpoint, &HashSet::new())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            (stages, Some(res))
+        } else {
+            (Vec::new(), None)
+        };
+
         let route = RouteConfig {
             model: cfg.model_path.clone(),
             head: cfg.head,
             tail: cfg.tail,
-            stages: cfg
-                .stages
+            stages: stages
                 .iter()
                 .map(|s| StageEndpointToml {
                     addr: s.addr.clone(),
@@ -433,17 +541,15 @@ impl Engine {
         };
         let add_bos = head_model.vocab().add_bos();
 
-        let route = if cfg.stages.is_empty() {
+        let route = if stages.is_empty() {
             None
         } else {
-            let fingerprint =
-                dfin_proto::model_fingerprint(&cfg.model_path).context("fingerprinting model")?;
             let mut route = Route::new(
-                cfg.stages.clone(),
+                stages.clone(),
                 cfg.return_policy.clone(),
-                endpoint,
-                rt,
-                fingerprint,
+                endpoint.clone(),
+                rt.clone(),
+                fingerprint.clone(),
                 n_embd as u32,
                 prefill_chunk as u32,
             );
@@ -462,31 +568,7 @@ impl Engine {
             })
             .collect();
 
-        let mut route_info = vec![RouteEntry {
-            kind: "head",
-            addr: None,
-            node_id: None,
-            layers: cfg.head.to_string(),
-            backend: None,
-        }];
-        if let Some(r) = &route {
-            for (i, s) in r.hops.iter().enumerate() {
-                route_info.push(RouteEntry {
-                    kind: "stage",
-                    addr: Some(s.addr.clone()),
-                    node_id: Some(s.node_id.to_string()),
-                    layers: s.layers.to_string(),
-                    backend: Some(r.backends[i].clone()).filter(|b| !b.is_empty()),
-                });
-            }
-        }
-        route_info.push(RouteEntry {
-            kind: "tail",
-            addr: None,
-            node_id: None,
-            layers: tail_range.to_string(),
-            backend: None,
-        });
+        let route_info = route_entries(cfg.head, tail_range, route.as_ref());
 
         let info = StaticInfo {
             model_path: cfg.model_path.clone(),
@@ -498,7 +580,12 @@ impl Engine {
             max_sessions: cfg.max_sessions,
             per_session_ctx,
         };
-        stats.lock().hops = vec![HopCounters::default(); cfg.stages.len()];
+        {
+            let mut st = stats.lock();
+            st.hops = vec![HopCounters::default(); stages.len()];
+            st.current_route = info.route.clone();
+            st.directory = resolver.as_ref().map(|r| r.info.clone());
+        }
 
         Ok((
             Engine {
@@ -506,6 +593,12 @@ impl Engine {
                 head,
                 tail,
                 route,
+                resolver,
+                endpoint,
+                rt,
+                return_policy: cfg.return_policy.clone(),
+                head_range: cfg.head,
+                tail_range,
                 sessions,
                 act_dtype: cfg.act_dtype,
                 prefill_chunk,
@@ -551,8 +644,9 @@ impl Engine {
         }
     }
 
-    /// Rebuild the route if it dropped. The stages' session state is then unknown,
-    /// so every cached session is dropped.
+    /// Rebuild the route if it dropped. With a hub, ask the directory again and prefer a
+    /// chain that avoids the nodes of the broken route. The stages' session state is then
+    /// unknown, so every cached session is dropped.
     fn ensure_connected(&mut self) -> Result<(), EngineErr> {
         let Some(route) = &mut self.route else {
             return Ok(());
@@ -561,8 +655,44 @@ impl Engine {
             return Ok(());
         }
         tracing::warn!(first = %route.first_addr(), "route dropped; rebuilding");
-        connect_with_backoff(route, Duration::from_secs(5))?;
-        route.counters.rebuilds += 1;
+        let rebuilds = route.counters.rebuilds + 1;
+        if let Some(res) = &mut self.resolver {
+            let exclude: HashSet<NodeId> = route.hops.iter().map(|h| h.node_id).collect();
+            match res.resolve(&self.rt, &self.endpoint, &exclude) {
+                Ok(stages) if stages != route.hops => {
+                    let mut fresh = Route::new(
+                        stages,
+                        self.return_policy.clone(),
+                        self.endpoint.clone(),
+                        self.rt.clone(),
+                        route_fingerprint(route),
+                        self.n_embd as u32,
+                        self.prefill_chunk as u32,
+                    );
+                    connect_with_backoff(&mut fresh, Duration::from_secs(5))?;
+                    fresh.counters.rebuilds = rebuilds;
+                    *route = fresh;
+                }
+                Ok(_) => {
+                    connect_with_backoff(route, Duration::from_secs(5))?;
+                    route.counters.rebuilds = rebuilds;
+                }
+                Err(e) => {
+                    tracing::warn!("{e}; retrying the previous route");
+                    connect_with_backoff(route, Duration::from_secs(5))?;
+                    route.counters.rebuilds = rebuilds;
+                }
+            }
+        } else {
+            connect_with_backoff(route, Duration::from_secs(5))?;
+            route.counters.rebuilds = rebuilds;
+        }
+        {
+            let mut st = self.stats.lock();
+            st.current_route = route_entries(self.head_range, self.tail_range, self.route.as_ref());
+            st.hops = vec![HopCounters::default(); self.route.as_ref().map_or(0, |r| r.hops.len())];
+            st.directory = self.resolver.as_ref().map(|r| r.info.clone());
+        }
         for i in 0..self.sessions.len() {
             if !self.sessions[i].tokens.is_empty() {
                 self.reset_session(i);
@@ -945,6 +1075,40 @@ impl Engine {
         self.last_tail_ms = t.elapsed().as_secs_f64() * 1e3;
         Ok(out)
     }
+}
+
+fn route_fingerprint(route: &Route) -> String {
+    route.fingerprint().to_string()
+}
+
+/// The route as `/status` shows it: head, each stage, tail.
+fn route_entries(head: LayerRange, tail: LayerRange, route: Option<&Route>) -> Vec<RouteEntry> {
+    let mut out = vec![RouteEntry {
+        kind: "head",
+        addr: None,
+        node_id: None,
+        layers: head.to_string(),
+        backend: None,
+    }];
+    if let Some(r) = route {
+        for (i, s) in r.hops.iter().enumerate() {
+            out.push(RouteEntry {
+                kind: "stage",
+                addr: Some(s.addr.clone()),
+                node_id: Some(s.node_id.to_string()),
+                layers: s.layers.to_string(),
+                backend: Some(r.backends[i].clone()).filter(|b| !b.is_empty()),
+            });
+        }
+    }
+    out.push(RouteEntry {
+        kind: "tail",
+        addr: None,
+        node_id: None,
+        layers: tail.to_string(),
+        backend: None,
+    });
+    out
 }
 
 /// Set the route up, retrying transport failures with exponential backoff until

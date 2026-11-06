@@ -10,6 +10,7 @@
 //! * [`route`]: the chain of stages, set up and driven over the QUIC transport.
 //! * [`sampling`], [`text`]: sampler, UTF-8 accumulation and stop strings.
 
+pub mod directory;
 mod engine;
 mod http;
 pub mod route;
@@ -49,6 +50,14 @@ pub struct ClientArgs {
     /// results through it, so no stage learns this client's address. Overrides `--return`.
     #[arg(long, value_parser = parse_relay)]
     pub relay: Option<dfin_proto::NextHop>,
+    /// A hub (`host:port/<node id>`) whose signed directory supplies the stages between
+    /// `--head` and `--tail` when no `--stage` is given. The route is rebuilt from the
+    /// directory when a stage drops.
+    #[arg(long, value_parser = parse_hub)]
+    pub hub: Option<dfin_proto::NextHop>,
+    /// Where the last verified directory is kept, so routing survives a hub outage.
+    #[arg(long, default_value = "dfin-directory.cache")]
+    pub directory_cache: PathBuf,
     /// Route TOML (model, head, tail, stages) instead of the flags above.
     #[arg(long)]
     pub route: Option<PathBuf>,
@@ -107,17 +116,11 @@ fn parse_return(s: &str) -> Result<ReturnPolicy, String> {
 }
 
 fn parse_relay(s: &str) -> Result<dfin_proto::NextHop, String> {
-    let (addr, id) = s
-        .rsplit_once('/')
-        .ok_or_else(|| format!("relay {s:?} must look like host:port/<node id>"))?;
-    if addr.is_empty() {
-        return Err(format!("relay {s:?} has an empty address"));
-    }
-    let node_id: dfin_net::NodeId = id.parse().map_err(|e| format!("relay {s:?}: {e}"))?;
-    Ok(dfin_proto::NextHop {
-        addr: addr.to_string(),
-        node_id: *node_id.as_bytes(),
-    })
+    crate::config::parse_node_addr(s).map_err(|e| format!("relay {e}"))
+}
+
+fn parse_hub(s: &str) -> Result<dfin_proto::NextHop, String> {
+    crate::config::parse_node_addr(s).map_err(|e| format!("hub {e}"))
 }
 
 fn parse_act_dtype(s: &str) -> Result<ActDtype, String> {
@@ -174,6 +177,8 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
             Some(relay) => ReturnPolicy::Relay(relay.clone()),
             None => args.return_mode.clone(),
         },
+        hub: args.hub.clone(),
+        directory_cache: Some(args.directory_cache.clone()),
         n_ctx: args.n_ctx,
         n_gpu_layers: args.n_gpu_layers,
         cpu_tensors: args.cpu_tensors.clone(),

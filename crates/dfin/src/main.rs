@@ -5,12 +5,14 @@
 //!   exposes an OpenAI-compatible API on localhost.
 //! * `dfin relay`  pipes streams between a client and its route so stages never
 //!   learn the client's address.
+//! * `dfin hub`    publishes a signed directory of announced stages.
 //! * `dfin pod`    launches stages plus a client on this machine for testing.
 //! * `dfin bench`  measures monolithic versus pipelined decode on this machine.
 
 mod bench;
 mod client;
 mod config;
+mod hub;
 mod pod;
 mod relay;
 mod stage;
@@ -40,6 +42,8 @@ enum Cmd {
     Client(client::ClientArgs),
     /// Pipe streams between clients and their routes, hiding client addresses from stages.
     Relay(relay::RelayArgs),
+    /// Publish a signed directory of the stages that announce to this hub.
+    Hub(hub::HubArgs),
     /// Launch a local pod (stages plus client) on this machine.
     Pod(pod::PodArgs),
     /// Benchmark monolithic versus pipelined decode on this machine.
@@ -54,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Stage(args) => stage::run(args).await,
         Cmd::Client(args) => client::run(args).await,
         Cmd::Relay(args) => relay::run(args).await,
+        Cmd::Hub(args) => hub::run(args).await,
         Cmd::Pod(args) => pod::run(args).await,
         Cmd::Bench(args) => bench::run(args).await,
     }

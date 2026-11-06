@@ -11,6 +11,7 @@
 //!
 //! See `docs/phase1-protocol.md`.
 
+pub mod directory;
 pub mod identity;
 pub mod sealed;
 mod tls;

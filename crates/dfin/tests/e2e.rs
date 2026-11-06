@@ -5,9 +5,10 @@
 //! the test model at `models/tiny-llama-f32.gguf`.
 
 use dfin_llama::{Context, ContextParams, Model, ModelParams, OutputMode};
+use dfin_net::directory::verify_directory;
 use dfin_net::transport::{CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
 use dfin_net::{Endpoint, NodeId, NodeKey};
-use dfin_proto::{Request, Response};
+use dfin_proto::{Request, Response, MAX_DIRECTORY_BYTES};
 use serde_json::{json, Value};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -78,6 +79,36 @@ fn rand_suffix() -> u64 {
         .as_nanos() as u64
 }
 
+/// How many records the hub at `addr` lists (0 if it cannot be reached or verified).
+async fn directory_count(probe: &Endpoint, addr: &str, hub_id: NodeId) -> usize {
+    let Ok(conn) = probe.connect(addr, hub_id).await else {
+        return 0;
+    };
+    let r: Result<Response, _> = conn
+        .call(&Request::DirectoryGet, MAX_DIRECTORY_BYTES, CONTROL_TIMEOUT)
+        .await;
+    conn.close("probe");
+    match r {
+        Ok(Response::Directory { directory }) => verify_directory(&directory, &hub_id)
+            .map(|d| d.entries.len())
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+async fn wait_listed(probe: &Endpoint, addr: &str, hub_id: NodeId, n: usize, procs: &Procs) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if directory_count(probe, addr, hub_id).await >= n {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("hub never listed {n} stages\n{}", procs.logs());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn stage_answers(probe: &Endpoint, addr: &str, id: NodeId) -> bool {
     let Ok(conn) = probe.connect(addr, id).await else {
         return false;
@@ -141,6 +172,11 @@ impl Procs {
             out.push('\n');
         }
         out
+    }
+
+    fn kill(&mut self, i: usize) {
+        let _ = self.0[i].child.kill();
+        let _ = self.0[i].child.wait();
     }
 
     fn check_alive(&mut self, i: usize) {
@@ -547,4 +583,137 @@ async fn head_tail_only() {
         .unwrap();
     assert_eq!(status["route"].as_array().unwrap().len(), 2, "{status:#}");
     assert_eq!(status["route"][1]["layers"], "4:8");
+}
+
+/// Stages announce to a hub; the client is given only the hub and builds its own route.
+/// Then the first stage is killed, a replacement for its range announces, and the next
+/// requests must succeed over the new route.
+#[tokio::test(flavor = "multi_thread")]
+async fn route_from_hub_and_reroute_after_stage_death() {
+    if should_skip() {
+        return;
+    }
+    let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
+    let model = model_path().display().to_string();
+    let probe = Endpoint::client(NodeKey::generate()).unwrap();
+    let mut procs = Procs::default();
+
+    let hub_port = free_udp_port();
+    let hub_key = StageKey::new("hub");
+    let hub_addr = format!("127.0.0.1:{hub_port}");
+    let hub_args: Vec<String> = ["hub", "--listen", &hub_addr, "--identity", &hub_key.path.display().to_string()]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let hi = procs.spawn("hub", &hub_args);
+    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(60)).await;
+    let hub_flag = format!("{hub_addr}/{}", hub_key.id);
+
+    let spawn_stage = |procs: &mut Procs, name: &str, layers: &str, key: &StageKey, port: u16| -> usize {
+        let args: Vec<String> = [
+            "stage",
+            "--model",
+            &model,
+            "--layers",
+            layers,
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--identity",
+            &key.path.display().to_string(),
+            "--hub",
+            &hub_flag,
+            "--announce-every",
+            "5",
+            "--n-gpu-layers",
+            "0",
+            "--act-dtype",
+            "f32",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        procs.spawn(name, &args)
+    };
+    let (k1, k2, k3) = (StageKey::new("s1"), StageKey::new("s2"), StageKey::new("s3"));
+    let (p1, p2, p3) = (free_udp_port(), free_udp_port(), free_udp_port());
+    let s1 = spawn_stage(&mut procs, "stage1", "2:4", &k1, p1);
+    let s2 = spawn_stage(&mut procs, "stage2", "4:6", &k2, p2);
+    procs.wait_stage(s1, p1, k1.id, Duration::from_secs(120)).await;
+    procs.wait_stage(s2, p2, k2.id, Duration::from_secs(120)).await;
+    wait_listed(&probe, &hub_addr, hub_key.id, 2, &procs).await;
+
+    let pc = free_port();
+    let cache = std::env::temp_dir().join(format!("dfin-e2e-dir-{}.cache", std::process::id()));
+    let _ = std::fs::remove_file(&cache);
+    let args: Vec<String> = [
+        "client",
+        "--model",
+        &model,
+        "--head",
+        "0:2",
+        "--tail",
+        "6:end",
+        "--hub",
+        &hub_flag,
+        "--directory-cache",
+        &cache.display().to_string(),
+        "--n-gpu-layers",
+        "0",
+        "--act-dtype",
+        "f32",
+        "--max-sessions",
+        "2",
+        "--n-ctx",
+        "512",
+        "--listen",
+        &format!("127.0.0.1:{pc}"),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let ci = procs.spawn("client", &args);
+    let base = format!("http://127.0.0.1:{pc}");
+    procs.wait_health(ci, &base, Duration::from_secs(120)).await;
+    exercise(&procs, &base, &expected).await;
+
+    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    assert_eq!(status["route"].as_array().unwrap().len(), 4, "{status:#}");
+    assert_eq!(status["directory"]["nodes_usable"], 2, "{status:#}");
+    assert_eq!(status["directory"]["from_cache"], false, "{status:#}");
+    assert!(cache.exists(), "directory cache was not written");
+    let first_hop = status["route"][1]["node_id"].as_str().unwrap().to_string();
+    assert!(first_hop == k1.id.to_string(), "{status:#}");
+
+    // A replacement for layers 2:4 joins, then the first stage dies.
+    let s3 = spawn_stage(&mut procs, "stage3", "2:4", &k3, p3);
+    procs.wait_stage(s3, p3, k3.id, Duration::from_secs(120)).await;
+    wait_listed(&probe, &hub_addr, hub_key.id, 3, &procs).await;
+    procs.kill(s1);
+
+    let http = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut rerouted = false;
+    while Instant::now() < deadline {
+        let (code, body) = post(
+            &http,
+            format!("{base}/v1/completions"),
+            json!({ "prompt": PROMPT, "max_tokens": MAX_TOKENS, "temperature": 0 }),
+        )
+        .await;
+        if code == 200 {
+            let v: Value = serde_json::from_str(&body).unwrap();
+            let text = v["choices"][0]["text"].as_str().unwrap_or("");
+            assert_eq!(text, expected, "rerouted output differs");
+            let status: Value = http.get(format!("{base}/status")).send().await.unwrap().json().await.unwrap();
+            let now_first = status["route"][1]["node_id"].as_str().unwrap_or("").to_string();
+            if now_first == k3.id.to_string() {
+                assert!(status["stats"]["chain"]["rebuilds"].as_u64().unwrap() >= 1, "{status:#}");
+                rerouted = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(rerouted, "client did not reroute to the replacement stage\n{}", procs.logs());
+    let _ = std::fs::remove_file(&cache);
 }

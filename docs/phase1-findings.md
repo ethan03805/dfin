@@ -73,11 +73,21 @@ Not yet rerun on the new transport: the MacBook Air still runs the Phase 0 TCP s
 follow-up prompt in `mac-node-prompt.md` updates it; `scripts/lan-pod.sh` takes the Mac's
 node id and `RETURN=` or `RELAY=`.
 
-## 5. Phase 1 scope still open
+## 5. The directory (6 November 2026, later the same day)
 
-Cloaked nodes (stages reachable only through relays), the signed directory, per-layer
-weight shards with peer seeding, multi-tensor stage state for `glm5-next` and Kimi K3,
-replay-log failover when a stage dies mid-generation, region fencing by timing probes,
-fuzzing of the frame decoders. The Linux build, a CPU-only container image (136 MB)
+`dfin hub`, signed node records, announcements with a reachability check, client-side
+route choice from the verified list, a cache for hub outages, and rerouting: the
+end-to-end test kills the first stage of a two-stage route after a replacement for its
+layers has announced, and the client's next requests succeed over the replacement with
+identical output. Protocol section 10 has the details. On the tiny model the whole
+sequence (hub up, two stages listed, requests, a third stage listed, the kill, the
+reroute) takes under 30 seconds.
+
+## 6. Phase 1 scope still open
+
+Cloaked nodes (stages reachable only through relays), per-layer weight shards with peer
+seeding, multi-tensor stage state for `glm5-next` and Kimi K3, failover of a live
+session without losing its context, region fencing from several vantage points, fuzzing
+of the frame decoders. The Linux build, a CPU-only container image (136 MB)
 and continuous integration on GitHub Actions landed in pull request 1 (6.5 minutes
 cold; the Windows-generated bindings compile unchanged on Linux x86-64).

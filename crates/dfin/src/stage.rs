@@ -10,15 +10,16 @@
 
 mod engine;
 
-use crate::config::LayerRange;
+use crate::config::{parse_node_addr, LayerRange};
 use anyhow::{bail, Context as _};
 use clap::{Args, ValueEnum};
 use dfin_llama::{Context, ContextParams, FlashAttn, KvType, Model, ModelParams};
+use dfin_net::directory::sign_record;
 use dfin_net::transport::{reply, CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
 use dfin_net::{unseal, Connection, Endpoint, NetError, NodeId, NodeKey};
 use dfin_proto::{
-    forward_frame_limit, ActDtype, Activations, ErrorCode, HopRecord, HopStat, NextHop, Request,
-    Response, ReturnFrame, ReturnMode, PROTOCOL_VERSION,
+    forward_frame_limit, ActDtype, Activations, ErrorCode, HopRecord, HopStat, NextHop,
+    NodeRecord, Request, Response, ReturnFrame, ReturnMode, PROTOCOL_VERSION,
 };
 use engine::{Engine, Job, Reply};
 use parking_lot::Mutex;
@@ -116,6 +117,19 @@ pub struct StageArgs {
     /// Physical micro-batch size.
     #[arg(long, default_value_t = 512)]
     pub n_ubatch: u32,
+    /// A hub (`host:port/<node id>`) to announce this stage to. Repeatable.
+    #[arg(long = "hub", value_parser = parse_node_addr)]
+    pub hubs: Vec<NextHop>,
+    /// The address other nodes should dial (`host:port`). Required with `--hub` when
+    /// `--listen` is an unspecified address such as `0.0.0.0`.
+    #[arg(long)]
+    pub advertise: Option<String>,
+    /// Region claim published in the record (free text, verified by nobody).
+    #[arg(long, default_value = "")]
+    pub region: String,
+    /// Seconds between announcements; records expire after three times this.
+    #[arg(long, default_value_t = 60)]
+    pub announce_every: u64,
 }
 
 /// What every connection needs to know about this stage.
@@ -295,6 +309,47 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         max_routes: args.max_routes.max(1),
     });
 
+    if !args.hubs.is_empty() {
+        let advertise = match &args.advertise {
+            Some(a) => a.clone(),
+            None if !addr.ip().is_unspecified() => addr.to_string(),
+            None => bail!(
+                "--hub needs --advertise host:port when --listen is {} (other nodes cannot dial an unspecified address)",
+                args.listen
+            ),
+        };
+        let template = NodeRecord {
+            node_id: *stage.info.node_id.as_bytes(),
+            addrs: vec![advertise],
+            model_fingerprint: stage.info.fingerprint.clone(),
+            model_name: args
+                .model
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            layer_begin,
+            layer_end,
+            n_layer: model.n_layer(),
+            n_embd: stage.info.n_embd,
+            n_ctx_seq: stage.info.n_ctx_seq,
+            n_seq_max: stage.info.n_seq_max,
+            act_dtype: args.act_dtype,
+            backend: stage.info.backend.clone(),
+            protocol: PROTOCOL_VERSION,
+            region: args.region.clone(),
+            attested: false,
+            issued_at: 0,
+            ttl_secs: (args.announce_every.max(5) * 3).min(dfin_proto::MAX_RECORD_TTL_SECS as u64)
+                as u32,
+        };
+        tokio::spawn(announce_loop(
+            endpoint.clone(),
+            args.hubs.clone(),
+            template,
+            Duration::from_secs(args.announce_every.max(5)),
+        ));
+    }
+
     let accept_loop = async {
         while let Some(incoming) = endpoint.accept().await {
             let conn = match incoming {
@@ -330,6 +385,74 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Response {
     Response::Error {
         code,
         message: message.into(),
+    }
+}
+
+/// Announce a fresh signed record to every hub, forever.
+async fn announce_loop(
+    endpoint: Endpoint,
+    hubs: Vec<NextHop>,
+    template: NodeRecord,
+    every: Duration,
+) {
+    let mut conns: HashMap<NodeId, Connection> = HashMap::new();
+    let mut announced: HashMap<NodeId, bool> = HashMap::new();
+    loop {
+        let mut record = template.clone();
+        record.issued_at = crate::hub::unix_now();
+        let signed = match sign_record(endpoint.key(), &record) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("cannot sign node record: {e}");
+                return;
+            }
+        };
+        for hub in &hubs {
+            let id = NodeId(hub.node_id);
+            let conn = match conns.get(&id).filter(|c| !c.is_closed()) {
+                Some(c) => c.clone(),
+                None => match endpoint.connect(&hub.addr, id).await {
+                    Ok(c) => {
+                        conns.insert(id, c.clone());
+                        c
+                    }
+                    Err(e) => {
+                        warn!(hub = %hub.addr, "cannot reach hub: {e}");
+                        continue;
+                    }
+                },
+            };
+            let r: Result<Response, NetError> = conn
+                .call(
+                    &Request::Announce {
+                        record: signed.clone(),
+                    },
+                    MAX_CONTROL_FRAME,
+                    Duration::from_secs(20),
+                )
+                .await;
+            match r {
+                Ok(Response::Ack) => {
+                    if !announced.get(&id).copied().unwrap_or(false) {
+                        info!(hub = %hub.addr, addr = %record.addrs[0], "listed in the directory");
+                        announced.insert(id, true);
+                    } else {
+                        debug!(hub = %hub.addr, "announcement refreshed");
+                    }
+                }
+                Ok(Response::Error { code, message }) => {
+                    warn!(hub = %hub.addr, ?code, "announcement refused: {message}");
+                    announced.insert(id, false);
+                }
+                Ok(other) => warn!(hub = %hub.addr, "unexpected announce reply {other:?}"),
+                Err(e) => {
+                    warn!(hub = %hub.addr, "announce failed: {e}");
+                    conns.remove(&id);
+                    announced.insert(id, false);
+                }
+            }
+        }
+        tokio::time::sleep(every).await;
     }
 }
 
@@ -578,8 +701,11 @@ impl Stage {
                 };
                 self.close_route(&rs, route).await
             }
-            Request::RelayOpen { .. } | Request::RelayAttach { .. } => {
-                error(ErrorCode::BadRequest, "this node is a stage, not a relay")
+            Request::RelayOpen { .. }
+            | Request::RelayAttach { .. }
+            | Request::Announce { .. }
+            | Request::DirectoryGet => {
+                error(ErrorCode::BadRequest, "this node is a stage, not a relay or hub")
             }
         }
     }

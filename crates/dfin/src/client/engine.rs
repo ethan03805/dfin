@@ -1,4 +1,4 @@
-//! The engine thread: owns the head and tail contexts and the stage connections,
+//! The engine thread: owns the head and tail contexts and the route to the stages,
 //! and runs generation jobs one at a time in FIFO order.
 //!
 //! Nothing in here touches the tokio runtime except through channels: jobs arrive
@@ -6,7 +6,7 @@
 //! per-job channel (`blocking_send`).
 
 use super::sampling::{Sampler, SamplingParams};
-use super::stage_conn::{ConnError, StageConn, StageCounters};
+use super::route::{HopCounters, ReturnPolicy, Route, RouteCounters, RouteError};
 use super::text::{StopMatcher, Utf8Accumulator};
 use crate::config::{LayerRange, RouteConfig, StageEndpoint, StageEndpointToml};
 use anyhow::Context as _;
@@ -14,7 +14,8 @@ use dfin_llama::{
     ChatMessage, Context, ContextParams, FlashAttn, KvType, Model, ModelParams, OutputMode, SeqId,
     Token,
 };
-use dfin_proto::{ActDtype, Activations, Request, Response};
+use dfin_net::{Endpoint, NodeKey};
+use dfin_proto::{ActDtype, Activations};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -134,6 +135,7 @@ pub struct EngineConfig {
     pub head: LayerRange,
     pub tail: LayerRange,
     pub stages: Vec<StageEndpoint>,
+    pub return_policy: ReturnPolicy,
     pub n_ctx: u32,
     pub n_gpu_layers: i32,
     /// Tensor-name regexes kept on the CPU buffer type (MoE experts in RAM).
@@ -153,6 +155,8 @@ pub struct RouteEntry {
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     pub layers: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -166,6 +170,7 @@ pub struct StaticInfo {
     pub n_embd: i32,
     pub act_dtype: ActDtype,
     pub route: Vec<RouteEntry>,
+    pub return_mode: &'static str,
     pub max_sessions: u32,
     pub per_session_ctx: usize,
 }
@@ -191,7 +196,8 @@ pub struct Stats {
     pub prefix_tokens_reused: u64,
     pub sessions_live: usize,
     pub sessions_busy: usize,
-    pub stages: Vec<StageCounters>,
+    pub hops: Vec<HopCounters>,
+    pub chain: RouteCounters,
 }
 
 impl Stats {
@@ -218,22 +224,22 @@ struct Session {
 }
 
 enum EngineErr {
-    Conn(ConnError),
+    Route(RouteError),
     Other(String),
     /// The HTTP side went away; stop quietly.
     Cancelled,
 }
 
-impl From<ConnError> for EngineErr {
-    fn from(e: ConnError) -> Self {
-        EngineErr::Conn(e)
+impl From<RouteError> for EngineErr {
+    fn from(e: RouteError) -> Self {
+        EngineErr::Route(e)
     }
 }
 
 impl EngineErr {
     fn into_api(self) -> Option<ApiError> {
         match self {
-            EngineErr::Conn(e) => Some(ApiError::internal(e.to_string())),
+            EngineErr::Route(e) => Some(ApiError::internal(e.to_string())),
             EngineErr::Other(m) => Some(ApiError::internal(m)),
             EngineErr::Cancelled => None,
         }
@@ -248,8 +254,8 @@ struct Engine {
     head_model: Arc<Model>,
     head: Context,
     tail: Context,
-    stages: Vec<StageConn>,
-    fingerprint: String,
+    /// `None` when the route is head and tail only.
+    route: Option<Route>,
     sessions: Vec<Session>,
     act_dtype: ActDtype,
     prefill_chunk: usize,
@@ -272,9 +278,12 @@ pub async fn spawn(
 ) -> anyhow::Result<(mpsc::Sender<Job>, StaticInfo)> {
     let (job_tx, job_rx) = mpsc::channel::<Job>(queue.max(1));
     let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<StaticInfo>>();
+    // One ephemeral client key per daemon start; stages see this instead of an account.
+    let endpoint = Endpoint::client(NodeKey::generate()).context("creating QUIC endpoint")?;
+    let rt = tokio::runtime::Handle::current();
     std::thread::Builder::new()
         .name("dfin-engine".into())
-        .spawn(move || match Engine::new(cfg, stats) {
+        .spawn(move || match Engine::new(cfg, stats, endpoint, rt) {
             Ok((engine, info)) => {
                 let _ = ready_tx.send(Ok(info));
                 engine.run(job_rx);
@@ -295,7 +304,12 @@ fn lcp(a: &[Token], b: &[Token]) -> usize {
 }
 
 impl Engine {
-    fn new(cfg: EngineConfig, stats: Arc<Mutex<Stats>>) -> anyhow::Result<(Engine, StaticInfo)> {
+    fn new(
+        cfg: EngineConfig,
+        stats: Arc<Mutex<Stats>>,
+        endpoint: Endpoint,
+        rt: tokio::runtime::Handle,
+    ) -> anyhow::Result<(Engine, StaticInfo)> {
         dfin_llama::init();
         if cfg.max_sessions == 0 {
             anyhow::bail!("--max-sessions must be at least 1");
@@ -330,6 +344,7 @@ impl Engine {
                 .iter()
                 .map(|s| StageEndpointToml {
                     addr: s.addr.clone(),
+                    node_id: s.node_id,
                     layers: s.layers,
                 })
                 .collect(),
@@ -418,21 +433,24 @@ impl Engine {
         };
         let add_bos = head_model.vocab().add_bos();
 
-        let fingerprint = if cfg.stages.is_empty() {
-            String::new()
+        let route = if cfg.stages.is_empty() {
+            None
         } else {
-            dfin_proto::model_fingerprint(&cfg.model_path).context("fingerprinting model")?
-        };
-
-        let mut stages: Vec<StageConn> = cfg
-            .stages
-            .iter()
-            .map(|s| StageConn::new(s.addr.clone(), s.layers))
-            .collect();
-        for s in &mut stages {
-            connect_with_backoff(s, &fingerprint, n_embd as u32, Duration::from_secs(60))
+            let fingerprint =
+                dfin_proto::model_fingerprint(&cfg.model_path).context("fingerprinting model")?;
+            let mut route = Route::new(
+                cfg.stages.clone(),
+                cfg.return_policy,
+                endpoint,
+                rt,
+                fingerprint,
+                n_embd as u32,
+                prefill_chunk as u32,
+            );
+            connect_with_backoff(&mut route, Duration::from_secs(60))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+            Some(route)
+        };
 
         let sessions = (0..cfg.max_sessions)
             .map(|slot| Session {
@@ -447,20 +465,25 @@ impl Engine {
         let mut route_info = vec![RouteEntry {
             kind: "head",
             addr: None,
+            node_id: None,
             layers: cfg.head.to_string(),
             backend: None,
         }];
-        for s in &stages {
-            route_info.push(RouteEntry {
-                kind: "stage",
-                addr: Some(s.addr.clone()),
-                layers: s.layers.to_string(),
-                backend: Some(s.backend.clone()),
-            });
+        if let Some(r) = &route {
+            for (i, s) in r.hops.iter().enumerate() {
+                route_info.push(RouteEntry {
+                    kind: "stage",
+                    addr: Some(s.addr.clone()),
+                    node_id: Some(s.node_id.to_string()),
+                    layers: s.layers.to_string(),
+                    backend: Some(r.backends[i].clone()).filter(|b| !b.is_empty()),
+                });
+            }
         }
         route_info.push(RouteEntry {
             kind: "tail",
             addr: None,
+            node_id: None,
             layers: tail_range.to_string(),
             backend: None,
         });
@@ -471,18 +494,18 @@ impl Engine {
             n_embd,
             act_dtype: cfg.act_dtype,
             route: route_info,
+            return_mode: cfg.return_policy.as_str(),
             max_sessions: cfg.max_sessions,
             per_session_ctx,
         };
-        stats.lock().stages = vec![StageCounters::default(); stages.len()];
+        stats.lock().hops = vec![HopCounters::default(); cfg.stages.len()];
 
         Ok((
             Engine {
                 head_model,
                 head,
                 tail,
-                stages,
-                fingerprint,
+                route,
                 sessions,
                 act_dtype: cfg.act_dtype,
                 prefill_chunk,
@@ -522,30 +545,27 @@ impl Engine {
             .filter(|s| !s.tokens.is_empty())
             .count();
         st.sessions_busy = self.sessions.iter().filter(|s| s.busy).count();
-        st.stages = self.stages.iter().map(|s| s.counters.clone()).collect();
+        if let Some(r) = &self.route {
+            st.hops = r.hop_counters.clone();
+            st.chain = r.counters.clone();
+        }
     }
 
-    /// Reconnect any dropped stage. After a reconnect the stages' session state is
-    /// unknown, so every cached session is dropped.
+    /// Rebuild the route if it dropped. The stages' session state is then unknown,
+    /// so every cached session is dropped.
     fn ensure_connected(&mut self) -> Result<(), EngineErr> {
-        let mut reconnected = false;
-        for i in 0..self.stages.len() {
-            if !self.stages[i].is_connected() {
-                tracing::warn!(addr = %self.stages[i].addr, "stage disconnected; reconnecting");
-                connect_with_backoff(
-                    &mut self.stages[i],
-                    &self.fingerprint,
-                    self.n_embd as u32,
-                    Duration::from_secs(5),
-                )?;
-                reconnected = true;
-            }
+        let Some(route) = &mut self.route else {
+            return Ok(());
+        };
+        if route.is_connected() {
+            return Ok(());
         }
-        if reconnected {
-            for i in 0..self.sessions.len() {
-                if !self.sessions[i].tokens.is_empty() {
-                    self.reset_session(i);
-                }
+        tracing::warn!(first = %route.first_addr(), "route dropped; rebuilding");
+        connect_with_backoff(route, Duration::from_secs(5))?;
+        route.counters.rebuilds += 1;
+        for i in 0..self.sessions.len() {
+            if !self.sessions[i].tokens.is_empty() {
+                self.reset_session(i);
             }
         }
         Ok(())
@@ -555,9 +575,9 @@ impl Engine {
     fn reset_session(&mut self, idx: usize) {
         let id = self.sessions[idx].id;
         let slot = self.sessions[idx].slot;
-        for s in &mut self.stages {
-            if s.is_connected() {
-                let _ = s.call(&Request::SessionClose { session: id });
+        if let Some(r) = &mut self.route {
+            if r.is_connected() {
+                let _ = r.close_session(id);
             }
         }
         self.head.seq_rm(slot, -1, -1);
@@ -571,18 +591,13 @@ impl Engine {
     fn evict(&mut self, idx: usize) -> Result<(), EngineErr> {
         let id = self.sessions[idx].id;
         let slot = self.sessions[idx].slot;
-        for s in &mut self.stages {
-            match s.call(&Request::SessionClose { session: id })? {
-                Response::Ok => {}
-                Response::Error { code, message } => {
-                    tracing::debug!(addr = %s.addr, ?code, "SessionClose: {message}");
+        if let Some(r) = &mut self.route {
+            match r.close_session(id) {
+                Ok(()) => {}
+                Err(RouteError::Stage { code, message, .. }) => {
+                    tracing::debug!(?code, "SessionClose: {message}");
                 }
-                other => {
-                    return Err(EngineErr::Other(format!(
-                        "stage {}: unexpected reply to SessionClose: {other:?}",
-                        s.addr
-                    )))
-                }
+                Err(e) => return Err(e.into()),
             }
         }
         self.head.seq_rm(slot, -1, -1);
@@ -606,26 +621,8 @@ impl Engine {
                 "KV rollback of slot {slot} to {keep} failed"
             )));
         }
-        for s in &mut self.stages {
-            match s.call(&Request::SeqRm {
-                session: id,
-                p0,
-                p1: -1,
-            })? {
-                Response::Ok => {}
-                Response::Error { code, message } => {
-                    return Err(EngineErr::Other(format!(
-                        "stage {} ({code:?}): {message}",
-                        s.addr
-                    )))
-                }
-                other => {
-                    return Err(EngineErr::Other(format!(
-                        "stage {}: unexpected reply to SeqRm: {other:?}",
-                        s.addr
-                    )))
-                }
-            }
+        if let Some(r) = &mut self.route {
+            r.seq_rm(id, p0, -1)?;
         }
         self.sessions[idx].tokens.truncate(keep);
         Ok(())
@@ -884,7 +881,7 @@ impl Engine {
         )
     }
 
-    /// One pipeline step: head over `tokens` at `pos0`, every stage in order, tail.
+    /// One pipeline step: head over `tokens` at `pos0`, the route, tail.
     /// Returns the last row's logits when `want_logits`.
     fn forward(
         &mut self,
@@ -912,63 +909,19 @@ impl Engine {
         let mut hidden = emb.to_vec();
         self.last_head_ms = t.elapsed().as_secs_f64() * 1e3;
 
-        for si in 0..self.stages.len() {
+        if let Some(route) = &mut self.route {
             let act = Activations::from_f32(&hidden, n, n_embd, self.act_dtype);
             self.seq += 1;
-            let seq = self.seq;
-            let t = Instant::now();
-            let resp = self.stages[si].call(&Request::Forward {
-                session,
-                seq,
-                pos0,
-                act,
-            })?;
-            let rtt_ms = t.elapsed().as_secs_f64() * 1e3;
-            let stage = &mut self.stages[si];
-            match resp {
-                Response::ForwardOk {
-                    session: rs,
-                    seq: rseq,
-                    act,
-                    compute_ms,
-                } => {
-                    if rs != session || rseq != seq {
-                        return Err(EngineErr::Other(format!(
-                            "stage {}: reply for session {rs} seq {rseq}, expected {session} seq {seq}",
-                            stage.addr
-                        )));
-                    }
-                    if act.n_tokens as usize != n || act.n_embd as usize != n_embd {
-                        return Err(EngineErr::Other(format!(
-                            "stage {}: returned [{}, {}] activations, expected [{n}, {n_embd}]",
-                            stage.addr, act.n_tokens, act.n_embd
-                        )));
-                    }
-                    hidden = act
-                        .to_f32()
-                        .map_err(|e| EngineErr::Other(format!("stage {}: {e}", stage.addr)))?;
-                    stage.counters.forwards += 1;
-                    stage.counters.rtt_ms_sum += rtt_ms;
-                    stage.counters.compute_ms_sum += compute_ms as f64;
-                    if n == 1 {
-                        stage.counters.decode_forwards += 1;
-                        stage.counters.decode_rtt_ms_sum += rtt_ms;
-                        stage.counters.decode_compute_ms_sum += compute_ms as f64;
-                    }
-                }
-                Response::Error { code, message } => {
-                    return Err(EngineErr::Other(format!(
-                        "stage {} ({code:?}): {message}",
-                        stage.addr
-                    )));
-                }
-                other => {
-                    return Err(EngineErr::Other(format!(
-                        "stage {}: unexpected reply to Forward: {other:?}",
-                        stage.addr
-                    )));
-                }
+            let (out, _hops) = route.forward(session, self.seq, pos0, act)?;
+            if out.n_tokens as usize != n || out.n_embd as usize != n_embd {
+                return Err(EngineErr::Other(format!(
+                    "route returned [{}, {}] activations, expected [{n}, {n_embd}]",
+                    out.n_tokens, out.n_embd
+                )));
             }
+            hidden = out
+                .to_f32()
+                .map_err(|e| EngineErr::Other(format!("route result: {e}")))?;
         }
 
         let t = Instant::now();
@@ -994,20 +947,16 @@ impl Engine {
     }
 }
 
-/// Connect to a stage, retrying with exponential backoff until `budget` elapses.
-/// Protocol-level rejections (wrong model, wrong layers) are not retried.
-fn connect_with_backoff(
-    s: &mut StageConn,
-    fingerprint: &str,
-    n_embd: u32,
-    budget: Duration,
-) -> Result<(), ConnError> {
+/// Set the route up, retrying transport failures with exponential backoff until
+/// `budget` elapses. Protocol-level rejections (wrong model, wrong layers) are not retried.
+fn connect_with_backoff(route: &mut Route, budget: Duration) -> Result<(), RouteError> {
     let deadline = Instant::now() + budget;
     let mut delay = Duration::from_millis(250);
     loop {
-        match s.connect(fingerprint, n_embd) {
+        match route.connect() {
             Ok(()) => return Ok(()),
-            Err(e @ ConnError::Protocol { .. }) => return Err(e),
+            Err(e @ RouteError::Protocol(_)) => return Err(e),
+            Err(e @ RouteError::Stage { .. }) => return Err(e),
             Err(e) => {
                 if Instant::now() + delay > deadline {
                     return Err(e);

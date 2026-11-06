@@ -37,6 +37,9 @@ pub struct BenchArgs {
     pub threads: Option<i32>,
     #[arg(long, default_value = "f16")]
     pub act_dtype: ActDtype,
+    /// Return mode for the pod client: `direct` or `reverse`.
+    #[arg(long = "return", default_value = "direct")]
+    pub return_mode: String,
     /// First stage port for the pod mode.
     #[arg(long, default_value_t = 7101)]
     pub base_port: u16,
@@ -370,6 +373,7 @@ async fn bench_pod_inner(
             cpu_tensors: a.cpu_tensors.clone(),
             threads: a.threads,
             act_dtype: a.act_dtype,
+            return_mode: a.return_mode.clone(),
             exe: None,
             log: Some("warn".into()),
             ready_timeout: Duration::from_secs(120),
@@ -424,23 +428,25 @@ async fn bench_pod_inner(
             if let Some(x) = get_f64(stats, "head_ms") {
                 notes.push(format!("head {x:.3}"));
             }
+            let chain = &stats["chain"];
+            if let Some(rtt) = get_f64(chain, "avg_rtt_ms") {
+                notes.push(format!(
+                    "chain ({}) rtt {} decode-only rtt {} ping {} setup {}",
+                    chain["return_mode"].as_str().unwrap_or("?"),
+                    fmt_opt(Some(rtt), 3),
+                    fmt_opt(get_f64(chain, "decode_avg_rtt_ms"), 3),
+                    fmt_opt(get_f64(chain, "ping_ms"), 2),
+                    fmt_opt(get_f64(chain, "setup_ms"), 1)
+                ));
+            }
             for (i, st) in stats["stages"].as_array().into_iter().flatten().enumerate() {
-                let rtt = get_f64(st, "avg_rtt_ms");
                 let comp = get_f64(st, "avg_compute_ms");
-                if rtt.is_some() || comp.is_some() {
+                let dcomp = get_f64(st, "decode_avg_compute_ms");
+                if comp.is_some() || dcomp.is_some() {
                     notes.push(format!(
-                        "stage{i} rtt {} compute {}",
-                        fmt_opt(rtt, 3),
-                        fmt_opt(comp, 3)
-                    ));
-                }
-                let drtt = get_f64(st, "decode_avg_rtt_ms");
-                if drtt.is_some() {
-                    notes.push(format!(
-                        "stage{i} decode-only rtt {} compute {} ping {}",
-                        fmt_opt(drtt, 3),
-                        fmt_opt(get_f64(st, "decode_avg_compute_ms"), 3),
-                        fmt_opt(get_f64(st, "ping_ms"), 2)
+                        "stage{i} compute {} decode-only {}",
+                        fmt_opt(comp, 3),
+                        fmt_opt(dcomp, 3)
                     ));
                 }
             }

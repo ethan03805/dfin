@@ -1,8 +1,10 @@
 //! Wire protocol between the client daemon and pipeline stage nodes.
 //!
-//! Phase 0 transport: a stream (TCP today, QUIC later) carrying length-prefixed
-//! frames. Each frame is a little-endian `u32` byte length followed by a
-//! [`postcard`]-encoded [`Request`] or [`Response`].
+//! Version 2 (phase 1): frames travel on QUIC streams (see `dfin-net`); routes are
+//! chains of stages set up with sealed per-hop records; results return along the
+//! chain or straight to the client. Each frame is a little-endian `u32` byte length
+//! followed by a [`postcard`]-encoded [`Request`], [`Response`] or [`ReturnFrame`].
+//! The contract is `docs/phase1-protocol.md`.
 //!
 //! Hidden states travel as [`Activations`]: a dense `[n_tokens, n_embd]` matrix in
 //! row-major order (token-major), as f32 or f16. FP8 is a later phase.
@@ -13,7 +15,7 @@ use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bump whenever the message layout changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest frame either side will accept. A 4k-token prefill chunk of a
 /// 6144-wide model is about 100 MB in f32, so leave generous headroom.
@@ -133,9 +135,59 @@ pub enum ErrorCode {
     Decode,
     BadRequest,
     Internal,
+    /// The route id is not known on this connection.
+    UnknownRoute,
+    /// Too many routes on one connection.
+    RouteLimit,
+    /// The sealed hop record did not open with this node's key.
+    BadRecord,
+    /// A later hop failed; the message names it.
+    Downstream,
+    /// The last hop has no connection to deliver results on.
+    NoReturnPath,
 }
 
-/// Client daemon to stage.
+/// Address and identity of a node to dial.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextHop {
+    pub addr: String,
+    pub node_id: [u8; 32],
+}
+
+/// Where the last hop sends results. Only the last hop's record is consulted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReturnMode {
+    /// Reply on the stream the forward arrived on; every hop relays it upstream.
+    Reverse,
+    /// Write results on the connection the client (identified by its key) holds to the last hop.
+    Direct { client_id: [u8; 32] },
+    /// Attach to a relay with `token` and write results there.
+    Relay { relay: NextHop, token: [u8; 16] },
+}
+
+/// The plaintext of one hop's sealed instructions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HopRecord {
+    pub model_fingerprint: String,
+    pub layer_begin: i32,
+    pub layer_end: i32,
+    /// The following hop, or `None` for the last.
+    pub next: Option<NextHop>,
+    pub ret: ReturnMode,
+    /// The next hop's sealed record (empty for the last hop).
+    #[serde(with = "serde_bytes")]
+    pub inner: Vec<u8>,
+}
+
+/// One hop's share of a forward, appended as the forward travels.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HopStat {
+    pub layer_begin: i32,
+    pub layer_end: i32,
+    pub compute_ms: f32,
+}
+
+/// Client daemon or previous hop to a stage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     /// First message on every connection. The stage checks the protocol version,
@@ -146,25 +198,49 @@ pub enum Request {
         layer_begin: i32,
         layer_end: i32,
     },
+    /// Establish a route. `hop` is this node's record, sealed to its key.
+    RouteSetup {
+        route: u64,
+        #[serde(with = "serde_bytes")]
+        hop: Vec<u8>,
+    },
     /// Run this stage's layers over `act` for `session`, at positions
-    /// `pos0 .. pos0 + n_tokens`, extending the session's KV cache.
-    /// `seq` is a client-chosen monotonically increasing number per session,
-    /// echoed back so the client can match replies.
+    /// `pos0 .. pos0 + n_tokens`, extending the session's KV cache, then hand the
+    /// output to the next hop. `seq` is a client-chosen monotonically increasing
+    /// number per session, echoed back so the client can match results.
     Forward {
+        route: u64,
         session: u64,
         seq: u64,
         pos0: i32,
         act: Activations,
+        hops: Vec<HopStat>,
     },
-    /// Drop KV entries for positions `p0 <= pos < p1` (`p1 = -1` means to the end).
-    /// Used by prefix caching to roll a session back to a common prefix.
-    SeqRm { session: u64, p0: i32, p1: i32 },
-    /// Free all state for a session.
-    SessionClose { session: u64 },
+    /// Drop KV entries for positions `p0 <= pos < p1` (`p1 = -1` means to the end)
+    /// here and on every later hop. Used by prefix caching to roll a session back.
+    SeqRm {
+        route: u64,
+        session: u64,
+        p0: i32,
+        p1: i32,
+    },
+    /// Free all state for a session along the route.
+    SessionClose { route: u64, session: u64 },
+    /// Tear the route down along the chain.
+    RouteClose { route: u64 },
     Ping,
+    /// Client to relay: pipe my streams to `first_hop` under `token`.
+    RelayOpen { token: [u8; 16], first_hop: NextHop },
+    /// Last hop to relay: pipe my one-way streams to the client holding `token`.
+    RelayAttach { token: [u8; 16] },
 }
 
-/// Stage to client daemon.
+impl Request {
+    /// Postcard variant index of `Forward`, the one request allowed to be large.
+    pub const FORWARD_TAG: u8 = 2;
+}
+
+/// Stage to client daemon or previous hop.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
     HelloOk {
@@ -175,17 +251,36 @@ pub enum Response {
         n_seq_max: u32,
         /// Human-readable backend description, for `/status`.
         backend: String,
+        node_id: [u8; 32],
     },
+    /// The route is set up; `hops` nodes acknowledged.
+    RouteOk { hops: u32 },
+    Ack,
     ForwardOk {
         session: u64,
         seq: u64,
         act: Activations,
-        /// Wall time the stage spent in llama_decode, for latency accounting.
-        compute_ms: f32,
+        hops: Vec<HopStat>,
     },
-    Ok,
     Pong,
     Error { code: ErrorCode, message: String },
+}
+
+/// A result delivered to a return target (direct or relay mode) on a one-way stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReturnFrame {
+    pub route: u64,
+    pub session: u64,
+    pub seq: u64,
+    /// `ForwardOk` or `Error`.
+    pub body: Response,
+}
+
+/// Bytes a `Forward` or `ForwardOk` frame may carry for `n_tokens * n_embd` values,
+/// with headroom for the envelope and hop stats.
+pub fn forward_frame_limit(n_tokens: u32, n_embd: u32) -> u32 {
+    let payload = (n_tokens as u64) * (n_embd as u64) * 4;
+    (payload + 65536).min(MAX_FRAME_BYTES as u64) as u32
 }
 
 /// Write one length-prefixed postcard frame.
@@ -204,8 +299,18 @@ where
     w.flush().await
 }
 
-/// Read one length-prefixed postcard frame.
+/// Read one length-prefixed postcard frame of at most [`MAX_FRAME_BYTES`].
 pub async fn read_frame<R, T>(r: &mut R) -> io::Result<T>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    read_frame_max(r, MAX_FRAME_BYTES).await
+}
+
+/// Read one length-prefixed postcard frame of at most `max` bytes. Receivers pick
+/// `max` by what message they expect, so a peer cannot make them allocate more.
+pub async fn read_frame_max<R, T>(r: &mut R, max: u32) -> io::Result<T>
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
@@ -213,8 +318,11 @@ where
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_le_bytes(len);
-    if len > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+    if len > max.min(MAX_FRAME_BYTES) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame of {len} bytes exceeds the {max} byte limit"),
+        ));
     }
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body).await?;
@@ -269,21 +377,41 @@ mod tests {
     #[tokio::test]
     async fn frame_roundtrip() {
         let req = Request::Forward {
+            route: 1,
             session: 7,
             seq: 3,
             pos0: 10,
             act: Activations::from_f32(&[1.0, 2.0, 3.0, 4.0], 2, 2, ActDtype::F16),
+            hops: Vec::new(),
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).await.unwrap();
         let mut cur = std::io::Cursor::new(buf);
         let back: Request = read_frame(&mut cur).await.unwrap();
         match back {
-            Request::Forward { session, seq, pos0, act } => {
+            Request::Forward {
+                session, seq, pos0, act, ..
+            } => {
                 assert_eq!((session, seq, pos0), (7, 3, 10));
                 assert_eq!(act.n_tokens, 2);
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn forward_tag_matches_variant_index() {
+        let req = Request::Forward {
+            route: 0,
+            session: 0,
+            seq: 0,
+            pos0: 0,
+            act: Activations::from_f32(&[0.0], 1, 1, ActDtype::F32),
+            hops: Vec::new(),
+        };
+        let bytes = postcard::to_stdvec(&req).unwrap();
+        assert_eq!(bytes[0], Request::FORWARD_TAG);
+        let ping = postcard::to_stdvec(&Request::Ping).unwrap();
+        assert_ne!(ping[0], Request::FORWARD_TAG);
     }
 }

@@ -7,17 +7,18 @@
 //! * [`engine`]: the dedicated engine thread (llama contexts, stage connections,
 //!   sessions with prefix caching, the generation loop).
 //! * [`http`]: axum handlers that submit jobs to the engine and relay its events.
-//! * [`stage_conn`]: blocking framing and the per-stage connection.
+//! * [`route`]: the chain of stages, set up and driven over the QUIC transport.
 //! * [`sampling`], [`text`]: sampler, UTF-8 accumulation and stop strings.
 
 mod engine;
 mod http;
+pub mod route;
 mod sampling;
-mod stage_conn;
 mod text;
 
 use crate::config::{LayerRange, RouteConfig, StageEndpoint};
 use anyhow::Context as _;
+pub use route::ReturnPolicy;
 use clap::Args;
 use dfin_llama::{FlashAttn, KvType};
 use dfin_proto::ActDtype;
@@ -36,9 +37,14 @@ pub struct ClientArgs {
     /// Layers run locally after the last stage, e.g. `6:end`.
     #[arg(long, value_parser = parse_range)]
     pub tail: Option<LayerRange>,
-    /// A remote stage `host:port=a:b`; repeat in pipeline order.
+    /// A remote stage `host:port/<node id>=a:b`; repeat in pipeline order.
     #[arg(long = "stage", value_parser = parse_stage)]
     pub stages: Vec<StageEndpoint>,
+    /// How results come back from the last stage: `direct` (the last stage sends to
+    /// this client, fastest) or `reverse` (back along the chain; only the first stage
+    /// learns this client's address).
+    #[arg(long = "return", default_value = "direct", value_parser = parse_return)]
+    pub return_mode: ReturnPolicy,
     /// Route TOML (model, head, tail, stages) instead of the flags above.
     #[arg(long)]
     pub route: Option<PathBuf>,
@@ -89,17 +95,11 @@ fn parse_range(s: &str) -> Result<LayerRange, String> {
 }
 
 fn parse_stage(s: &str) -> Result<StageEndpoint, String> {
-    let (addr, layers) = s
-        .rsplit_once('=')
-        .ok_or_else(|| format!("stage {s:?} must look like host:port=a:b"))?;
-    let layers = parse_range(layers)?;
-    if addr.is_empty() {
-        return Err(format!("stage {s:?} has an empty address"));
-    }
-    Ok(StageEndpoint {
-        addr: addr.to_string(),
-        layers,
-    })
+    s.parse::<StageEndpoint>().map_err(|e| format!("{e:#}"))
+}
+
+fn parse_return(s: &str) -> Result<ReturnPolicy, String> {
+    s.parse()
 }
 
 fn parse_act_dtype(s: &str) -> Result<ActDtype, String> {
@@ -152,6 +152,7 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
         head,
         tail,
         stages,
+        return_policy: args.return_mode,
         n_ctx: args.n_ctx,
         n_gpu_layers: args.n_gpu_layers,
         cpu_tensors: args.cpu_tensors.clone(),
@@ -199,10 +200,13 @@ mod tests {
 
     #[test]
     fn parse_stage_flag() {
-        let s = parse_stage("127.0.0.1:7001=2:4").unwrap();
+        let id = dfin_net::NodeKey::generate().id();
+        let s = parse_stage(&format!("127.0.0.1:7001/{id}=2:4")).unwrap();
         assert_eq!(s.addr, "127.0.0.1:7001");
+        assert_eq!(s.node_id, id);
         assert_eq!(s.layers, LayerRange::new(2, 4));
         assert!(parse_stage("nope").is_err());
+        assert!(parse_stage("127.0.0.1:7001=2:4").is_err());
     }
 
     #[test]
@@ -213,6 +217,7 @@ mod tests {
             #[command(flatten)]
             a: ClientArgs,
         }
+        let id = dfin_net::NodeKey::generate().id();
         let t = T::try_parse_from([
             "t",
             "--model",
@@ -222,9 +227,11 @@ mod tests {
             "--tail",
             "6:end",
             "--stage",
-            "127.0.0.1:1=2:4",
+            &format!("127.0.0.1:1/{id}=2:4"),
             "--stage",
-            "127.0.0.1:2=4:6",
+            &format!("127.0.0.1:2/{id}=4:6"),
+            "--return",
+            "reverse",
             "--n-gpu-layers",
             "-1",
             "--act-dtype",
@@ -234,6 +241,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(t.a.stages.len(), 2);
+        assert_eq!(t.a.return_mode, ReturnPolicy::Reverse);
         assert_eq!(t.a.n_gpu_layers, -1);
         assert_eq!(t.a.tail, Some(LayerRange::new(6, -1)));
     }

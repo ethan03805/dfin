@@ -5,8 +5,11 @@
 //! the test model at `models/tiny-llama-f32.gguf`.
 
 use dfin_llama::{Context, ContextParams, Model, ModelParams, OutputMode};
+use dfin_net::transport::{CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
+use dfin_net::{Endpoint, NodeId, NodeKey};
+use dfin_proto::{Request, Response};
 use serde_json::{json, Value};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -35,6 +38,55 @@ fn should_skip() -> bool {
 fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
+}
+
+fn free_udp_port() -> u16 {
+    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+    s.local_addr().unwrap().port()
+}
+
+/// A node key saved to a temp file, for a stage child to use.
+struct StageKey {
+    path: PathBuf,
+    id: NodeId,
+}
+
+impl StageKey {
+    fn new(name: &str) -> StageKey {
+        let key = NodeKey::generate();
+        let path = std::env::temp_dir().join(format!(
+            "dfin-e2e-{name}-{}-{}.key",
+            std::process::id(),
+            rand_suffix()
+        ));
+        key.save(&path).unwrap();
+        StageKey { path, id: key.id() }
+    }
+}
+
+impl Drop for StageKey {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn rand_suffix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+async fn stage_answers(probe: &Endpoint, addr: &str, id: NodeId) -> bool {
+    let Ok(conn) = probe.connect(addr, id).await else {
+        return false;
+    };
+    let r: Result<Response, _> = conn
+        .call(&Request::Ping, MAX_CONTROL_FRAME, CONTROL_TIMEOUT)
+        .await;
+    conn.close("probe");
+    matches!(r, Ok(Response::Pong))
 }
 
 /// A spawned child process plus the log file its stderr goes to.
@@ -97,22 +149,23 @@ impl Procs {
         }
     }
 
-    fn wait_port(&mut self, i: usize, port: u16, timeout: Duration) {
+    async fn wait_stage(&mut self, i: usize, port: u16, id: NodeId, timeout: Duration) {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let probe = Endpoint::client(NodeKey::generate()).unwrap();
         let deadline = Instant::now() + timeout;
         loop {
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            if stage_answers(&probe, &addr.to_string(), id).await {
                 return;
             }
             self.check_alive(i);
             if Instant::now() > deadline {
                 panic!(
-                    "{} did not listen on {addr}\n{}",
+                    "{} did not answer on {addr}\n{}",
                     self.0[i].name,
                     self.logs()
                 );
             }
-            std::thread::sleep(Duration::from_millis(200));
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -321,10 +374,11 @@ async fn pipeline_with_two_stages() {
     let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
     eprintln!("reference text: {expected:?}");
     let model = model_path().display().to_string();
-    let (p1, p2, pc) = (free_port(), free_port(), free_port());
+    let (p1, p2, pc) = (free_udp_port(), free_udp_port(), free_port());
+    let (k1, k2) = (StageKey::new("stage1"), StageKey::new("stage2"));
     let mut procs = Procs::default();
     let mut stage_idx = Vec::new();
-    for (name, port, layers) in [("stage1", p1, "2:4"), ("stage2", p2, "4:6")] {
+    for (name, port, layers, key) in [("stage1", p1, "2:4", &k1), ("stage2", p2, "4:6", &k2)] {
         let args: Vec<String> = [
             "stage",
             "--model",
@@ -333,6 +387,8 @@ async fn pipeline_with_two_stages() {
             layers,
             "--listen",
             &format!("127.0.0.1:{port}"),
+            "--identity",
+            &key.path.display().to_string(),
             "--n-gpu-layers",
             "0",
             "--act-dtype",
@@ -341,11 +397,12 @@ async fn pipeline_with_two_stages() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        stage_idx.push((procs.spawn(name, &args), port));
+        stage_idx.push((procs.spawn(name, &args), port, key.id));
     }
-    for (i, port) in stage_idx {
-        procs.wait_port(i, port, Duration::from_secs(120));
+    for (i, port, id) in stage_idx {
+        procs.wait_stage(i, port, id, Duration::from_secs(120)).await;
     }
+    let return_mode = std::env::var("DFIN_TEST_RETURN").unwrap_or_else(|_| "direct".into());
     let args: Vec<String> = [
         "client",
         "--model",
@@ -355,9 +412,11 @@ async fn pipeline_with_two_stages() {
         "--tail",
         "6:end",
         "--stage",
-        &format!("127.0.0.1:{p1}=2:4"),
+        &format!("127.0.0.1:{p1}/{}=2:4", k1.id),
         "--stage",
-        &format!("127.0.0.1:{p2}=4:6"),
+        &format!("127.0.0.1:{p2}/{}=4:6", k2.id),
+        "--return",
+        &return_mode,
         "--n-gpu-layers",
         "0",
         "--act-dtype",
@@ -392,6 +451,12 @@ async fn pipeline_with_two_stages() {
         stages.iter().all(|s| s["forwards"].as_u64().unwrap() > 0),
         "{status:#}"
     );
+    assert_eq!(status["stats"]["chain"]["return_mode"], return_mode, "{status:#}");
+    assert!(
+        status["stats"]["chain"]["forwards"].as_u64().unwrap() > 0,
+        "{status:#}"
+    );
+    assert_eq!(status["route"][1]["node_id"], k1.id.to_string());
 }
 
 #[tokio::test(flavor = "multi_thread")]

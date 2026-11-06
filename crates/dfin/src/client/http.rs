@@ -81,21 +81,18 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
     let stage_entries: Vec<_> = st.info.route.iter().filter(|r| r.kind == "stage").collect();
     let stages: Vec<Value> = stage_entries
         .iter()
-        .zip(s.stages.iter())
+        .zip(s.hops.iter())
         .map(|(r, c)| {
             let n = c.forwards.max(1) as f64;
             json!({
                 "addr": r.addr,
+                "node_id": r.node_id,
                 "layers": r.layers,
+                "backend": r.backend,
                 "forwards": c.forwards,
-                "avg_rtt_ms": c.rtt_ms_sum / n,
                 "avg_compute_ms": c.compute_ms_sum / n,
                 "decode_forwards": c.decode_forwards,
-                "decode_avg_rtt_ms": c.decode_rtt_ms_sum / c.decode_forwards.max(1) as f64,
                 "decode_avg_compute_ms": c.decode_compute_ms_sum / c.decode_forwards.max(1) as f64,
-                "ping_ms": c.ping_ms,
-                "bytes_sent": c.bytes_sent,
-                "bytes_received": c.bytes_received,
             })
         })
         .collect();
@@ -133,6 +130,16 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
             "p50_token_ms": s.p50_token_ms(),
             "head_ms": s.head_ms_sum / steps,
             "tail_ms": s.tail_ms_sum / steps,
+            "chain": {
+                "return_mode": st.info.return_mode,
+                "forwards": s.chain.forwards,
+                "avg_rtt_ms": s.chain.rtt_ms_sum / s.chain.forwards.max(1) as f64,
+                "decode_forwards": s.chain.decode_forwards,
+                "decode_avg_rtt_ms": s.chain.decode_rtt_ms_sum / s.chain.decode_forwards.max(1) as f64,
+                "ping_ms": s.chain.ping_ms,
+                "setup_ms": s.chain.setup_ms,
+                "rebuilds": s.chain.rebuilds,
+            },
             "stages": stages,
         }
     }))

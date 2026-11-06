@@ -1,0 +1,53 @@
+[package]
+name = "dfin-net"
+description = "Node identities and the authenticated QUIC transport between dfin clients, stages and relays"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dfin-proto = { path = "../dfin-proto" }
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+postcard.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[dependencies.quinn]
+version = "0.11"
+default-features = false
+features = ["runtime-tokio", "rustls-ring", "log"]
+
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["ring", "std", "logging"]
+
+[dependencies.rcgen]
+version = "0.13"
+default-features = false
+features = ["crypto", "ring"]
+
+[dependencies.ed25519-dalek]
+version = "2"
+features = ["pkcs8"]
+
+[dependencies.x25519-dalek]
+version = "2"
+features = ["static_secrets"]
+
+[dependencies.chacha20poly1305]
+version = "0.10"
+
+[dependencies.hkdf]
+version = "0.12"
+
+[dependencies.x509-parser]
+version = "0.16"

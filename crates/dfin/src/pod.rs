@@ -2,13 +2,16 @@
 //!
 //! `--split 2,5` on an 8-layer model runs one `dfin stage` child for layers `2:5`
 //! and a `dfin client` child with head `0:2` and tail `5:end`. `--split 2,4,6` runs
-//! stages `2:4` and `4:6`. Stages listen on `127.0.0.1:(base_port + i)`.
+//! stages `2:4` and `4:6`. Stages listen on `127.0.0.1:(base_port + i)` with node keys
+//! the pod generates for them, and the client pins those keys.
 
 use crate::config::LayerRange;
 use anyhow::{bail, Context as _};
 use clap::Args;
 use dfin_llama::{Model, ModelParams};
-use dfin_proto::ActDtype;
+use dfin_net::transport::{CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
+use dfin_net::{Endpoint, NodeId, NodeKey};
+use dfin_proto::{ActDtype, Request, Response};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -45,6 +48,9 @@ pub struct PodArgs {
     pub threads: Option<i32>,
     #[arg(long, default_value = "f16")]
     pub act_dtype: ActDtype,
+    /// Return mode for the client: `direct` or `reverse`.
+    #[arg(long = "return", default_value = "direct")]
+    pub return_mode: String,
 }
 
 /// Everything `spawn_pod` needs.
@@ -60,6 +66,8 @@ pub struct PodOptions {
     pub cpu_tensors: Vec<String>,
     pub threads: Option<i32>,
     pub act_dtype: ActDtype,
+    /// `direct` or `reverse`.
+    pub return_mode: String,
     /// The `dfin` binary to launch; defaults to `std::env::current_exe()`.
     pub exe: Option<PathBuf>,
     /// `--log` filter passed to the children (otherwise they inherit `DFIN_LOG`).
@@ -81,6 +89,7 @@ impl PodOptions {
             cpu_tensors: a.cpu_tensors.clone(),
             threads: a.threads,
             act_dtype: a.act_dtype,
+            return_mode: a.return_mode.clone(),
             exe: None,
             log: None,
             ready_timeout: Duration::from_secs(120),
@@ -169,8 +178,12 @@ pub struct PodHandle {
     pub api_url: String,
     /// `host:port` of each stage, in pipeline order.
     pub stage_addrs: Vec<String>,
+    /// Node id of each stage, in pipeline order.
+    pub stage_ids: Vec<NodeId>,
     pub plan: SplitPlan,
     pub children: Vec<PodChild>,
+    /// Directory holding the generated stage keys; removed on drop.
+    key_dir: PathBuf,
 }
 
 impl PodHandle {
@@ -205,6 +218,7 @@ impl Drop for PodHandle {
         for c in &mut self.children {
             let _ = c.child.start_kill();
         }
+        let _ = std::fs::remove_dir_all(&self.key_dir);
     }
 }
 
@@ -220,15 +234,35 @@ fn base_command(exe: &Path, log: &Option<String>) -> Command {
     cmd
 }
 
-fn ensure_port_free(addr: SocketAddr) -> anyhow::Result<()> {
+fn ensure_tcp_port_free(addr: SocketAddr) -> anyhow::Result<()> {
     std::net::TcpListener::bind(addr)
         .map(drop)
         .with_context(|| format!("port {addr} is already in use"))
 }
 
-/// Poll until `addr` accepts a TCP connection, failing early if `child` exits.
-async fn wait_for_port(
+fn ensure_udp_port_free(addr: SocketAddr) -> anyhow::Result<()> {
+    std::net::UdpSocket::bind(addr)
+        .map(drop)
+        .with_context(|| format!("UDP port {addr} is already in use"))
+}
+
+/// Ping a stage over QUIC: true once it answers `Pong` with the expected key.
+pub async fn stage_answers(probe: &Endpoint, addr: &str, id: NodeId) -> bool {
+    let Ok(conn) = probe.connect(addr, id).await else {
+        return false;
+    };
+    let r: Result<Response, _> = conn
+        .call(&Request::Ping, MAX_CONTROL_FRAME, CONTROL_TIMEOUT)
+        .await;
+    conn.close("probe");
+    matches!(r, Ok(Response::Pong))
+}
+
+/// Poll until the stage at `addr` answers a QUIC ping, failing early if `child` exits.
+async fn wait_for_stage(
+    probe: &Endpoint,
     addr: SocketAddr,
+    id: NodeId,
     child: &mut PodChild,
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -237,12 +271,12 @@ async fn wait_for_port(
         if let Some(st) = child.child.try_wait()? {
             bail!("{} exited before listening on {addr} ({st})", child.name);
         }
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+        if stage_answers(probe, &addr.to_string(), id).await {
             return Ok(());
         }
         if start.elapsed() > timeout {
             bail!(
-                "{} did not listen on {addr} within {:?}",
+                "{} did not answer on {addr} within {:?}",
                 child.name,
                 timeout
             );
@@ -292,20 +326,40 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
             .checked_add(i as u16)
             .context("stage port overflows u16")?;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        ensure_port_free(addr)?;
+        ensure_udp_port_free(addr)?;
         stage_addrs.push(addr);
     }
-    ensure_port_free(opts.listen)?;
+    ensure_tcp_port_free(opts.listen)?;
+
+    // One key per stage, written where the stage child can read it.
+    let key_dir = std::env::temp_dir().join(format!(
+        "dfin-pod-{}-{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir_all(&key_dir).with_context(|| format!("creating {}", key_dir.display()))?;
+    let mut key_files = Vec::new();
+    let mut stage_ids = Vec::new();
+    for i in 0..plan.stages.len() {
+        let key = NodeKey::generate();
+        let path = key_dir.join(format!("stage-{i}.key"));
+        key.save(&path)?;
+        stage_ids.push(key.id());
+        key_files.push(path);
+    }
+    let probe = Endpoint::client(NodeKey::generate()).context("creating probe endpoint")?;
 
     let mut handle = PodHandle {
         api_url: String::new(),
         stage_addrs: stage_addrs.iter().map(|a| a.to_string()).collect(),
+        stage_ids: stage_ids.clone(),
         plan: plan.clone(),
         children: Vec::new(),
+        key_dir,
     };
 
     // All stages load in parallel.
-    for (range, addr) in plan.stages.iter().zip(&stage_addrs) {
+    for ((range, addr), key_file) in plan.stages.iter().zip(&stage_addrs).zip(&key_files) {
         let mut cmd = base_command(&exe, &opts.log);
         cmd.arg("stage")
             .arg("--model")
@@ -314,6 +368,8 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
             .arg(range.to_string())
             .arg("--listen")
             .arg(addr.to_string())
+            .arg("--identity")
+            .arg(key_file)
             .arg("--n-ctx")
             .arg(opts.n_ctx.to_string())
             .arg("--n-seq-max")
@@ -336,7 +392,14 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
         handle.children.push(PodChild { name, child });
     }
     for (i, addr) in stage_addrs.iter().enumerate() {
-        wait_for_port(*addr, &mut handle.children[i], opts.ready_timeout).await?;
+        wait_for_stage(
+            &probe,
+            *addr,
+            stage_ids[i],
+            &mut handle.children[i],
+            opts.ready_timeout,
+        )
+        .await?;
         info!("{} is up", handle.children[i].name);
     }
 
@@ -348,9 +411,10 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
         .arg(plan.head.to_string())
         .arg("--tail")
         .arg(format!("{}:end", plan.tail.begin));
-    for (range, addr) in plan.stages.iter().zip(&stage_addrs) {
-        cmd.arg("--stage").arg(format!("{addr}={range}"));
+    for ((range, addr), id) in plan.stages.iter().zip(&stage_addrs).zip(&stage_ids) {
+        cmd.arg("--stage").arg(format!("{addr}/{id}={range}"));
     }
+    cmd.arg("--return").arg(&opts.return_mode);
     cmd.arg("--listen")
         .arg(opts.listen.to_string())
         .arg("--n-ctx")

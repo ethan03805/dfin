@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 dfin-proto = { path = "../dfin-proto" }
+dfin-net = { path = "../dfin-net" }
 dfin-llama = { path = "../dfin-llama" }
 anyhow.workspace = true
 thiserror.workspace = true

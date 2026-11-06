@@ -1,10 +1,12 @@
-//! `dfin stage`: serve one contiguous middle layer range `[a, b)` of a GGUF over TCP.
+//! `dfin stage`: serve one contiguous middle layer range `[a, b)` of a GGUF as one hop
+//! of a route chain, over the authenticated QUIC transport.
 //!
-//! Protocol (see `dfin-proto`): the first frame on a connection must be
-//! `Request::Hello`; after a successful `HelloOk` the client sends requests and the
-//! stage answers each one, in order. Requests may be pipelined: a reader task
-//! queues work for the engine thread and a writer task emits replies in request
-//! order, so receiving the next activation overlaps with compute.
+//! Protocol: `docs/phase1-protocol.md`. The first stream on a connection must carry
+//! `Hello`. A `RouteSetup` opens this node's sealed record, dials the next hop if there
+//! is one and forwards the rest of the records. A `Forward` runs this stage's layers
+//! and hands the output down the chain; what happens at the last hop depends on the
+//! route's return mode. `SeqRm`, `SessionClose` and `RouteClose` run here, then on
+//! every later hop, and are acknowledged once the whole chain has done them.
 
 mod engine;
 
@@ -12,16 +14,31 @@ use crate::config::LayerRange;
 use anyhow::{bail, Context as _};
 use clap::{Args, ValueEnum};
 use dfin_llama::{Context, ContextParams, FlashAttn, KvType, Model, ModelParams};
+use dfin_net::transport::{reply, CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
+use dfin_net::{unseal, Connection, Endpoint, NetError, NodeId, NodeKey};
 use dfin_proto::{
-    read_frame, write_frame, ActDtype, ErrorCode, Request, Response, PROTOCOL_VERSION,
+    forward_frame_limit, ActDtype, Activations, ErrorCode, HopRecord, HopStat, NextHop, Request,
+    Response, ReturnFrame, ReturnMode, PROTOCOL_VERSION,
 };
-use engine::{Engine, Job};
+use engine::{Engine, Job, Reply};
+use parking_lot::Mutex;
+use dfin_net::RecvStream;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
+
+/// Time allowed for a forward to travel the rest of the chain and come back.
+pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(600);
+/// Time allowed to receive the body of a large forward frame.
+const FORWARD_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// Time allowed for route setup down the chain.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum FlashAttnArg {
@@ -49,15 +66,22 @@ pub struct StageArgs {
     /// embedding or the LM head (those run on the client).
     #[arg(long)]
     pub layers: LayerRange,
-    /// Address to listen on.
+    /// Address to listen on (UDP, QUIC).
     #[arg(long, default_value = "0.0.0.0:7001")]
     pub listen: String,
+    /// Node key file (64 hex characters). Created if missing. Its public key is this
+    /// node's id, which clients pin.
+    #[arg(long, default_value = "dfin-stage.key")]
+    pub identity: PathBuf,
     /// Total KV capacity in tokens, shared by all session slots.
     #[arg(long, default_value_t = 8192)]
     pub n_ctx: u32,
     /// Concurrent session slots; each gets `n_ctx / n_seq_max` tokens.
     #[arg(long, default_value_t = 8)]
     pub n_seq_max: u32,
+    /// Routes one connection may hold open.
+    #[arg(long, default_value_t = 64)]
+    pub max_routes: usize,
     /// Layers to offload to the GPU (`-1` = all of this stage's layers).
     #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
     pub n_gpu_layers: i32,
@@ -67,7 +91,7 @@ pub struct StageArgs {
     /// Threads for batch (prefill) decode.
     #[arg(long)]
     pub threads_batch: Option<i32>,
-    /// Element type of the activations this stage sends back.
+    /// Element type of the activations this stage sends on.
     #[arg(long, default_value = "f16")]
     pub act_dtype: ActDtype,
     /// KV cache element type (K and V).
@@ -78,13 +102,12 @@ pub struct StageArgs {
     /// Regex of tensor names to keep in system RAM (e.g. `exps`). Repeatable.
     #[arg(long = "cpu-tensors")]
     pub cpu_tensors: Vec<String>,
-    /// Read the weights into memory at load instead of memory-mapping the file. Slower
-    /// start, but no first-request page-fault storm; recommended for a node that runs a
-    /// single piece (llama.cpp's own advice when experts live on the CPU).
+    /// Read the weights into memory at load instead of memory-mapping the file.
+    /// Only safe when the machine has memory to spare beyond the piece.
     #[arg(long)]
     pub no_mmap: bool,
     /// Lock the mapped weights in RAM at load so the first request is not slowed by page
-    /// faults. Needs free memory for the whole piece.
+    /// faults. Needs free memory for the whole piece. Recommended on a serving node.
     #[arg(long)]
     pub mlock: bool,
     /// Max tokens per forward request.
@@ -103,7 +126,9 @@ struct StageInfo {
     n_embd: u32,
     n_ctx_seq: u32,
     n_seq_max: u32,
+    n_batch: u32,
     backend: String,
+    node_id: NodeId,
 }
 
 /// Summarise the devices this stage computes on, e.g. `"Vulkan0 (AMD Radeon RX 7800 XT), CPU"`.
@@ -149,6 +174,13 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
     if args.n_seq_max == 0 {
         bail!("--n-seq-max must be at least 1");
     }
+    let key = NodeKey::load_or_create(&args.identity)
+        .with_context(|| format!("node key {}", args.identity.display()))?;
+    info!(
+        "node id {} (key file {})",
+        key.id(),
+        args.identity.display()
+    );
 
     let model_path = args.model.clone();
     let fingerprint = {
@@ -232,40 +264,53 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         n_embd: model.n_embd() as u32,
         n_ctx_seq,
         n_seq_max,
+        n_batch: args.n_batch,
         backend: backend_summary(args.n_gpu_layers),
+        node_id: key.id(),
     });
 
     let (jobs, _engine_thread) =
         Engine::new(ctx, args.act_dtype, args.n_batch as usize).spawn(256)?;
 
-    let listener = TcpListener::bind(&args.listen)
+    let listen: SocketAddr = tokio::net::lookup_host(&args.listen)
         .await
-        .with_context(|| format!("binding {}", args.listen))?;
-    let addr = listener.local_addr()?;
+        .with_context(|| format!("resolving {}", args.listen))?
+        .next()
+        .with_context(|| format!("{} resolved to nothing", args.listen))?;
+    let endpoint =
+        Endpoint::server(key, listen).with_context(|| format!("listening on {listen}"))?;
+    let addr = endpoint.local_addr()?;
     info!(
-        "stage ready: layers {}:{} on {} ({})",
-        layer_begin, layer_end, addr, info.backend
+        "stage ready: layers {}:{} on {} ({}) node {}",
+        layer_begin, layer_end, addr, info.backend, info.node_id
     );
 
-    let next_conn = AtomicU64::new(1);
+    let stage = Arc::new(Stage {
+        info,
+        jobs,
+        endpoint: endpoint.clone(),
+        clients: Mutex::new(HashMap::new()),
+        outbound: Mutex::new(HashMap::new()),
+        next_handle: AtomicU64::new(1),
+        max_routes: args.max_routes.max(1),
+    });
+
     let accept_loop = async {
-        loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(x) => x,
+        while let Some(incoming) = endpoint.accept().await {
+            let conn = match incoming {
+                Ok(c) => c,
                 Err(e) => {
-                    warn!("accept failed: {e}");
+                    debug!("handshake failed: {e}");
                     continue;
                 }
             };
-            let conn = next_conn.fetch_add(1, Ordering::Relaxed);
-            let info = info.clone();
-            let jobs = jobs.clone();
+            let stage = stage.clone();
             tokio::spawn(async move {
-                debug!(conn, %peer, "connection opened");
-                if let Err(e) = handle_conn(stream, conn, info, jobs).await {
-                    warn!(conn, %peer, "connection error: {e:#}");
-                }
-                debug!(conn, %peer, "connection closed");
+                let peer = conn.remote_address();
+                let id = conn.peer_id();
+                debug!(%peer, peer_id = %id.short(), "connection opened");
+                stage.serve_conn(conn).await;
+                debug!(%peer, peer_id = %id.short(), "connection closed");
             });
         }
     };
@@ -275,6 +320,7 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         r = tokio::signal::ctrl_c() => {
             r?;
             info!("ctrl-c: stage exiting");
+            endpoint.close();
             Ok(())
         }
     }
@@ -288,6 +334,8 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Response {
 }
 
 /// Check a `Hello` against this stage. `Ok` carries `HelloOk`, `Err` the refusal.
+/// A range of `-1:-1` means the dialer is a previous hop that does not know our
+/// range; it will be checked against the sealed route record instead.
 fn check_hello(req: &Request, info: &StageInfo) -> Result<Response, Response> {
     let Request::Hello {
         version,
@@ -313,7 +361,8 @@ fn check_hello(req: &Request, info: &StageInfo) -> Result<Response, Response> {
             ),
         ));
     }
-    if (*layer_begin, *layer_end) != (info.layer_begin, info.layer_end) {
+    let any = (*layer_begin, *layer_end) == (-1, -1);
+    if !any && (*layer_begin, *layer_end) != (info.layer_begin, info.layer_end) {
         return Err(error(
             ErrorCode::LayerRangeMismatch,
             format!(
@@ -329,145 +378,576 @@ fn check_hello(req: &Request, info: &StageInfo) -> Result<Response, Response> {
         n_ctx: info.n_ctx_seq,
         n_seq_max: info.n_seq_max,
         backend: info.backend.clone(),
+        node_id: *info.node_id.as_bytes(),
     })
 }
 
-/// A reply slot in request order: either already known or pending on the engine.
-enum Pending {
-    Ready(Response),
-    Wait(oneshot::Receiver<Response>),
+/// One route as seen from this hop.
+struct RouteState {
+    /// Engine key for this route's sessions.
+    handle: u64,
+    next: Option<(NextHop, Connection)>,
+    ret: ReturnMode,
+    /// Where results go in `Direct` and `Relay` modes.
+    return_conn: Option<Connection>,
 }
 
-async fn handle_conn(
-    stream: TcpStream,
-    conn: u64,
+struct ConnState {
+    conn: Connection,
+    hello: AtomicBool,
+    routes: Mutex<HashMap<u64, Arc<RouteState>>>,
+}
+
+struct Stage {
     info: Arc<StageInfo>,
     jobs: mpsc::Sender<Job>,
-) -> anyhow::Result<()> {
-    stream.set_nodelay(true)?;
-    let (mut rd, mut wr) = stream.into_split();
+    endpoint: Endpoint,
+    /// Connections that completed `Hello`, by peer id, for direct returns.
+    clients: Mutex<HashMap<NodeId, Connection>>,
+    /// Connections to next hops that completed `Hello`, by address and id.
+    outbound: Mutex<HashMap<(String, NodeId), Connection>>,
+    next_handle: AtomicU64,
+    max_routes: usize,
+}
 
-    // Handshake.
-    let first: Request = match read_frame(&mut rd).await {
-        Ok(r) => r,
-        Err(e) => {
-            // Port probes (e.g. `dfin pod` waiting for readiness) connect and leave.
-            debug!(conn, "no hello: {e}");
-            return Ok(());
+/// How a request frame failed to arrive.
+enum ReadErr {
+    Eof,
+    Bad(String),
+    Net(NetError),
+}
+
+impl Stage {
+    fn max_forward_frame(&self) -> u32 {
+        forward_frame_limit(self.info.n_batch, self.info.n_embd)
+    }
+
+    async fn serve_conn(self: &Arc<Self>, conn: Connection) {
+        let st = Arc::new(ConnState {
+            conn: conn.clone(),
+            hello: AtomicBool::new(false),
+            routes: Mutex::new(HashMap::new()),
+        });
+        loop {
+            let (mut send, recv) = match conn.accept_bi().await {
+                Ok(x) => x,
+                Err(e) => {
+                    debug!("{e}");
+                    break;
+                }
+            };
+            let stage = self.clone();
+            let st = st.clone();
+            tokio::spawn(async move {
+                let resp = match stage.read_request(recv).await {
+                    Ok(req) => stage.handle(&st, req).await,
+                    Err(ReadErr::Eof) => return,
+                    Err(ReadErr::Bad(m)) => error(ErrorCode::BadRequest, m),
+                    Err(ReadErr::Net(e)) => {
+                        debug!("request stream: {e}");
+                        return;
+                    }
+                };
+                if let Response::Error { code, message } = &resp {
+                    debug!(?code, "{message}");
+                }
+                if let Err(e) = reply(&mut send, &resp).await {
+                    debug!("reply: {e}");
+                }
+            });
         }
-    };
-    match check_hello(&first, &info) {
-        Ok(ok) => write_frame(&mut wr, &ok).await?,
-        Err(refusal) => {
-            if let Response::Error { code, message } = &refusal {
-                warn!(conn, ?code, "refusing connection: {message}");
+        self.teardown(&st).await;
+    }
+
+    /// Read one request, allowing a large frame only for `Forward`.
+    async fn read_request(&self, mut recv: RecvStream) -> Result<Request, ReadErr> {
+        let head = async {
+            let mut len = [0u8; 4];
+            AsyncReadExt::read_exact(&mut recv, &mut len).await?;
+            let mut tag = [0u8; 1];
+            AsyncReadExt::read_exact(&mut recv, &mut tag).await?;
+            Ok::<_, std::io::Error>((u32::from_le_bytes(len), tag[0]))
+        };
+        let (len, tag) = match tokio::time::timeout(CONTROL_TIMEOUT, head).await {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(ReadErr::Eof),
+            Ok(Err(e)) => return Err(ReadErr::Net(e.into())),
+            Err(_) => return Err(ReadErr::Bad("timed out reading the request header".into())),
+        };
+        let (max, budget) = if tag == Request::FORWARD_TAG {
+            (self.max_forward_frame(), FORWARD_READ_TIMEOUT)
+        } else {
+            (MAX_CONTROL_FRAME, CONTROL_TIMEOUT)
+        };
+        if len == 0 || len > max {
+            return Err(ReadErr::Bad(format!(
+                "frame of {len} bytes exceeds the {max} byte limit for this request"
+            )));
+        }
+        let mut body = vec![0u8; len as usize];
+        body[0] = tag;
+        match tokio::time::timeout(budget, AsyncReadExt::read_exact(&mut recv, &mut body[1..])).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(ReadErr::Net(e.into())),
+            Err(_) => return Err(ReadErr::Bad("timed out reading the request body".into())),
+        }
+        postcard::from_bytes(&body).map_err(|e| ReadErr::Bad(format!("bad frame: {e}")))
+    }
+
+    async fn handle(&self, st: &Arc<ConnState>, req: Request) -> Response {
+        match req {
+            Request::Hello { .. } => {
+                if st.hello.swap(true, Ordering::SeqCst) {
+                    return error(ErrorCode::BadRequest, "duplicate Hello");
+                }
+                match check_hello(&req, &self.info) {
+                    Ok(ok) => {
+                        self.clients
+                            .lock()
+                            .insert(st.conn.peer_id(), st.conn.clone());
+                        ok
+                    }
+                    Err(refusal) => {
+                        st.hello.store(false, Ordering::SeqCst);
+                        if let Response::Error { code, message } = &refusal {
+                            warn!(?code, "refusing connection: {message}");
+                        }
+                        refusal
+                    }
+                }
             }
-            write_frame(&mut wr, &refusal).await?;
-            return Ok(());
+            Request::Ping => Response::Pong,
+            _ if !st.hello.load(Ordering::SeqCst) => {
+                error(ErrorCode::BadRequest, "Hello must come first")
+            }
+            Request::RouteSetup { route, hop } => self.route_setup(st, route, hop).await,
+            Request::Forward {
+                route,
+                session,
+                seq,
+                pos0,
+                act,
+                hops,
+            } => self.forward(st, route, session, seq, pos0, act, hops).await,
+            Request::SeqRm {
+                route,
+                session,
+                p0,
+                p1,
+            } => {
+                let Some(rs) = st.routes.lock().get(&route).cloned() else {
+                    return error(ErrorCode::UnknownRoute, format!("unknown route {route}"));
+                };
+                let (tx, rx) = oneshot::channel();
+                let job = Job::SeqRm {
+                    conn: rs.handle,
+                    session,
+                    p0,
+                    p1,
+                    reply: tx,
+                };
+                match self.run_job(job, rx).await {
+                    Reply::Ok => {}
+                    Reply::Error { code, message } => return error(code, message),
+                    Reply::Forward { .. } => return error(ErrorCode::Internal, "engine replied oddly"),
+                }
+                self.downstream_ack(&rs, &Request::SeqRm { route, session, p0, p1 })
+                    .await
+            }
+            Request::SessionClose { route, session } => {
+                let Some(rs) = st.routes.lock().get(&route).cloned() else {
+                    return error(ErrorCode::UnknownRoute, format!("unknown route {route}"));
+                };
+                let (tx, rx) = oneshot::channel();
+                let job = Job::Close {
+                    conn: rs.handle,
+                    session,
+                    reply: tx,
+                };
+                match self.run_job(job, rx).await {
+                    Reply::Ok => {}
+                    Reply::Error { code, message } => return error(code, message),
+                    Reply::Forward { .. } => return error(ErrorCode::Internal, "engine replied oddly"),
+                }
+                self.downstream_ack(&rs, &Request::SessionClose { route, session })
+                    .await
+            }
+            Request::RouteClose { route } => {
+                let Some(rs) = st.routes.lock().remove(&route) else {
+                    return error(ErrorCode::UnknownRoute, format!("unknown route {route}"));
+                };
+                self.close_route(&rs, route).await
+            }
+            Request::RelayOpen { .. } | Request::RelayAttach { .. } => {
+                error(ErrorCode::BadRequest, "this node is a stage, not a relay")
+            }
         }
     }
 
-    let (ptx, mut prx) = mpsc::channel::<Pending>(64);
-    let writer = tokio::spawn(async move {
-        while let Some(p) = prx.recv().await {
-            let resp = match p {
-                Pending::Ready(r) => r,
-                Pending::Wait(rx) => rx
-                    .await
-                    .unwrap_or_else(|_| error(ErrorCode::Internal, "engine stopped")),
-            };
-            write_frame(&mut wr, &resp).await?;
+    async fn run_job(&self, job: Job, rx: oneshot::Receiver<Reply>) -> Reply {
+        let stopped = || Reply::Error {
+            code: ErrorCode::Internal,
+            message: "engine stopped".into(),
+        };
+        if self.jobs.send(job).await.is_err() {
+            return stopped();
         }
-        Ok::<_, std::io::Error>(())
-    });
+        rx.await.unwrap_or_else(|_| stopped())
+    }
 
-    let read_result: anyhow::Result<()> = async {
-        loop {
-            let req: Request = match read_frame(&mut rd).await {
-                Ok(r) => r,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                    let _ = ptx
-                        .send(Pending::Ready(error(
-                            ErrorCode::BadRequest,
-                            format!("bad frame: {e}"),
-                        )))
-                        .await;
-                    return Err(anyhow::Error::new(e).context("bad frame"));
-                }
-                Err(e) => return Err(e.into()),
+    /// Dial the next hop (or reuse the connection) and complete `Hello` with it.
+    async fn outbound(&self, nh: &NextHop) -> Result<Connection, Response> {
+        let id = NodeId(nh.node_id);
+        let key = (nh.addr.clone(), id);
+        if let Some(c) = self.outbound.lock().get(&key) {
+            if !c.is_closed() {
+                return Ok(c.clone());
+            }
+        }
+        let conn = self
+            .endpoint
+            .connect(&nh.addr, id)
+            .await
+            .map_err(|e| error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)))?;
+        let hello = Request::Hello {
+            version: PROTOCOL_VERSION,
+            model_fingerprint: self.info.fingerprint.clone(),
+            layer_begin: -1,
+            layer_end: -1,
+        };
+        let r: Response = conn
+            .call(&hello, MAX_CONTROL_FRAME, CONTROL_TIMEOUT)
+            .await
+            .map_err(|e| error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)))?;
+        match r {
+            Response::HelloOk { n_embd, .. } if n_embd == self.info.n_embd => {}
+            Response::HelloOk { n_embd, .. } => {
+                return Err(error(
+                    ErrorCode::Downstream,
+                    format!("next hop {}: n_embd {n_embd} differs from ours", nh.addr),
+                ))
+            }
+            Response::Error { code, message } => {
+                return Err(error(
+                    ErrorCode::Downstream,
+                    format!("next hop {} refused hello ({code:?}): {message}", nh.addr),
+                ))
+            }
+            other => {
+                return Err(error(
+                    ErrorCode::Downstream,
+                    format!("next hop {}: unexpected hello reply {other:?}", nh.addr),
+                ))
+            }
+        }
+        self.outbound.lock().insert(key, conn.clone());
+        Ok(conn)
+    }
+
+    async fn route_setup(&self, st: &Arc<ConnState>, route: u64, hop: Vec<u8>) -> Response {
+        {
+            let routes = st.routes.lock();
+            if routes.contains_key(&route) {
+                return error(ErrorCode::BadRequest, format!("route {route} already exists"));
+            }
+            if routes.len() >= self.max_routes {
+                return error(
+                    ErrorCode::RouteLimit,
+                    format!("{} routes already open on this connection", routes.len()),
+                );
+            }
+        }
+        let plain = match unseal(self.endpoint.key(), &hop) {
+            Ok(p) => p,
+            Err(e) => return error(ErrorCode::BadRecord, e.to_string()),
+        };
+        let rec: HopRecord = match postcard::from_bytes(&plain) {
+            Ok(r) => r,
+            Err(e) => return error(ErrorCode::BadRecord, format!("record does not parse: {e}")),
+        };
+        if rec.model_fingerprint != self.info.fingerprint {
+            return error(ErrorCode::ModelMismatch, "route record names another model");
+        }
+        if (rec.layer_begin, rec.layer_end) != (self.info.layer_begin, self.info.layer_end) {
+            return error(
+                ErrorCode::LayerRangeMismatch,
+                format!(
+                    "route wants layers {}:{} from this hop, it serves {}:{}",
+                    rec.layer_begin, rec.layer_end, self.info.layer_begin, self.info.layer_end
+                ),
+            );
+        }
+        let mut next = None;
+        let mut hops = 0u32;
+        if let Some(nh) = rec.next.clone() {
+            let conn = match self.outbound(&nh).await {
+                Ok(c) => c,
+                Err(e) => return e,
             };
-            let pending = match req {
-                Request::Hello { .. } => {
-                    Pending::Ready(error(ErrorCode::BadRequest, "duplicate Hello"))
+            let r: Result<Response, NetError> = conn
+                .call(
+                    &Request::RouteSetup {
+                        route,
+                        hop: rec.inner,
+                    },
+                    MAX_CONTROL_FRAME,
+                    SETUP_TIMEOUT,
+                )
+                .await;
+            match r {
+                Ok(Response::RouteOk { hops: h }) => hops = h,
+                Ok(Response::Error { code, message }) => {
+                    return error(
+                        ErrorCode::Downstream,
+                        format!("next hop {} ({code:?}): {message}", nh.addr),
+                    )
                 }
-                Request::Ping => Pending::Ready(Response::Pong),
-                Request::Forward {
+                Ok(other) => {
+                    return error(
+                        ErrorCode::Downstream,
+                        format!("next hop {}: unexpected setup reply {other:?}", nh.addr),
+                    )
+                }
+                Err(e) => {
+                    return error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr))
+                }
+            }
+            next = Some((nh, conn));
+        }
+        let mut return_conn = None;
+        if next.is_none() {
+            match &rec.ret {
+                ReturnMode::Reverse => {}
+                ReturnMode::Direct { client_id } => {
+                    let id = NodeId(*client_id);
+                    match self.clients.lock().get(&id) {
+                        Some(c) if !c.is_closed() => return_conn = Some(c.clone()),
+                        _ => {
+                            return error(
+                                ErrorCode::NoReturnPath,
+                                format!("no live connection from client {}", id.short()),
+                            )
+                        }
+                    }
+                }
+                ReturnMode::Relay { relay, token } => {
+                    let conn = match self
+                        .endpoint
+                        .connect(&relay.addr, NodeId(relay.node_id))
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return error(
+                                ErrorCode::NoReturnPath,
+                                format!("relay {}: {e}", relay.addr),
+                            )
+                        }
+                    };
+                    let r: Result<Response, NetError> = conn
+                        .call(
+                            &Request::RelayAttach { token: *token },
+                            MAX_CONTROL_FRAME,
+                            CONTROL_TIMEOUT,
+                        )
+                        .await;
+                    match r {
+                        Ok(Response::Ack) => return_conn = Some(conn),
+                        Ok(Response::Error { code, message }) => {
+                            return error(
+                                ErrorCode::NoReturnPath,
+                                format!("relay {} ({code:?}): {message}", relay.addr),
+                            )
+                        }
+                        Ok(other) => {
+                            return error(
+                                ErrorCode::NoReturnPath,
+                                format!("relay {}: unexpected reply {other:?}", relay.addr),
+                            )
+                        }
+                        Err(e) => {
+                            return error(
+                                ErrorCode::NoReturnPath,
+                                format!("relay {}: {e}", relay.addr),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let rs = Arc::new(RouteState {
+            handle,
+            next,
+            ret: rec.ret,
+            return_conn,
+        });
+        let mut routes = st.routes.lock();
+        if routes.len() >= self.max_routes {
+            return error(ErrorCode::RouteLimit, "route limit reached");
+        }
+        routes.insert(route, rs);
+        debug!(route, handle, hops = hops + 1, "route set up");
+        Response::RouteOk { hops: hops + 1 }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward(
+        &self,
+        st: &Arc<ConnState>,
+        route: u64,
+        session: u64,
+        seq: u64,
+        pos0: i32,
+        act: Activations,
+        mut hops: Vec<HopStat>,
+    ) -> Response {
+        let Some(rs) = st.routes.lock().get(&route).cloned() else {
+            return error(ErrorCode::UnknownRoute, format!("unknown route {route}"));
+        };
+        if hops.len() > 256 {
+            return error(ErrorCode::BadRequest, "too many hop stats");
+        }
+        let (tx, rx) = oneshot::channel();
+        let job = Job::Forward {
+            conn: rs.handle,
+            session,
+            seq,
+            pos0,
+            act,
+            reply: tx,
+        };
+        let (out, compute_ms) = match self.run_job(job, rx).await {
+            Reply::Forward { act, compute_ms } => (act, compute_ms),
+            Reply::Error { code, message } => {
+                // The client may be waiting on the return path rather than on this stream.
+                self.deliver_error(&rs, route, session, seq, code, &message)
+                    .await;
+                return error(code, message);
+            }
+            Reply::Ok => return error(ErrorCode::Internal, "engine replied oddly"),
+        };
+        hops.push(HopStat {
+            layer_begin: self.info.layer_begin,
+            layer_end: self.info.layer_end,
+            compute_ms,
+        });
+        match &rs.next {
+            Some((nh, conn)) => {
+                let limit = forward_frame_limit(out.n_tokens, out.n_embd);
+                let r: Result<Response, NetError> = conn
+                    .call(
+                        &Request::Forward {
+                            route,
+                            session,
+                            seq,
+                            pos0,
+                            act: out,
+                            hops,
+                        },
+                        limit,
+                        FORWARD_TIMEOUT,
+                    )
+                    .await;
+                match r {
+                    Ok(resp) => resp,
+                    Err(e) => error(
+                        ErrorCode::Downstream,
+                        format!("next hop {}: {e}", nh.addr),
+                    ),
+                }
+            }
+            None => match &rs.ret {
+                ReturnMode::Reverse => Response::ForwardOk {
                     session,
                     seq,
-                    pos0,
-                    act,
-                } => {
-                    let (reply, rx) = oneshot::channel();
-                    jobs.send(Job::Forward {
-                        conn,
+                    act: out,
+                    hops,
+                },
+                ReturnMode::Direct { .. } | ReturnMode::Relay { .. } => {
+                    let frame = ReturnFrame {
+                        route,
                         session,
                         seq,
-                        pos0,
-                        act,
-                        reply,
-                    })
-                    .await
-                    .map_err(|_| anyhow::anyhow!("engine stopped"))?;
-                    Pending::Wait(rx)
+                        body: Response::ForwardOk {
+                            session,
+                            seq,
+                            act: out,
+                            hops,
+                        },
+                    };
+                    match &rs.return_conn {
+                        Some(c) => match c.send_uni(&frame).await {
+                            Ok(()) => Response::Ack,
+                            Err(e) => error(ErrorCode::NoReturnPath, format!("return path: {e}")),
+                        },
+                        None => error(ErrorCode::NoReturnPath, "no return connection"),
+                    }
                 }
-                Request::SeqRm { session, p0, p1 } => {
-                    let (reply, rx) = oneshot::channel();
-                    jobs.send(Job::SeqRm {
-                        conn,
-                        session,
-                        p0,
-                        p1,
-                        reply,
-                    })
-                    .await
-                    .map_err(|_| anyhow::anyhow!("engine stopped"))?;
-                    Pending::Wait(rx)
-                }
-                Request::SessionClose { session } => {
-                    let (reply, rx) = oneshot::channel();
-                    jobs.send(Job::Close {
-                        conn,
-                        session,
-                        reply,
-                    })
-                    .await
-                    .map_err(|_| anyhow::anyhow!("engine stopped"))?;
-                    Pending::Wait(rx)
-                }
+            },
+        }
+    }
+
+    /// In direct and relay modes the client listens on the return path; tell it there.
+    async fn deliver_error(
+        &self,
+        rs: &RouteState,
+        route: u64,
+        session: u64,
+        seq: u64,
+        code: ErrorCode,
+        message: &str,
+    ) {
+        if rs.next.is_some() || matches!(rs.ret, ReturnMode::Reverse) {
+            return;
+        }
+        if let Some(c) = &rs.return_conn {
+            let frame = ReturnFrame {
+                route,
+                session,
+                seq,
+                body: error(code, message),
             };
-            if ptx.send(pending).await.is_err() {
-                // Writer died (peer gone); stop reading.
-                return Ok(());
+            let _ = c.send_uni(&frame).await;
+        }
+    }
+
+    /// Forward a control request down the chain and wait for its `Ack`.
+    async fn downstream_ack(&self, rs: &RouteState, req: &Request) -> Response {
+        let Some((nh, conn)) = &rs.next else {
+            return Response::Ack;
+        };
+        let r: Result<Response, NetError> =
+            conn.call(req, MAX_CONTROL_FRAME, CONTROL_TIMEOUT).await;
+        match r {
+            Ok(Response::Ack) => Response::Ack,
+            Ok(Response::Error { code, message }) => error(
+                ErrorCode::Downstream,
+                format!("next hop {} ({code:?}): {message}", nh.addr),
+            ),
+            Ok(other) => error(
+                ErrorCode::Downstream,
+                format!("next hop {}: unexpected reply {other:?}", nh.addr),
+            ),
+            Err(e) => error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)),
+        }
+    }
+
+    async fn close_route(&self, rs: &RouteState, route: u64) -> Response {
+        let _ = self.jobs.send(Job::CloseConn { conn: rs.handle }).await;
+        self.downstream_ack(rs, &Request::RouteClose { route }).await
+    }
+
+    async fn teardown(&self, st: &Arc<ConnState>) {
+        let routes: Vec<(u64, Arc<RouteState>)> = st.routes.lock().drain().collect();
+        for (route, rs) in routes {
+            let _ = self.close_route(&rs, route).await;
+        }
+        let mut clients = self.clients.lock();
+        if let Some(c) = clients.get(&st.conn.peer_id()) {
+            if c.stable_id() == st.conn.stable_id() {
+                clients.remove(&st.conn.peer_id());
             }
         }
     }
-    .await;
-
-    // Free every session of this connection (queued after its in-flight work).
-    let _ = jobs.send(Job::CloseConn { conn }).await;
-    drop(ptx);
-    let write_result = writer.await?;
-    read_result?;
-    if let Err(e) = write_result {
-        if !matches!(
-            e.kind(),
-            std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-        ) {
-            return Err(e.into());
-        }
-    }
-    Ok(())
 }

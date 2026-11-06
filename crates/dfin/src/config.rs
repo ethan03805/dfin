@@ -1,6 +1,7 @@
 //! Shared configuration types: layer ranges and the route a client daemon drives.
 
 use anyhow::{bail, Context as _};
+use dfin_net::NodeId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -66,7 +67,40 @@ impl FromStr for LayerRange {
 pub struct StageEndpoint {
     /// `host:port` of a `dfin stage` server.
     pub addr: String,
+    /// The stage's node id; the connection is refused if another key answers.
+    pub node_id: NodeId,
     pub layers: LayerRange,
+}
+
+impl FromStr for StageEndpoint {
+    type Err = anyhow::Error;
+
+    /// Parses `host:port/<node id hex>=a:b`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (target, layers) = s
+            .rsplit_once('=')
+            .with_context(|| format!("stage {s:?} must look like host:port/<node id>=a:b"))?;
+        let (addr, id) = target
+            .rsplit_once('/')
+            .with_context(|| format!("stage {s:?} is missing its node id (host:port/<node id>=a:b)"))?;
+        if addr.is_empty() {
+            bail!("stage {s:?} has an empty address");
+        }
+        let node_id: NodeId = id
+            .parse()
+            .with_context(|| format!("stage {s:?}: bad node id {id:?}"))?;
+        Ok(StageEndpoint {
+            addr: addr.to_string(),
+            node_id,
+            layers: layers.parse()?,
+        })
+    }
+}
+
+impl fmt::Display for StageEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}={}", self.addr, self.node_id, self.layers)
+    }
 }
 
 /// The route a client daemon drives: local head, remote stages in order, local tail.
@@ -78,9 +112,11 @@ pub struct StageEndpoint {
 /// tail = "6:8"
 /// [[stages]]
 /// addr = "127.0.0.1:7001"
+/// node_id = "<64 hex characters>"
 /// layers = "2:4"
 /// [[stages]]
 /// addr = "127.0.0.1:7002"
+/// node_id = "<64 hex characters>"
 /// layers = "4:6"
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +134,8 @@ pub struct RouteConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StageEndpointToml {
     pub addr: String,
+    #[serde(with = "node_id_str")]
+    pub node_id: NodeId,
     #[serde(with = "layer_range_str")]
     pub layers: LayerRange,
 }
@@ -122,6 +160,7 @@ impl RouteConfig {
             .iter()
             .map(|s| StageEndpoint {
                 addr: s.addr.clone(),
+                node_id: s.node_id,
                 layers: s.layers,
             })
             .collect()
@@ -178,9 +217,25 @@ pub mod layer_range_str {
     }
 }
 
+/// Serde adapter: `NodeId` as 64 hex characters.
+pub mod node_id_str {
+    use dfin_net::NodeId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(id: &NodeId, s: S) -> Result<S::Ok, S::Error> {
+        id.to_string().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<NodeId, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dfin_net::NodeKey;
 
     #[test]
     fn parse_ranges() {
@@ -195,21 +250,38 @@ mod tests {
 
     #[test]
     fn validate_route() {
-        let cfg: RouteConfig = toml::from_str(
+        let a = NodeKey::generate().id();
+        let b = NodeKey::generate().id();
+        let cfg: RouteConfig = toml::from_str(&format!(
             r#"
 model = "m.gguf"
 head = "0:2"
 tail = "6:8"
 [[stages]]
 addr = "a:1"
+node_id = "{a}"
 layers = "2:4"
 [[stages]]
 addr = "b:1"
+node_id = "{b}"
 layers = "4:6"
-"#,
-        )
+"#
+        ))
         .unwrap();
         cfg.validate(8).unwrap();
         assert!(cfg.validate(9).is_err());
+        assert_eq!(cfg.stages()[1].node_id, b);
+    }
+
+    #[test]
+    fn parse_stage_endpoint() {
+        let id = NodeKey::generate().id();
+        let s: StageEndpoint = format!("10.0.0.5:7001/{id}=3:9").parse().unwrap();
+        assert_eq!(s.addr, "10.0.0.5:7001");
+        assert_eq!(s.node_id, id);
+        assert_eq!(s.layers, LayerRange::new(3, 9));
+        assert_eq!(s.to_string().parse::<StageEndpoint>().unwrap(), s);
+        assert!("10.0.0.5:7001=3:9".parse::<StageEndpoint>().is_err());
+        assert!(format!("10.0.0.5:7001/zz=3:9").parse::<StageEndpoint>().is_err());
     }
 }

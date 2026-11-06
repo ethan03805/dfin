@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/dfin-proto",
+    "crates/dfin-net",
     "crates/dfin-llama-sys",
     "crates/dfin-llama",
     "crates/dfin",

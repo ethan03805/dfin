@@ -11,12 +11,21 @@
 //! returns it to the free list.
 
 use dfin_llama::{Context, OutputMode, SeqId};
-use dfin_proto::{ActDtype, Activations, ErrorCode, Response};
+use dfin_proto::{ActDtype, Activations, ErrorCode};
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
+/// What the engine thread answers.
+#[derive(Debug)]
+pub enum Reply {
+    Forward { act: Activations, compute_ms: f32 },
+    Ok,
+    Error { code: ErrorCode, message: String },
+}
+
 /// Work for the engine thread. Every variant except `CloseConn` carries a reply channel.
+/// `conn` is whatever key the caller uses to group sessions (a route handle).
 pub enum Job {
     Forward {
         conn: u64,
@@ -24,19 +33,19 @@ pub enum Job {
         seq: u64,
         pos0: i32,
         act: Activations,
-        reply: oneshot::Sender<Response>,
+        reply: oneshot::Sender<Reply>,
     },
     SeqRm {
         conn: u64,
         session: u64,
         p0: i32,
         p1: i32,
-        reply: oneshot::Sender<Response>,
+        reply: oneshot::Sender<Reply>,
     },
     Close {
         conn: u64,
         session: u64,
-        reply: oneshot::Sender<Response>,
+        reply: oneshot::Sender<Reply>,
     },
     /// A connection went away: free every session it owned.
     CloseConn { conn: u64 },
@@ -53,8 +62,8 @@ pub struct Engine {
     free: Vec<SeqId>,
 }
 
-fn err(code: ErrorCode, message: impl Into<String>) -> Response {
-    Response::Error {
+fn err(code: ErrorCode, message: impl Into<String>) -> Reply {
+    Reply::Error {
         code,
         message: message.into(),
     }
@@ -116,7 +125,7 @@ impl Engine {
                         ),
                         Some(&slot) => {
                             if self.ctx.seq_rm(slot, p0, p1) {
-                                Response::Ok
+                                Reply::Ok
                             } else {
                                 err(
                                     ErrorCode::BadRequest,
@@ -133,7 +142,7 @@ impl Engine {
                     reply,
                 } => {
                     self.free_session(conn, session);
-                    let _ = reply.send(Response::Ok);
+                    let _ = reply.send(Reply::Ok);
                 }
                 Job::CloseConn { conn } => {
                     let keys: Vec<(u64, u64)> =
@@ -162,7 +171,7 @@ impl Engine {
         seq: u64,
         pos0: i32,
         act: &Activations,
-    ) -> Response {
+    ) -> Reply {
         let n_embd = self.ctx.n_embd();
         let n_tokens = act.n_tokens as usize;
         if act.n_embd as usize != n_embd {
@@ -269,11 +278,6 @@ impl Engine {
             compute_ms = format!("{compute_ms:.2}"),
             "forward"
         );
-        Response::ForwardOk {
-            session,
-            seq,
-            act,
-            compute_ms,
-        }
+        Reply::Forward { act, compute_ms }
     }
 }

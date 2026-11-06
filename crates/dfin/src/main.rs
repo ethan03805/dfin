@@ -1,0 +1,60 @@
+//! `dfin`: one binary, several roles.
+//!
+//! * `dfin stage`  serves a contiguous layer range of a GGUF to a client daemon.
+//! * `dfin client` runs the head and tail locally, drives a route of stages, and
+//!   exposes an OpenAI-compatible API on localhost.
+//! * `dfin pod`    launches stages plus a client on this machine for testing.
+//! * `dfin bench`  measures monolithic versus pipelined decode on this machine.
+
+mod bench;
+mod client;
+mod config;
+mod pod;
+mod stage;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser, Debug)]
+#[command(name = "dfin", version, about = "Decentralized pipeline-parallel inference node")]
+struct Cli {
+    /// Log filter, e.g. `info`, `debug`, `dfin=debug,llama=warn`.
+    #[arg(long, env = "DFIN_LOG", default_value = "info", global = true)]
+    log: String,
+
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Serve one layer range of a model to a client daemon.
+    Stage(stage::StageArgs),
+    /// Run the client daemon: local head and tail, pipeline routing, OpenAI API.
+    Client(client::ClientArgs),
+    /// Launch a local pod (stages plus client) on this machine.
+    Pod(pod::PodArgs),
+    /// Benchmark monolithic versus pipelined decode on this machine.
+    Bench(bench::BenchArgs),
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    init_tracing(&cli.log);
+    match cli.cmd {
+        Cmd::Stage(args) => stage::run(args).await,
+        Cmd::Client(args) => client::run(args).await,
+        Cmd::Pod(args) => pod::run(args).await,
+        Cmd::Bench(args) => bench::run(args).await,
+    }
+}
+
+fn init_tracing(filter: &str) {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .try_init();
+}

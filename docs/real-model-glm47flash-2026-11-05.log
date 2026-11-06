@@ -1,0 +1,70 @@
+### 1. metadata
+gguf_ex_read_0: kv[0]: key = general.architecture
+gguf_ex_read_0: kv[3]: key = general.name
+gguf_ex_read_0: kv[8]: key = deepseek2.block_count
+gguf_ex_read_0: kv[9]: key = deepseek2.context_length
+gguf_ex_read_0: kv[10]: key = deepseek2.embedding_length
+gguf_ex_read_0: kv[12]: key = deepseek2.attention.head_count
+gguf_ex_read_0: kv[13]: key = deepseek2.attention.head_count_kv
+gguf_ex_read_0: kv[16]: key = deepseek2.expert_used_count
+gguf_ex_read_0: kv[21]: key = deepseek2.leading_dense_block_count
+gguf_ex_read_0: kv[28]: key = deepseek2.expert_count
+gguf_ex_read_0: kv[44]: key = tokenizer.chat_template
+gguf_ex_read_0: kv[46]: key = general.file_type
+gguf_ex_read_1: kv[0]: key = general.architecture
+gguf_ex_read_1: kv[3]: key = general.name
+gguf_ex_read_1: kv[8]: key = deepseek2.block_count
+gguf_ex_read_1: kv[9]: key = deepseek2.context_length
+gguf_ex_read_1: kv[10]: key = deepseek2.embedding_length
+gguf_ex_read_1: kv[12]: key = deepseek2.attention.head_count
+gguf_ex_read_1: kv[13]: key = deepseek2.attention.head_count_kv
+gguf_ex_read_1: kv[16]: key = deepseek2.expert_used_count
+### 2. stock llama.cpp baseline (llama-bench, -ngl 99, experts on CPU)
+| model                          |       size |     params | backend    | ngl | ot                    |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------------- | --------------: | -------------------: |
+| deepseek2 30B.A3B Q4_K - Medium |  17.20 GiB |    29.94 B | Vulkan     |  99 | exps=CPU              |           pp256 |       106.18 ± 21.46 |
+| deepseek2 30B.A3B Q4_K - Medium |  17.20 GiB |    29.94 B | Vulkan     |  99 | exps=CPU              |            tg64 |         19.90 ± 0.10 |
+### 3. dfin bench, GPU + experts in RAM, f16 wire
+[2m2026-11-05T20:41:15.083432Z[0m [33m WARN[0m [2mllama[0m[2m:[0m load: special_eot_id is not in special_eog_ids - the tokenizer config may be incorrect
+[2m2026-11-05T20:41:15.083450Z[0m [33m WARN[0m [2mllama[0m[2m:[0m load: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect
+[2m2026-11-05T20:41:15.107768Z[0m [33m WARN[0m [2mllama[0m[2m:[0m llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+listening on http://127.0.0.1:53232
+| mode               | prefill ms | ms/tok mean | ms/tok p50 | tok/s | notes
+|--------------------|------------|-------------|------------|-------|---
+| 1 monolithic       |    1473.06 |      59.718 |     49.818 |  16.7 | 256 prompt tok, 64 generated
+| 2 in-process split |    1450.26 |      51.634 |     51.467 |  19.4 | tokens == mono; ms/tok: head 0:1 0.231, mid 1:24 24.777, mid 24:46 23.815, tail 46:end 1.446, conv 0.598
+| 3 local pod (TCP)  |          - |      58.677 |          - |  17.0 | request 8471.7 ms, 64 completion tok; text == mono prefix; head 0.596; stage0 rtt 63.626 compute 63.186; stage1 rtt 64.745 compute 64.310; tail 2.549
+### 4. dfin bench, GPU + experts in RAM, f32 wire
+[2m2026-11-05T20:42:00.489654Z[0m [33m WARN[0m [2mllama[0m[2m:[0m load: special_eot_id is not in special_eog_ids - the tokenizer config may be incorrect
+[2m2026-11-05T20:42:00.489671Z[0m [33m WARN[0m [2mllama[0m[2m:[0m load: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect
+[2m2026-11-05T20:42:00.513789Z[0m [33m WARN[0m [2mllama[0m[2m:[0m llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+listening on http://127.0.0.1:49436
+| mode               | prefill ms | ms/tok mean | ms/tok p50 | tok/s | notes
+|--------------------|------------|-------------|------------|-------|---
+| 1 monolithic       |    1419.13 |      50.165 |     49.794 |  19.9 | 256 prompt tok, 64 generated
+| 2 in-process split |    1429.85 |      51.391 |     50.996 |  19.5 | tokens == mono; ms/tok: head 0:1 0.216, mid 1:24 24.737, mid 24:46 23.567, tail 46:end 1.528, conv 0.604
+| 3 local pod (TCP)  |          - |      59.000 |          - |  16.9 | request 8449.6 ms, 64 completion tok; text == mono prefix; head 0.651; stage0 rtt 63.249 compute 62.789; stage1 rtt 64.773 compute 64.291; tail 2.579
+### 5. dfin bench, CPU only, f16 wire
+[2m2026-11-05T20:42:41.906540Z[0m [33m WARN[0m [2mllama[0m[2m:[0m load: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect
+[2m2026-11-05T20:42:43.133928Z[0m [33m WARN[0m [2mllama[0m[2m:[0m load: special_eot_id is not in special_eog_ids - the tokenizer config may be incorrect
+[2m2026-11-05T20:42:43.133947Z[0m [33m WARN[0m [2mllama[0m[2m:[0m load: special_eom_id is not in special_eog_ids - the tokenizer config may be incorrect
+listening on http://127.0.0.1:49444
+| mode               | prefill ms | ms/tok mean | ms/tok p50 | tok/s | notes
+|--------------------|------------|-------------|------------|-------|---
+| 1 monolithic       |    1421.22 |      67.416 |     66.277 |  14.8 | 128 prompt tok, 32 generated
+| 2 in-process split |    1451.07 |      67.120 |     66.468 |  14.9 | tokens == mono; ms/tok: head 0:1 1.566, mid 1:24 29.517, mid 24:46 28.458, tail 46:end 7.389, conv 0.062
+| 3 local pod (TCP)  |          - |      79.837 |          - |  12.5 | request 7633.7 ms, 32 completion tok; text == mono prefix; head 1.620; stage0 rtt 111.373 compute 111.062; stage1 rtt 114.853 compute 114.585; tail 7.895
+### 6. live pod: memory per piece and one chat request
+pod ready after 2s
+--- per-process working set (MB) and Vulkan/CPU buffer sizes from the logs ---
+2026-11-05T20:42:55.839695Z  INFO dfin::stage: stage ready: layers 1:24 on 127.0.0.1:7201 (Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) Graphics), C
+2026-11-05T20:42:55.850740Z  INFO dfin::stage: stage ready: layers 24:46 on 127.0.0.1:7202 (Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) Graphics), 
+2026-11-05T20:42:56.012235Z  INFO dfin::client::engine: loading head model=models/glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf layers=0:1
+2026-11-05T20:42:57.258595Z  INFO dfin::client::engine: loading tail layers=46:47
+--- chat request ---
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Pipeline parallelism in neural network inference splits a model across multiple devices, executing layers sequentially to maximize hardware utilization. It balances computational load by overlapping the execution of different model stages across devices.","role":"assistant"}}],"created":1793911378,"id":"chatcmpl-5fa29c8cb7c9409f","model":"zai-org_GLM-4.7-Flash-Q4_K_M","object":"chat.completion","usage":{"completion_tokens":37,"prompt_tokens":22,"total_tokens":59}}
+--- second request, same prefix plus a follow-up (prefix cache) ---
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"One drawback is that it introduces pipeline bubbles, where some devices remain idle while waiting for data to move between stages.","role":"assistant"}}],"created":1793911386,"id":"chatcmpl-d1c5eb2568555eb2","model":"zai-org_GLM-4.7-Flash-Q4_K_M","object":"chat.completion","usage":{"completion_tokens":23,"prompt_tokens":43,"total_tokens":66}}
+--- /status ---
+{"act_dtype":"f16","model":"zai-org_GLM-4.7-Flash-Q4_K_M","model_path":"models/glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf","n_embd":2048,"n_layer":47,"prefix_cache":{"hits":1,"misses":1,"tokens_reused":22},"route":[{"kind":"head","layers":"0:1"},{"addr":"127.0.0.1:7201","backend":"Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) Graphics), CPU","kind":"stage","layers":"1:24"},{"addr":"127.0.0.1:7202","backend":"Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) Graphics), CPU","kind":"stage","layers":"24:46"},{"kind":"tail","layers":"46:47"}],"sessions":{"busy":0,"ctx_per_session":4096,"live":1,"max":2},"stats":{"avg_token_ms":68.67708,"head_ms":0.6467550000000001,"p50_token_ms":65.3572,"requests":2,"stages":[{"addr":"127.0.0.1:7201","avg_compute_ms":63.183639034148186,"avg_rtt_ms":63.806830645161284,"bytes_received":423529,"bytes_sent":423345,"forwards":62,"layers":"1:24"},{"addr":"127.0.0.1:7202","avg_compute_ms":63.17600465589954,"avg_rtt_ms":63.55824516129034,"bytes_received":423529,"bytes_sent":423345,"forwards":62,"layers":"24:46"}],"tail_ms":2.7913966666666665,"tokens_generated":60}}
+### done

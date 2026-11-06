@@ -1,0 +1,11 @@
+[package]
+name = "dfin-llama"
+description = "Safe wrapper over the layer-range patched libllama: models, partial models, contexts, batches"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dfin-llama-sys = { path = "../dfin-llama-sys" }
+thiserror.workspace = true
+tracing.workspace = true

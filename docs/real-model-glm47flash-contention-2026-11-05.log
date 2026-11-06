@@ -1,0 +1,27 @@
+### A. default threads, OMP_WAIT_POLICY=PASSIVE
+| 1 monolithic       |    1475.06 |      55.962 |     53.901 |  17.9 | 256 prompt tok, 64 generated
+| 2 in-process split |    1405.66 |      53.571 |     53.204 |  18.7 | tokens == mono; ms/tok: head 0:1 0.188, mid 1:24 25.687, mid 24:46 24.846, tail 46:end 1.440, conv 0.663
+| 3 local pod (TCP)  |          - |      59.892 |          - |  16.7 | request 8562.1 ms, 64 completion tok; text == mono prefix; head 0.607; stage0 rtt 65.611 compute 65.114; stage1 rtt 64.122 compute 63.674; tail 2.509
+### B. --threads 3 per piece
+| 1 monolithic       |    2345.96 |      50.031 |     48.719 |  20.0 | 256 prompt tok, 64 generated
+| 2 in-process split |    1426.09 |      50.812 |     49.310 |  19.7 | tokens == mono; ms/tok: head 0:1 0.191, mid 1:24 24.227, mid 24:46 23.673, tail 46:end 1.344, conv 0.639
+| 3 local pod (TCP)  |          - |      53.574 |          - |  18.7 | request 8130.9 ms, 64 completion tok; text == mono prefix; head 0.595; stage0 rtt 62.385 compute 61.944; stage1 rtt 60.888 compute 60.456; tail 2.363
+### C. --threads 3 and OMP_WAIT_POLICY=PASSIVE
+| 1 monolithic       |    1400.40 |      53.209 |     52.736 |  18.8 | 256 prompt tok, 64 generated
+| 2 in-process split |    1421.96 |      54.255 |     53.754 |  18.4 | tokens == mono; ms/tok: head 0:1 0.193, mid 1:24 26.209, mid 24:46 25.019, tail 46:end 1.442, conv 0.651
+| 3 local pod (TCP)  |          - |      54.754 |          - |  18.3 | request 8152.4 ms, 64 completion tok; text == mono prefix; head 0.505; stage0 rtt 62.258 compute 61.806; stage1 rtt 61.416 compute 60.970; tail 2.319
+### D. memory per piece (GPU + experts in RAM)
+pod ready after 3s
+   26992  WS     812 MB  private   1,253 MB  cmd: "W:\target\release\dfin.exe" client --head 0:1 --tail 46:end --stage 127.0.0.1:7301=1:24 --stage 127.0.0.1:7302=24:46
+   28288  WS      70 MB  private      54 MB  cmd: pod --split 1,24,46 --base-port 7301
+   51140  WS   3,870 MB  private   1,361 MB  cmd: "W:\target\release\dfin.exe" stage --layers 24:46
+   52716  WS   4,485 MB  private   1,328 MB  cmd: "W:\target\release\dfin.exe" stage --layers 1:24
+--- model sizes per piece (from logs) ---
+2026-11-05T20:47:10.583360Z  INFO dfin::stage: stage ready: layers 1:24 on 127.0.0.1:7301 (Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) Graphics), CPU)
+2026-11-05T20:47:10.591852Z  INFO dfin::stage: stage ready: layers 24:46 on 127.0.0.1:7302 (Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) Graphics), CPU)
+2026-11-05T20:47:10.796853Z  INFO dfin::client::engine: loading head model=models/glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf layers=0:1
+2026-11-05T20:47:12.190190Z  INFO dfin::client::engine: loading tail layers=46:47
+2026-11-05T20:47:15.084720Z  INFO dfin::client::stage_conn: connected to stage addr=127.0.0.1:7301 layers=1:24 n_ctx=4096 n_seq_max=2 backend=Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) G
+2026-11-05T20:47:15.085122Z  INFO dfin::client::stage_conn: connected to stage addr=127.0.0.1:7302 layers=24:46 n_ctx=4096 n_seq_max=2 backend=Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) 
+system RAM: total 31,968 MB, free 8,065 MB
+### done

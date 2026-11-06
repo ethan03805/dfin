@@ -1,0 +1,19 @@
+[package]
+name = "dfin-proto"
+description = "Wire protocol between the client daemon and pipeline stage nodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
+postcard.workspace = true
+half.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

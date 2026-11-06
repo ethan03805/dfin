@@ -1,0 +1,102 @@
+### cargo test --workspace
+     Running unittests src\main.rs (target\debug\deps\dfin-a2e6287024dd341c.exe)
+test client::http::tests::content_parts_concatenate_text ... ok
+test client::http::tests::stop_forms ... ok
+test client::sampling::tests::min_p_filters_low_tokens ... ok
+test client::tests::parse_stage_flag ... ok
+test client::sampling::tests::top_p_small_keeps_best ... ok
+test client::sampling::tests::top_k_one_is_argmax ... ok
+test client::stage_conn::tests::blocking_frames_roundtrip ... ok
+test client::http::tests::chat_request_parses_with_extras ... ok
+test client::sampling::tests::temperature_zero_is_argmax ... ok
+test client::text::tests::no_stops_passthrough ... ok
+test client::text::tests::stop_false_alarm_released ... ok
+test client::text::tests::stop_hold_back_and_match ... ok
+test client::sampling::tests::seeded_sampling_is_reproducible ... ok
+test client::text::tests::utf8_invalid_byte ... ok
+test client::text::tests::utf8_split_sequence ... ok
+test config::tests::parse_ranges ... ok
+test pod::tests::plan_split_basic ... ok
+test client::stage_conn::tests::blocking_writer_matches_async_reader ... ok
+test config::tests::validate_route ... ok
+test client::tests::client_args_parse ... ok
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\e2e.rs (target\debug\deps\e2e-b47f39dab4b44beb.exe)
+test head_tail_only ... ok
+test pipeline_with_two_stages ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.38s
+     Running tests\stage_proto.rs (target\debug\deps\stage_proto-bafd43b49f0ec3a9.exe)
+test stage_matches_full_model ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.43s
+     Running unittests src\lib.rs (target\debug\deps\dfin_llama-2440d15b7c788c24.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\tiny_model.rs (target\debug\deps\tiny_model-3d6e1f3da820991b.exe)
+test full_model_decodes ... ok
+test split_pipeline_matches_full_model ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+     Running unittests src\lib.rs (target\debug\deps\dfin_llama_sys-f2c5a1d283c47abb.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src\lib.rs (target\debug\deps\dfin_proto-f26697132e5b280d.exe)
+test tests::activations_roundtrip_f32 ... ok
+test tests::activations_roundtrip_f16_is_close ... ok
+test tests::frame_roundtrip ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+### cargo build --release
+warning: `dfin` (bin "dfin") generated 1 warning
+    Finished `release` profile [optimized + debuginfo] target(s) in 33.43s
+### bench tiny-llama-f32.gguf split 3,6 ngl 0
+layer-range patch: true | split [3, 6] | act dtype f16 | n_gpu_layers 0
+model: 8 layers | plan: head 0:3 | stages ["3:6"] | tail 6:end | prompt 32 tok
+2026-11-05T19:23:31.580221Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:31.589199Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:31.826778Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:32.334165Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+listening on http://127.0.0.1:63706
+| mode               | prefill ms | ms/tok mean | ms/tok p50 |  tok/s | notes
+|--------------------|------------|-------------|------------|--------|---
+| 1 monolithic       |       7.38 |       0.180 |      0.169 | 5554.7 | 32 prompt tok, 64 generated
+| 2 in-process split |       6.93 |       0.227 |      0.212 | 4401.1 | tokens == mono; ms/tok: head 0:3 0.081, mid 3:6 0.078, tail 6:end 0.066, conv 0.001
+| 3 local pod (TCP)  |          - |       0.410 |          - | 2438.0 | request 62.5 ms, 64 completion tok; text == mono prefix; head 0.113; stage0 rtt 0.409 compute 0.340; tail 0.105
+### bench tiny-llama-f32.gguf split 3,6 ngl -1
+layer-range patch: true | split [3, 6] | act dtype f16 | n_gpu_layers -1
+model: 8 layers | plan: head 0:3 | stages ["3:6"] | tail 6:end | prompt 32 tok
+2026-11-05T19:23:33.768030Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:33.779680Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:34.023036Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:34.549842Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+listening on http://127.0.0.1:63711
+| mode               | prefill ms | ms/tok mean | ms/tok p50 |  tok/s | notes
+|--------------------|------------|-------------|------------|--------|---
+| 1 monolithic       |       0.56 |       0.236 |      0.201 | 4232.1 | 32 prompt tok, 64 generated
+| 2 in-process split |       1.04 |       0.855 |      0.820 | 1169.1 | tokens == mono; ms/tok: head 0:3 0.141, mid 3:6 0.149, tail 6:end 0.127, conv 0.306
+| 3 local pod (TCP)  |          - |       1.032 |          - |  969.1 | request 88.0 ms, 64 completion tok; text == mono prefix; head 0.310; stage0 rtt 0.554 compute 0.318; tail 0.295
+### bench tiny-glm-dsa-f32.gguf split 2,6 ngl 0
+layer-range patch: true | split [2, 6] | act dtype f16 | n_gpu_layers 0
+model: 8 layers | plan: head 0:2 | stages ["2:6"] | tail 6:end | prompt 32 tok
+2026-11-05T19:23:36.155476Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:36.168413Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:36.451124Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:36.954894Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+listening on http://127.0.0.1:63722
+| mode               | prefill ms | ms/tok mean | ms/tok p50 |  tok/s | notes
+|--------------------|------------|-------------|------------|--------|---
+| 1 monolithic       |      17.39 |       0.333 |      0.316 | 3007.0 | 32 prompt tok, 64 generated
+| 2 in-process split |      18.27 |       0.537 |      0.515 | 1863.7 | tokens == mono; ms/tok: head 0:2 0.161, mid 2:6 0.209, tail 6:end 0.163, conv 0.002
+| 3 local pod (TCP)  |          - |       0.702 |          - | 1424.6 | request 127.0 ms, 64 completion tok; text == mono prefix; head 0.188; stage0 rtt 0.888 compute 0.817; tail 0.193
+### bench tiny-kimi-k3-f32.gguf split 2,5 ngl 0
+layer-range patch: true | split [2, 5] | act dtype f16 | n_gpu_layers 0
+model: 8 layers | plan: head 0:2 | stages ["2:5"] | tail 5:end | prompt 32 tok
+2026-11-05T19:23:37.889302Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:37.902580Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:38.187080Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+2026-11-05T19:23:38.711262Z  WARN llama: llama_init_from_model: model default pooling_type is [-1], but [0] was specified
+listening on http://127.0.0.1:63727
+| mode               | prefill ms | ms/tok mean | ms/tok p50 |  tok/s | notes
+|--------------------|------------|-------------|------------|--------|---
+| 1 monolithic       |      18.98 |       0.442 |      0.407 | 2262.2 | 32 prompt tok, 64 generated
+| 2 in-process split |      20.08 |       0.514 |      0.463 | 1946.8 | tokens == mono; ms/tok: head 0:2 0.125, mid 2:5 0.196, tail 5:end 0.189, conv 0.002
+| 3 local pod (TCP)  |          - |       0.917 |          - | 1090.1 | request 150.9 ms, 64 completion tok; text == mono prefix; head 0.201; stage0 rtt 1.024 compute 0.951; tail 0.312
+### done

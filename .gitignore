@@ -1,0 +1,10 @@
+/target/
+/.venv/
+/dist/
+/models/**/*.gguf
+/models/**/download.log
+/vendor/llama.cpp/build/
+/vendor/*.log
+/*.log
+__pycache__/
+.DS_Store

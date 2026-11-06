@@ -1,0 +1,36 @@
+[package]
+name = "dfin"
+description = "Pipeline-parallel inference node: stage server, client daemon with OpenAI-compatible API, local pod launcher and benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dfin"
+path = "src/main.rs"
+
+[dependencies]
+dfin-proto = { path = "../dfin-proto" }
+dfin-llama = { path = "../dfin-llama" }
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+postcard.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]

@@ -80,7 +80,7 @@ fails its layout tests on your platform, regenerate them with `scripts/gen-bindi
 ### Docker (Linux, CPU only)
 
 The `Dockerfile` builds llama.cpp and the workspace in a builder stage and ships `dfin`
-with its shared libraries on `debian:trixie-slim` (about 150 MB). It needs the submodule
+with its shared libraries on `debian:trixie-slim` (about 140 MB). It needs the submodule
 checked out; the comment at the top says how Vulkan and CUDA variants would be added.
 
 ```bash

@@ -46,8 +46,9 @@ jobs:
         if: steps.llama-cache.outputs.cache-hit != 'true'
         # GGML_NATIVE=OFF: hosted runners are a mix of CPU generations, and a cached
         # -march=native build from one could SIGILL on the next. The default non-native x86-64
-        # flags (AVX2, FMA, F16C, BMI2) are available on every runner.
-        run: GGML_NATIVE=OFF scripts/build-llama.sh
+        # flags (AVX2, FMA, F16C, BMI2) are available on every runner. TARGETS=llama skips the
+        # llama.cpp tools and examples, which nothing here uses.
+        run: GGML_NATIVE=OFF TARGETS=llama scripts/build-llama.sh
 
       - name: Rust stable
         uses: dtolnay/rust-toolchain@stable

@@ -37,9 +37,10 @@ COPY . .
 # Layer-range patch (idempotent; the script also copes with a CRLF checkout from Windows,
 # since the build context carries no .git for git apply to convert through), then
 # llama.cpp. GGML_NATIVE=OFF keeps the CPU backend portable (AVX2/FMA/F16C baseline on
-# x86-64, NEON on arm64) instead of -march=native of whatever machine ran `docker build`.
+# x86-64, NEON on arm64) instead of -march=native of whatever machine ran `docker build`;
+# TARGETS=llama builds libllama and the ggml libraries only, not the tools and examples.
 RUN scripts/apply-llama-patch.sh \
-    && GGML_NATIVE=OFF scripts/build-llama.sh
+    && GGML_NATIVE=OFF TARGETS=llama scripts/build-llama.sh
 
 # The workspace. build.rs links against vendor/llama.cpp/build and copies the .so files
 # next to the binary; the runtime image collects them from the llama.cpp build tree.

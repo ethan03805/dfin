@@ -71,8 +71,10 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     t.stream_receive_window(VarInt::from_u32(64 << 20));
     t.receive_window(VarInt::from_u32(256 << 20));
     t.send_window(256 << 20);
-    t.max_concurrent_bidi_streams(VarInt::from_u32(256));
-    t.max_concurrent_uni_streams(VarInt::from_u32(256));
+    // A peer may hold this many requests open at once; each can carry one forward
+    // frame, so this bounds what a connection can make the receiver buffer.
+    t.max_concurrent_bidi_streams(VarInt::from_u32(32));
+    t.max_concurrent_uni_streams(VarInt::from_u32(32));
     Arc::new(t)
 }
 

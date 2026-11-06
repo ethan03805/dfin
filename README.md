@@ -20,8 +20,9 @@ seconds, the WAN version must be rethought before continuing.
 | `vendor/llama.cpp` | Mainline llama.cpp (pinned) plus the **layer-range patch**; see `vendor/README.md` |
 | `crates/dfin-llama-sys` | Raw bindings to the patched libllama (bindgen, prebuilt DLLs) |
 | `crates/dfin-llama` | Safe wrapper: `Model` (full or partial), `Context`, tokenizer, chat templates |
-| `crates/dfin-proto` | Wire protocol: postcard frames, f32/f16 activations, model fingerprint |
-| `crates/dfin` | The `dfin` binary: `stage`, `client`, `pod`, `bench` |
+| `crates/dfin-proto` | Wire protocol: postcard frames, f32/f16 activations, routes, sealed hop records |
+| `crates/dfin-net` | Node identities, QUIC with certificates bound to node keys, sealed boxes |
+| `crates/dfin` | The `dfin` binary: `stage`, `client`, `relay`, `pod`, `bench` |
 | `tools/` | Synthetic test-model generators (random weights, valid structure) |
 | `scripts/` | Build llama.cpp, regenerate bindings |
 
@@ -32,16 +33,22 @@ agent framework (OpenCode, Hermes, curl)
         │  OpenAI API, localhost
         ▼
  dfin client ── head: embedding + layers [0,a)      (user's machine)
-        │  hidden states, f16, TCP (QUIC in phase 1)
+        │  hidden states, f16, QUIC with pinned node keys
+        │  (optionally through a dfin relay, so no stage sees the client's address)
         ▼
- dfin stage  ── layers [a,b)                         (pod member)
+ dfin stage  ── layers [a,b)                         (node)
+        │  stage dials the next stage; each knows only its neighbours
         ▼
- dfin stage  ── layers [b,c)                         (pod member)
-        │
+ dfin stage  ── layers [b,c)                         (node)
+        │  result straight back to the client, or via the relay, or back along the chain
         ▼
  dfin client ── tail: layers [c,n) + norm + LM head  (user's machine)
                 sampling, prefix cache, streaming
 ```
+
+Every node has an Ed25519 key; its public key is the node id, which clients pin when
+they dial. Route instructions are sealed to each hop's key, so a hop learns only its two
+neighbours. The wire contract is [docs/phase1-protocol.md](docs/phase1-protocol.md).
 
 Every piece is the same GGUF file opened with a different layer range, so any
 architecture llama.cpp supports (including `glm-dsa`, `glm5-next`, `kimi-k3`) works as
@@ -114,13 +121,31 @@ that the pipelined logits equal the monolithic ones.
 dfin pod --model models\tiny-llama-f32.gguf --split 2,5 --listen 127.0.0.1:8080
 ```
 
-Or by hand, one process per machine:
+Or by hand, one process per machine. Each stage prints its node id at startup (the key
+lives in `--identity`, default `dfin-stage.key`, created on first run); the client names
+every stage as `host:port/<node id>=a:b` and refuses any other key:
 
 ```powershell
-dfin stage  --model model.gguf --layers 3:40  --listen 0.0.0.0:7001 --n-gpu-layers -1 --cpu-tensors exps
-dfin stage  --model model.gguf --layers 40:77 --listen 0.0.0.0:7001 --n-gpu-layers -1 --cpu-tensors exps
-dfin client --model model.gguf --head 0:3 --tail 77:end --stage 192.168.1.10:7001=3:40 --stage 192.168.1.11:7001=40:77 --listen 127.0.0.1:8080
+dfin stage  --model model.gguf --layers 3:40  --listen 0.0.0.0:7001 --identity node.key --n-gpu-layers -1 --cpu-tensors exps --mlock
+dfin stage  --model model.gguf --layers 40:77 --listen 0.0.0.0:7001 --identity node.key --n-gpu-layers -1 --cpu-tensors exps --mlock
+dfin client --model model.gguf --head 0:3 --tail 77:end --stage 192.168.1.10:7001/<id1>=3:40 --stage 192.168.1.11:7001/<id2>=40:77 --listen 127.0.0.1:8080
 ```
+
+Stages are QUIC over UDP: open the UDP port, not a TCP one. The client dials only the
+first stage (and the last, in the default `--return direct` mode, which is where results
+come back from); the stages dial each other. `--return reverse` sends results back along
+the chain so only the first stage learns the client's address, at the cost of one extra
+link crossing per stage. To hide the client's address from every stage, run a relay and
+name it:
+
+```powershell
+dfin relay  --listen 0.0.0.0:7000 --identity relay.key
+dfin client ... --relay 203.0.113.5:7000/<relay id>
+```
+
+The relay pipes streams between the client and the first stage and between the last stage
+and the client; it sees addresses and ciphertext, never a route record or an activation
+in a form it can use. `dfin pod --relay` and `dfin bench --relay` start one locally.
 
 On a node that only serves a stage, the model file must be byte-identical to the
 client's (the handshake checks a fingerprint); each stage maps only its own layers, so a
@@ -135,7 +160,8 @@ start) and the default thread count. `--no-mmap` reads the weights into private 
 is only safe when the machine has memory to spare beyond the piece.
 
 Then point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. `GET /status`
-shows the route, per-stage round-trip and compute times, and prefix-cache hits.
+shows the route with each stage's node id, the chain's round-trip and setup times and
+return mode, per-stage compute times, and prefix-cache hits.
 
 ```powershell
 dfin bench --model models\tiny-llama-f32.gguf --split 3,6 --gen-tokens 64
@@ -194,7 +220,7 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [x] `dfin client` daemon: local head and tail, OpenAI API with streaming, prefix cache, sampler
 - [x] `dfin pod` and `dfin bench`
 - [x] Verified on tiny synthetic `glm-dsa` and `kimi-k3` models (MLA, indexer, MoE, KDA paths); see `docs/phase0-findings.md` for what each architecture needs at a stage boundary
-- [ ] QUIC transport (TCP today)
+- [x] Phase 1 transport: Ed25519 node ids, QUIC with pinned keys, sealed route records, chain forwarding stage to stage, direct, reverse and relay return modes, `dfin relay`; see `docs/phase1-protocol.md`
 - [ ] MTP speculative decoding in the client tail
 - [ ] Stage state wider than `n_embd` for `glm5-next` (hyper-connections) and Kimi K3 attention residuals
 - [ ] Tool-call parsing in the OpenAI layer (requests with `tools` are accepted, calls are not parsed)
@@ -203,10 +229,11 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [x] Real model across two machines (PC plus MacBook Air over WiFi): identical output, 16.8 tok/s against 19.8 single-machine, network-bound as predicted
 - [ ] The scale gate: GLM-5.3 IQ4_XS across 4 to 8 machines at 3 tok/s or better (moved to phase 3 in design v0.2; needs rented hardware and sharded loading)
 
-What comes next is design v0.2 phase 1, the encrypted chain: transport with node keys in
-place of raw TCP, stage-to-stage forwarding with the client touching only the ends through
-relays, cloaked nodes, a signed directory, per-layer weight shards, multi-tensor stage state,
-a verified Linux build. Nothing in this repository is safe to expose to the internet yet.
+Design v0.2 phase 1 (the encrypted chain) is under way. Done: node identities, the QUIC
+transport, chain forwarding, relays. Still to do in phase 1: cloaked nodes, a signed
+directory, per-layer weight shards, multi-tensor stage state, replay-log failover, region
+fencing, fuzzing of the decoders. Until the directory and the integrity checks of phase 2
+exist, only run stages for clients you know.
 
 ## License
 

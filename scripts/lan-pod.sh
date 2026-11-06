@@ -2,9 +2,12 @@
 # Two-machine LAN pod: a remote stage already running on another machine serves layers
 # 1:N; this machine runs the head (layer 0), a local stage for N:LAST, and the tail.
 #
-#   scripts/lan-pod.sh <model.gguf> <remote host:port> <N> <LAST> [gen_tokens] [prompt_tokens]
+#   scripts/lan-pod.sh <model.gguf> <remote host:port/node-id> <N> <LAST> [gen_tokens] [prompt_tokens]
 #
-# e.g. scripts/lan-pod.sh models/glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf 10.0.0.38:7001 21 46
+# The remote stage prints its node id at startup. RETURN=direct|reverse (default direct)
+# picks how results come back; RELAY=host:port/node-id routes through a relay instead.
+#
+# e.g. scripts/lan-pod.sh models/glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf 10.0.0.38:7001/<id> 21 46
 set -u
 cd "$(dirname "$0")/.."
 MODEL="${1:?model}"; REMOTE="${2:?host:port}"; N="${3:?N}"; LAST="${4:?LAST}"
@@ -18,19 +21,23 @@ HOST="${REMOTE%%:*}"
 ping -n 10 "$HOST" 2>/dev/null | tail -2 || ping -c 10 "$HOST" | tail -2
 
 echo "### local stage $N:$LAST"
-"$B" stage --model "$MODEL" --layers "$N:$LAST" --listen 127.0.0.1:7002 --n-gpu-layers -1 --cpu-tensors exps ${STAGE_ARGS:-} \
+KEY=lan-stage.key
+"$B" stage --model "$MODEL" --layers "$N:$LAST" --listen 127.0.0.1:7002 --identity "$KEY" --n-gpu-layers -1 --cpu-tensors exps ${STAGE_ARGS:-} \
     --n-ctx 8192 --n-seq-max 2 --act-dtype f16 --log info > lan-stage.log 2>&1 &
 STAGEPID=$!
-for i in $(seq 1 300); do (exec 3<>/dev/tcp/127.0.0.1/7002) 2>/dev/null && break; sleep 1; done
+for i in $(seq 1 300); do grep -q "stage ready" lan-stage.log 2>/dev/null && break; sleep 1; done
 echo "local stage up after ${i}s"
+LOCAL_ID=$(strip < lan-stage.log | sed -n 's/.*node id \([0-9a-f]\{64\}\).*/\1/p' | head -1)
 
-echo "### client: head 0:1 -> $REMOTE=1:$N -> 127.0.0.1:7002=$N:$LAST -> tail $LAST:end"
-"$B" client --model "$MODEL" --head 0:1 --tail "$LAST:end" --stage "$REMOTE=1:$N" --stage "127.0.0.1:7002=$N:$LAST" \
+RET_ARGS="--return ${RETURN:-direct}"
+[ -n "${RELAY:-}" ] && RET_ARGS="--relay $RELAY"
+echo "### client: head 0:1 -> $REMOTE=1:$N -> 127.0.0.1:7002/$LOCAL_ID=$N:$LAST -> tail $LAST:end ($RET_ARGS)"
+"$B" client --model "$MODEL" --head 0:1 --tail "$LAST:end" --stage "$REMOTE=1:$N" --stage "127.0.0.1:7002/$LOCAL_ID=$N:$LAST" $RET_ARGS \
     --listen $API --n-gpu-layers -1 --cpu-tensors exps --max-sessions 2 --n-ctx 8192 --act-dtype f16 --log info > lan-client.log 2>&1 &
 CLIENTPID=$!
 for i in $(seq 1 180); do curl.exe -s "http://$API/health" >/dev/null 2>&1 && break; sleep 1; done
 echo "client up after ${i}s"
-strip < lan-client.log | grep -E "connected to stage|stage ping|engine ready" | cut -c1-200
+strip < lan-client.log | grep -E "route ready|first hop ping|engine ready" | cut -c1-200
 
 if [ "${QUICK:-0}" = "1" ]; then
     echo "### QUICK: one 256-token completion through the LAN pipeline"

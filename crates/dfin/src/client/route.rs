@@ -21,25 +21,30 @@ pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(600);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How results come back from the last hop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReturnPolicy {
     /// Back along the chain. Only the first hop learns the client's address.
     Reverse,
     /// Straight from the last hop on a connection the client holds to it.
     Direct,
+    /// Through a relay: the client reaches the first hop through it and the last hop
+    /// delivers results to it. No stage learns the client's address.
+    Relay(NextHop),
 }
 
 impl ReturnPolicy {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             ReturnPolicy::Reverse => "reverse",
             ReturnPolicy::Direct => "direct",
+            ReturnPolicy::Relay(_) => "relay",
         }
     }
 }
 
 impl FromStr for ReturnPolicy {
     type Err = String;
+    /// `reverse` or `direct`; relay mode is chosen by naming a relay instead.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "reverse" => Ok(ReturnPolicy::Reverse),
@@ -101,6 +106,8 @@ pub struct Route {
     /// Largest forward (tokens) this client sends; bounds result frames.
     max_tokens: u32,
     route_id: u64,
+    /// Relay session token (relay mode).
+    token: [u8; 16],
     first: Option<Connection>,
     last: Option<Connection>,
     returns: Option<mpsc::Receiver<ReturnFrame>>,
@@ -145,6 +152,7 @@ impl Route {
             n_embd,
             max_tokens,
             route_id: 0,
+            token: [0; 16],
             first: None,
             last: None,
             returns: None,
@@ -157,7 +165,7 @@ impl Route {
 
     pub fn is_connected(&self) -> bool {
         let live = |c: &Option<Connection>| c.as_ref().is_some_and(|c| !c.is_closed());
-        live(&self.first) && (self.policy == ReturnPolicy::Reverse || live(&self.last))
+        live(&self.first) && (matches!(self.policy, ReturnPolicy::Reverse) || live(&self.last))
     }
 
     pub fn first_addr(&self) -> &str {
@@ -237,10 +245,14 @@ impl Route {
                     })
                 },
                 ret: if last {
-                    match self.policy {
+                    match &self.policy {
                         ReturnPolicy::Reverse => ReturnMode::Reverse,
                         ReturnPolicy::Direct => ReturnMode::Direct {
                             client_id: *client_id.as_bytes(),
+                        },
+                        ReturnPolicy::Relay(relay) => ReturnMode::Relay {
+                            relay: relay.clone(),
+                            token: self.token,
                         },
                     }
                 } else {
@@ -261,12 +273,45 @@ impl Route {
         self.disconnect();
         let t = Instant::now();
         let n = self.hops.len();
-        let first = self
-            .rt
-            .block_on(self.endpoint.connect(&self.hops[0].addr, self.hops[0].node_id))?;
+        self.token = rand::random();
+        let first = match self.policy.clone() {
+            ReturnPolicy::Relay(relay) => {
+                // Reach the first hop through the relay; results come back the same way.
+                let c = self
+                    .rt
+                    .block_on(self.endpoint.connect(&relay.addr, NodeId(relay.node_id)))?;
+                let open = Request::RelayOpen {
+                    token: self.token,
+                    first_hop: NextHop {
+                        addr: self.hops[0].addr.clone(),
+                        node_id: *self.hops[0].node_id.as_bytes(),
+                    },
+                };
+                let r: Response = self
+                    .rt
+                    .block_on(c.call(&open, MAX_CONTROL_FRAME, SETUP_TIMEOUT))?;
+                match r {
+                    Response::Ack => {}
+                    Response::Error { code, message } => {
+                        return Err(stage_err(&relay.addr, code, format!("relay: {message}")))
+                    }
+                    other => {
+                        return Err(RouteError::Protocol(format!(
+                            "relay {}: unexpected reply {other:?}",
+                            relay.addr
+                        )))
+                    }
+                }
+                c
+            }
+            _ => self
+                .rt
+                .block_on(self.endpoint.connect(&self.hops[0].addr, self.hops[0].node_id))?,
+        };
         self.backends[0] = self.hello(&first, &self.hops[0])?;
-        let last = match self.policy {
+        let last = match &self.policy {
             ReturnPolicy::Reverse => None,
+            ReturnPolicy::Relay(_) => Some(first.clone()),
             ReturnPolicy::Direct if n == 1 => Some(first.clone()),
             ReturnPolicy::Direct => {
                 let hop = &self.hops[n - 1];
@@ -459,7 +504,7 @@ impl Route {
                 self.rt
                     .block_on(first.call::<_, Response>(&req, limit, FORWARD_TIMEOUT))?
             }
-            ReturnPolicy::Direct => {
+            ReturnPolicy::Direct | ReturnPolicy::Relay(_) => {
                 let returns = self
                     .returns
                     .as_mut()

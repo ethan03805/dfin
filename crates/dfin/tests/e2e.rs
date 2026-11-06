@@ -366,8 +366,8 @@ async fn exercise(procs: &Procs, base: &str, expected: &str) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn pipeline_with_two_stages() {
+/// Two stages and a client in the given return mode (`direct`, `reverse` or `relay`).
+async fn pipeline_with_two_stages(return_mode: &str) {
     if should_skip() {
         return;
     }
@@ -399,11 +399,31 @@ async fn pipeline_with_two_stages() {
         .collect();
         stage_idx.push((procs.spawn(name, &args), port, key.id));
     }
+    let relay = if return_mode == "relay" {
+        let port = free_udp_port();
+        let key = StageKey::new("relay");
+        let args: Vec<String> = [
+            "relay",
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--identity",
+            &key.path.display().to_string(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let i = procs.spawn("relay", &args);
+        Some((i, port, key))
+    } else {
+        None
+    };
     for (i, port, id) in stage_idx {
         procs.wait_stage(i, port, id, Duration::from_secs(120)).await;
     }
-    let return_mode = std::env::var("DFIN_TEST_RETURN").unwrap_or_else(|_| "direct".into());
-    let args: Vec<String> = [
+    if let Some((i, port, key)) = &relay {
+        procs.wait_stage(*i, *port, key.id, Duration::from_secs(60)).await;
+    }
+    let mut args: Vec<String> = [
         "client",
         "--model",
         &model,
@@ -415,8 +435,6 @@ async fn pipeline_with_two_stages() {
         &format!("127.0.0.1:{p1}/{}=2:4", k1.id),
         "--stage",
         &format!("127.0.0.1:{p2}/{}=4:6", k2.id),
-        "--return",
-        &return_mode,
         "--n-gpu-layers",
         "0",
         "--act-dtype",
@@ -431,6 +449,16 @@ async fn pipeline_with_two_stages() {
     .iter()
     .map(|s| s.to_string())
     .collect();
+    match &relay {
+        Some((_, port, key)) => {
+            args.push("--relay".into());
+            args.push(format!("127.0.0.1:{port}/{}", key.id));
+        }
+        None => {
+            args.push("--return".into());
+            args.push(return_mode.into());
+        }
+    }
     let ci = procs.spawn("client", &args);
     let base = format!("http://127.0.0.1:{pc}");
     procs.wait_health(ci, &base, Duration::from_secs(120)).await;
@@ -457,6 +485,21 @@ async fn pipeline_with_two_stages() {
         "{status:#}"
     );
     assert_eq!(status["route"][1]["node_id"], k1.id.to_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_stages_direct_return() {
+    pipeline_with_two_stages("direct").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_stages_reverse_return() {
+    pipeline_with_two_stages("reverse").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_stages_through_relay() {
+    pipeline_with_two_stages("relay").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -83,3 +83,35 @@ fingerprint.
    the download, the `dfin` git commit (`git rev-parse --short HEAD`) and any files you
    changed, the tiny-model bench table from step 4, and the stage's startup log lines
    about model size and Metal buffers. Then keep the stage running.
+
+
+---
+
+## Follow-up prompt: update the Mac stage to phase 1 (6 November 2026)
+
+Copy everything below the line into the same Claude session on the Mac.
+
+---
+
+The `dfin` project moved from raw TCP to an authenticated QUIC transport with node
+identities (branch `main`, commit 897bed2 or later). Update the stage on this Mac and
+leave it running. Work autonomously; only stop for a firewall click or a decision.
+
+1. Stop the running `dfin stage` (find it with `pgrep -fl "dfin stage"`).
+2. In `~/dfin`: `git fetch origin && git checkout main && git pull`. If you had local
+   commits on `mac-node` that are not on `main`, rebase them on top of `main` and tell me
+   which files they touch. Then `cargo build --release` (llama.cpp does not need
+   rebuilding; the patch did not change). Run `cargo test --release` with the tiny model.
+3. Start the stage with the same model, layer range and flags as before, plus an identity
+   file and locked weights:
+   ```bash
+   target/release/dfin stage --model models/glm-4.7-flash/zai-org_GLM-4.7-Flash-Q4_K_M.gguf \
+     --layers 1:N --listen 0.0.0.0:7001 --identity ~/dfin/mac-stage.key --mlock \
+     --n-gpu-layers -1 --n-ctx 8192 --n-seq-max 2 --act-dtype f16 --log info
+   ```
+   The stage is now QUIC over UDP: if macOS asks about incoming connections for `dfin`,
+   tell me so I can click Allow. `nc -z` will not see a UDP listener; use the log line
+   `stage ready` instead.
+4. Report, each on its own line: the line `node id <64 hex characters>` from the stage
+   log, the Mac's LAN IP, the port, the layer range, the git commit, and the `cargo test`
+   result. Then keep the stage running.

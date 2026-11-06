@@ -440,7 +440,7 @@ impl Engine {
                 dfin_proto::model_fingerprint(&cfg.model_path).context("fingerprinting model")?;
             let mut route = Route::new(
                 cfg.stages.clone(),
-                cfg.return_policy,
+                cfg.return_policy.clone(),
                 endpoint,
                 rt,
                 fingerprint,

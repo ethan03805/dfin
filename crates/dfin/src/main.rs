@@ -3,6 +3,8 @@
 //! * `dfin stage`  serves a contiguous layer range of a GGUF to a client daemon.
 //! * `dfin client` runs the head and tail locally, drives a route of stages, and
 //!   exposes an OpenAI-compatible API on localhost.
+//! * `dfin relay`  pipes streams between a client and its route so stages never
+//!   learn the client's address.
 //! * `dfin pod`    launches stages plus a client on this machine for testing.
 //! * `dfin bench`  measures monolithic versus pipelined decode on this machine.
 
@@ -10,6 +12,7 @@ mod bench;
 mod client;
 mod config;
 mod pod;
+mod relay;
 mod stage;
 
 use clap::{Parser, Subcommand};
@@ -35,6 +38,8 @@ enum Cmd {
     Stage(stage::StageArgs),
     /// Run the client daemon: local head and tail, pipeline routing, OpenAI API.
     Client(client::ClientArgs),
+    /// Pipe streams between clients and their routes, hiding client addresses from stages.
+    Relay(relay::RelayArgs),
     /// Launch a local pod (stages plus client) on this machine.
     Pod(pod::PodArgs),
     /// Benchmark monolithic versus pipelined decode on this machine.
@@ -48,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Stage(args) => stage::run(args).await,
         Cmd::Client(args) => client::run(args).await,
+        Cmd::Relay(args) => relay::run(args).await,
         Cmd::Pod(args) => pod::run(args).await,
         Cmd::Bench(args) => bench::run(args).await,
     }

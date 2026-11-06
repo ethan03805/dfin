@@ -40,6 +40,9 @@ pub struct BenchArgs {
     /// Return mode for the pod client: `direct` or `reverse`.
     #[arg(long = "return", default_value = "direct")]
     pub return_mode: String,
+    /// Run the pod client through a relay (overrides `--return`).
+    #[arg(long)]
+    pub relay: bool,
     /// First stage port for the pod mode.
     #[arg(long, default_value_t = 7101)]
     pub base_port: u16,
@@ -374,6 +377,7 @@ async fn bench_pod_inner(
             threads: a.threads,
             act_dtype: a.act_dtype,
             return_mode: a.return_mode.clone(),
+            relay: a.relay,
             exe: None,
             log: Some("warn".into()),
             ready_timeout: Duration::from_secs(120),

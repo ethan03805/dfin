@@ -45,6 +45,10 @@ pub struct ClientArgs {
     /// learns this client's address).
     #[arg(long = "return", default_value = "direct", value_parser = parse_return)]
     pub return_mode: ReturnPolicy,
+    /// Reach the first stage through this relay (`host:port/<node id>`) and receive
+    /// results through it, so no stage learns this client's address. Overrides `--return`.
+    #[arg(long, value_parser = parse_relay)]
+    pub relay: Option<dfin_proto::NextHop>,
     /// Route TOML (model, head, tail, stages) instead of the flags above.
     #[arg(long)]
     pub route: Option<PathBuf>,
@@ -102,6 +106,20 @@ fn parse_return(s: &str) -> Result<ReturnPolicy, String> {
     s.parse()
 }
 
+fn parse_relay(s: &str) -> Result<dfin_proto::NextHop, String> {
+    let (addr, id) = s
+        .rsplit_once('/')
+        .ok_or_else(|| format!("relay {s:?} must look like host:port/<node id>"))?;
+    if addr.is_empty() {
+        return Err(format!("relay {s:?} has an empty address"));
+    }
+    let node_id: dfin_net::NodeId = id.parse().map_err(|e| format!("relay {s:?}: {e}"))?;
+    Ok(dfin_proto::NextHop {
+        addr: addr.to_string(),
+        node_id: *node_id.as_bytes(),
+    })
+}
+
 fn parse_act_dtype(s: &str) -> Result<ActDtype, String> {
     s.parse()
 }
@@ -152,7 +170,10 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
         head,
         tail,
         stages,
-        return_policy: args.return_mode,
+        return_policy: match &args.relay {
+            Some(relay) => ReturnPolicy::Relay(relay.clone()),
+            None => args.return_mode.clone(),
+        },
         n_ctx: args.n_ctx,
         n_gpu_layers: args.n_gpu_layers,
         cpu_tensors: args.cpu_tensors.clone(),

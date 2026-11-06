@@ -51,6 +51,9 @@ pub struct PodArgs {
     /// Return mode for the client: `direct` or `reverse`.
     #[arg(long = "return", default_value = "direct")]
     pub return_mode: String,
+    /// Also start a relay and send the client through it (overrides `--return`).
+    #[arg(long)]
+    pub relay: bool,
 }
 
 /// Everything `spawn_pod` needs.
@@ -68,6 +71,8 @@ pub struct PodOptions {
     pub act_dtype: ActDtype,
     /// `direct` or `reverse`.
     pub return_mode: String,
+    /// Start a relay on `base_port + n_stages` and route the client through it.
+    pub relay: bool,
     /// The `dfin` binary to launch; defaults to `std::env::current_exe()`.
     pub exe: Option<PathBuf>,
     /// `--log` filter passed to the children (otherwise they inherit `DFIN_LOG`).
@@ -90,6 +95,7 @@ impl PodOptions {
             threads: a.threads,
             act_dtype: a.act_dtype,
             return_mode: a.return_mode.clone(),
+            relay: a.relay,
             exe: None,
             log: None,
             ready_timeout: Duration::from_secs(120),
@@ -347,6 +353,20 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
         stage_ids.push(key.id());
         key_files.push(path);
     }
+    let relay = if opts.relay {
+        let port = opts
+            .base_port
+            .checked_add(plan.stages.len() as u16)
+            .context("relay port overflows u16")?;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        ensure_udp_port_free(addr)?;
+        let key = NodeKey::generate();
+        let path = key_dir.join("relay.key");
+        key.save(&path)?;
+        Some((addr, key.id(), path))
+    } else {
+        None
+    };
     let probe = Endpoint::client(NodeKey::generate()).context("creating probe endpoint")?;
 
     let mut handle = PodHandle {
@@ -391,6 +411,23 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
             .with_context(|| format!("spawning {}", exe.display()))?;
         handle.children.push(PodChild { name, child });
     }
+    if let Some((addr, id, path)) = &relay {
+        let mut cmd = base_command(&exe, &opts.log);
+        cmd.arg("relay")
+            .arg("--listen")
+            .arg(addr.to_string())
+            .arg("--identity")
+            .arg(path);
+        let name = format!("relay @ {addr}");
+        info!("starting {name}");
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("spawning {}", exe.display()))?;
+        handle.children.push(PodChild { name, child });
+        let last = handle.children.len() - 1;
+        wait_for_stage(&probe, *addr, *id, &mut handle.children[last], opts.ready_timeout).await?;
+        info!("{} is up", handle.children[last].name);
+    }
     for (i, addr) in stage_addrs.iter().enumerate() {
         wait_for_stage(
             &probe,
@@ -415,6 +452,9 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
         cmd.arg("--stage").arg(format!("{addr}/{id}={range}"));
     }
     cmd.arg("--return").arg(&opts.return_mode);
+    if let Some((addr, id, _)) = &relay {
+        cmd.arg("--relay").arg(format!("{addr}/{id}"));
+    }
     cmd.arg("--listen")
         .arg(opts.listen.to_string())
         .arg("--n-ctx")

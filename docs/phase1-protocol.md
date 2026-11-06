@@ -83,8 +83,9 @@ the address and id of its two neighbours and nothing else: not the client's addr
 
 Hop 1 must have received `Hello` on the incoming connection. Later hops check the
 model fingerprint and the range from their sealed record instead; the hop-to-hop
-connection carries a `Hello` too, which is how a hop learns its successor is sane
-before it forwards anything.
+connection carries a `Hello` too, with the range `-1:-1` meaning "whatever you serve",
+which is how a hop learns its successor runs the same weights before it forwards
+anything. Hop-to-hop connections are reused across routes.
 
 ## 5. Forwarding and return modes
 
@@ -126,8 +127,10 @@ connection to hop 1. Last-hop side: `RelayAttach { token }` on the first stream;
 unidirectional stream it opens is piped to a unidirectional stream on the client's
 connection.
 
-Relay is the third return mode and the default once relays exist. Until then the
-client defaults to `Direct` on a LAN and `Reverse` when asked to hide its address.
+Relay is the third return mode, chosen by naming a relay (`--relay host:port/<node id>`).
+Without one the client defaults to `Direct`, and `--return reverse` hides its address
+from all but the first stage. A relay session that nobody attaches to is forgotten after
+two minutes; a relay answers `Ping` so launchers can probe it.
 
 ## 7. What a stage keeps
 
@@ -137,7 +140,16 @@ per session, as in Phase 0). When an incoming connection closes, every route it
 opened is torn down along the chain and every session freed. Stages never persist
 any of this.
 
-## 8. What changed from Phase 0 and why
+## 8. Status, 6 November 2026
+
+Built and tested: identities, transport, sealed records, route setup, forwarding, all
+three return modes, `dfin relay`, the limits in section 2 except fuzzing. Verified with
+the tiny model (unit, protocol and end-to-end tests in every mode) and on GLM-4.7-Flash
+on one machine (`docs/phase1-findings.md`). Not yet done from the phase 1 list: cloaked
+nodes (stages reachable only through relays), the signed directory, per-layer shards,
+multi-tensor stage state, replay-log failover, region fencing.
+
+## 9. What changed from Phase 0 and why
 
 - Stages dial each other. A route is a chain, not a star around the client.
 - Stages have identities and connections are authenticated, so a route to the wrong

@@ -1,0 +1,16 @@
+### return mode: direct
+layer-range patch: true | split [1, 24, 46] | act dtype f16 | n_gpu_layers -1
+model: 47 layers | plan: head 0:1 | stages ["1:24", "24:46"] | tail 46:end | prompt 256 tok
+| mode               | prefill ms | ms/tok mean | ms/tok p50 | tok/s | notes
+| 1 monolithic       |   40960.51 |     150.216 |    146.126 |   6.7 | 256 prompt tok, 64 generated
+| 2 in-process split |   15838.52 |     170.282 |    164.109 |   5.9 | tokens == mono; ms/tok: head 0:1 0.313, mid 1:24 84.323, mid 24:46 78.344, tail 46:end 5.653, conv 0.870
+| 3 local pod (TCP)  |   44547.97 |      96.267 |          - |  10.4 | request 50615.4 ms, 64 completion tok; text == mono prefix; head 0.695; chain (direct) rtt 784.662 decode-only rtt 91.262 ping 0.13 setup 7.0; stage0 compute 340.516 decode-only 31.107; stage1 compute 442.565 decode-only 59.398; tail 4.186
+### return mode: reverse
+layer-range patch: true | split [1, 24, 46] | act dtype f16 | n_gpu_layers -1
+model: 47 layers | plan: head 0:1 | stages ["1:24", "24:46"] | tail 46:end | prompt 256 tok
+| mode               | prefill ms | ms/tok mean | ms/tok p50 | tok/s | notes
+| 1 monolithic       |    2474.65 |      55.141 |     53.484 |  18.1 | 256 prompt tok, 64 generated
+| 2 in-process split |   14756.32 |     186.602 |    182.895 |   5.4 | tokens == mono; ms/tok: head 0:1 0.320, mid 1:24 92.150, mid 24:46 84.941, tail 46:end 7.205, conv 0.949
+| 3 local pod (TCP)  |   25899.78 |     195.509 |          - |   5.1 | request 38219.3 ms, 64 completion tok; text == mono prefix; head 0.902; chain (reverse) rtt 587.503 decode-only rtt 187.272 ping 0.14 setup 7.0; stage0 compute 309.999 decode-only 70.982; stage1 compute 275.187 decode-only 114.594; tail 7.144
+### done
+exit 0

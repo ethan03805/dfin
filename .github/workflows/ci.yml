@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux x86-64, CPU
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out (with the llama.cpp submodule)
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: Apply the layer-range patch
+        run: scripts/apply-llama-patch.sh
+
+      - name: Cache keys
+        id: keys
+        # The pinned llama.cpp commit (the gitlink, no submodule needed) plus the patch and
+        # build script contents decide what the llama.cpp build tree looks like.
+        run: |
+          echo "llama=$(git rev-parse HEAD:vendor/llama.cpp)" >> "$GITHUB_OUTPUT"
+          echo "patch=$(cat vendor/patches/*.patch scripts/build-llama.sh | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the llama.cpp build tree
+        id: llama-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/llama.cpp/build
+          key: llama-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.llama }}-${{ steps.keys.outputs.patch }}
+
+      - name: Build llama.cpp (CPU, Release)
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        # GGML_NATIVE=OFF: hosted runners are a mix of CPU generations, and a cached
+        # -march=native build from one could SIGILL on the next. The default non-native x86-64
+        # flags (AVX2, FMA, F16C, BMI2) are available on every runner.
+        run: GGML_NATIVE=OFF scripts/build-llama.sh
+
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: llama-${{ steps.keys.outputs.llama }}-${{ steps.keys.outputs.patch }}
+
+      - name: Python for the test-model generator
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate the tiny test model
+        run: |
+          python -m pip install --quiet numpy vendor/llama.cpp/gguf-py
+          mkdir -p models
+          python tools/make_tiny_llama.py models/tiny-llama-f32.gguf
+
+      - name: cargo test --release --workspace
+        run: cargo test --release --workspace --locked
+
+      - name: The release binary runs on its own (rpath $ORIGIN)
+        run: |
+          cargo build --release --locked -p dfin
+          env -u LD_LIBRARY_PATH target/release/dfin --help
+          ldd target/release/dfin | grep -E "llama|ggml"

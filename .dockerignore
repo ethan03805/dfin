@@ -1,0 +1,17 @@
+# Keep the Docker build context to the sources the image needs. The submodule's own
+# .git (a gitfile pointing into the superproject) is excluded, so apply-llama-patch.sh
+# runs `git apply` outside any repository, which works like plain `patch -p1`.
+.git
+.github
+**/.git
+/target
+/.venv
+/dist
+/models
+/docs
+/vendor/llama.cpp/build
+*.log
+__pycache__
+.DS_Store
+Dockerfile
+.dockerignore

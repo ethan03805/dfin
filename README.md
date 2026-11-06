@@ -84,6 +84,25 @@ checked-in FFI bindings were generated on Windows x64; if `cargo test -p dfin-ll
 fails its layout tests on your platform, regenerate them with `scripts/gen-bindings.sh`
 (needs `cargo install bindgen-cli` and libclang).
 
+### Docker (Linux, CPU only)
+
+The `Dockerfile` builds llama.cpp and the workspace in a builder stage and ships `dfin`
+with its shared libraries on `debian:trixie-slim` (about 140 MB). It needs the submodule
+checked out; the comment at the top says how Vulkan and CUDA variants would be added.
+
+```bash
+docker build -t dfin .
+docker run --rm dfin --help
+```
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request: it checks
+out the submodule, applies the patch, builds llama.cpp (CPU, `GGML_NATIVE=OFF` so the
+cached build is portable between runners), generates the tiny test model and runs
+`cargo test --release --workspace` on `ubuntu-latest`. The llama.cpp build tree is cached
+on the submodule commit and the patch, so only changes to either rebuild it.
+
 ## Build (Windows)
 
 Prerequisites: Visual Studio 2022 with C++ tools, CMake, Rust 1.85+, Python 3.10+,

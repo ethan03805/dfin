@@ -1,0 +1,6 @@
+# llama.cpp's dylibs carry @rpath install names, and build.rs copies them next to the
+# executables (target/<profile>/ and target/<profile>/deps/). Cargo does not forward
+# `cargo:rustc-link-arg` from dfin-llama-sys's build script to the crates that depend
+# on it, so the rpath has to be set for every link here.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,@executable_path"]

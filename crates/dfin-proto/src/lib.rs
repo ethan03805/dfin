@@ -273,6 +273,11 @@ pub enum Response {
         layer_begin: i32,
         layer_end: i32,
         n_embd: u32,
+        /// Width of the rows this stage takes and produces: `n_embd` times the number of
+        /// state vectors at its boundaries (more than one for hyper-connection streams or
+        /// residual banks).
+        n_embd_inp: u32,
+        n_embd_out: u32,
         n_ctx: u32,
         n_seq_max: u32,
         /// Human-readable backend description, for `/status`.

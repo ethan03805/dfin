@@ -283,6 +283,7 @@ async fn stage_matches_full_model() {
             n_seq_max,
             backend,
             node_id,
+            ..
         } => {
             eprintln!("HelloOk: layers {layer_begin}:{layer_end} n_embd {n_embd} n_ctx {n_ctx} n_seq_max {n_seq_max} backend {backend:?}");
             assert_eq!((layer_begin, layer_end), MID);

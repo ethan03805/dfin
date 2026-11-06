@@ -159,6 +159,8 @@ struct StageInfo {
     layer_begin: i32,
     layer_end: i32,
     n_embd: u32,
+    n_embd_inp: u32,
+    n_embd_out: u32,
     n_ctx_seq: u32,
     n_seq_max: u32,
     n_batch: u32,
@@ -273,13 +275,15 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
     }
     let (layer_begin, layer_end) = model.layer_range();
     info!(
-        "model: {} | {:.1} MiB resident | layers {}:{} of {} | n_embd {}",
+        "model: {} | {:.1} MiB resident | layers {}:{} of {} | n_embd {} | state in {} out {}",
         model.desc(),
         model.size_bytes() as f64 / (1024.0 * 1024.0),
         layer_begin,
         layer_end,
         model.n_layer(),
-        model.n_embd()
+        model.n_embd(),
+        model.n_embd_inp(),
+        model.n_embd_out()
     );
 
     let mut cparams = ContextParams {
@@ -318,6 +322,8 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         layer_begin,
         layer_end,
         n_embd: model.n_embd() as u32,
+        n_embd_inp: model.n_embd_inp() as u32,
+        n_embd_out: model.n_embd_out() as u32,
         n_ctx_seq,
         n_seq_max,
         n_batch: args.n_batch,
@@ -632,6 +638,8 @@ fn check_hello(req: &Request, info: &StageInfo) -> Result<Response, Response> {
         layer_begin: info.layer_begin,
         layer_end: info.layer_end,
         n_embd: info.n_embd,
+        n_embd_inp: info.n_embd_inp,
+        n_embd_out: info.n_embd_out,
         n_ctx: info.n_ctx_seq,
         n_seq_max: info.n_seq_max,
         backend: info.backend.clone(),
@@ -680,7 +688,7 @@ enum ReadErr {
 
 impl Stage {
     fn max_forward_frame(&self) -> u32 {
-        forward_frame_limit(self.info.n_batch, self.info.n_embd)
+        forward_frame_limit(self.info.n_batch, self.info.n_embd_inp.max(self.info.n_embd_out))
     }
 
     async fn serve_conn(self: &Arc<Self>, conn: Connection) {
@@ -901,11 +909,22 @@ impl Stage {
             .await
             .map_err(|e| error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)))?;
         match r {
-            Response::HelloOk { n_embd, .. } if n_embd == self.info.n_embd => {}
-            Response::HelloOk { n_embd, .. } => {
+            Response::HelloOk {
+                n_embd,
+                n_embd_inp,
+                ..
+            } if n_embd == self.info.n_embd && n_embd_inp == self.info.n_embd_out => {}
+            Response::HelloOk {
+                n_embd,
+                n_embd_inp,
+                ..
+            } => {
                 return Err(error(
                     ErrorCode::Downstream,
-                    format!("next hop {}: n_embd {n_embd} differs from ours", nh.addr),
+                    format!(
+                        "next hop {}: takes rows of {n_embd_inp} (n_embd {n_embd}), this stage produces {}",
+                        nh.addr, self.info.n_embd_out
+                    ),
                 ))
             }
             Response::Error { code, message } => {

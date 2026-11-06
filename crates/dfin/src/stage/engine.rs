@@ -172,12 +172,13 @@ impl Engine {
         pos0: i32,
         act: &Activations,
     ) -> Reply {
-        let n_embd = self.ctx.n_embd();
+        let n_in = self.ctx.n_embd_inp();
+        let n_out = self.ctx.n_embd_out();
         let n_tokens = act.n_tokens as usize;
-        if act.n_embd as usize != n_embd {
+        if act.n_embd as usize != n_in {
             return err(
                 ErrorCode::BadRequest,
-                format!("activation width {} != model n_embd {n_embd}", act.n_embd),
+                format!("activation width {} != this stage's input width {n_in}", act.n_embd),
             );
         }
         if n_tokens == 0 {
@@ -258,17 +259,17 @@ impl Engine {
         // reported compute time must include it.
         let out = self.ctx.embeddings();
         let compute_ms = t.elapsed().as_secs_f32() * 1000.0;
-        if out.len() != n_tokens * n_embd {
+        if out.len() != n_tokens * n_out {
             return err(
                 ErrorCode::Internal,
                 format!(
                     "decode produced {} values, expected {}",
                     out.len(),
-                    n_tokens * n_embd
+                    n_tokens * n_out
                 ),
             );
         }
-        let act = Activations::from_f32(out, n_tokens, n_embd, self.act_dtype);
+        let act = Activations::from_f32(out, n_tokens, n_out, self.act_dtype);
         tracing::debug!(
             session,
             seq,

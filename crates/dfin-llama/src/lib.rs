@@ -300,6 +300,18 @@ impl Model {
         unsafe { sys::llama_model_n_embd(self.ptr) }
     }
 
+    /// Width of one input row: `n_embd` for a whole model or a head; a multiple of
+    /// `n_embd` for a stage of an architecture whose state between layers is wider
+    /// (hyper-connection streams, residual banks).
+    pub fn n_embd_inp(&self) -> i32 {
+        unsafe { sys::llama_model_n_embd_inp(self.ptr) }
+    }
+
+    /// Width of one output row of a stage without the LM head (see [`Model::n_embd_inp`]).
+    pub fn n_embd_out(&self) -> i32 {
+        unsafe { sys::llama_model_n_embd_out(self.ptr) }
+    }
+
     pub fn n_layer(&self) -> i32 {
         self.n_layer
     }
@@ -642,6 +654,8 @@ pub struct Context {
     ptr: *mut sys::llama_context,
     model: Arc<Model>,
     n_embd: usize,
+    n_embd_inp: usize,
+    n_embd_out: usize,
     n_vocab: usize,
     last_n_outputs: usize,
 }
@@ -685,11 +699,15 @@ impl Context {
             return Err(Error::ContextInit);
         }
         let n_embd = model.n_embd() as usize;
+        let n_embd_inp = model.n_embd_inp().max(1) as usize;
+        let n_embd_out = model.n_embd_out().max(1) as usize;
         let n_vocab = model.vocab().n_tokens() as usize;
         Ok(Context {
             ptr,
             model,
             n_embd,
+            n_embd_inp,
+            n_embd_out,
             n_vocab,
             last_n_outputs: 0,
         })
@@ -705,6 +723,16 @@ impl Context {
 
     pub fn n_embd(&self) -> usize {
         self.n_embd
+    }
+
+    /// Width of one hidden-state row this context takes with [`Context::decode_embd`].
+    pub fn n_embd_inp(&self) -> usize {
+        self.n_embd_inp
+    }
+
+    /// Width of one row of [`Context::embeddings`].
+    pub fn n_embd_out(&self) -> usize {
+        self.n_embd_out
     }
 
     pub fn n_vocab(&self) -> usize {
@@ -737,14 +765,14 @@ impl Context {
     /// `pos0 ..` into sequence `seq`. Valid on any piece; on a head piece it bypasses
     /// the embedding table.
     pub fn decode_embd(&mut self, embd: &[f32], pos0: Pos, seq: SeqId, output: OutputMode) -> Result<usize> {
-        if embd.len() % self.n_embd != 0 {
+        if embd.len() % self.n_embd_inp != 0 {
             return Err(Error::Invalid(format!(
-                "embedding buffer length {} is not a multiple of n_embd {}",
+                "embedding buffer length {} is not a multiple of the input width {}",
                 embd.len(),
-                self.n_embd
+                self.n_embd_inp
             )));
         }
-        let n_tokens = embd.len() / self.n_embd;
+        let n_tokens = embd.len() / self.n_embd_inp;
         self.decode_inner(None, Some(embd), n_tokens, pos0, seq, output)
     }
 
@@ -760,7 +788,7 @@ impl Context {
         if n_tokens == 0 {
             return Err(Error::Invalid("empty batch".into()));
         }
-        let embd_dim = if embd.is_some() { self.n_embd as i32 } else { 0 };
+        let embd_dim = if embd.is_some() { self.n_embd_inp as i32 } else { 0 };
         let mut batch = unsafe { sys::llama_batch_init(n_tokens as i32, embd_dim, 1) };
         let mut n_outputs = 0usize;
         unsafe {
@@ -781,7 +809,7 @@ impl Context {
                 n_outputs += out as usize;
             }
             if let Some(e) = embd {
-                ptr::copy_nonoverlapping(e.as_ptr(), batch.embd, n_tokens * self.n_embd);
+                ptr::copy_nonoverlapping(e.as_ptr(), batch.embd, n_tokens * self.n_embd_inp);
             }
         }
         let rc = unsafe { sys::llama_decode(self.ptr, batch) };
@@ -805,7 +833,7 @@ impl Context {
             if p.is_null() || self.last_n_outputs == 0 {
                 return &[];
             }
-            std::slice::from_raw_parts(p, self.last_n_outputs * self.n_embd)
+            std::slice::from_raw_parts(p, self.last_n_outputs * self.n_embd_out)
         }
     }
 

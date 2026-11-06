@@ -31,7 +31,11 @@ With default parameters behaviour is unchanged. The patch is exercised by
 `examples/layer-range` inside the checkout (`llama-layer-range.exe <model.gguf> <a> <b>` runs
 the model monolithically and as three pieces and compares logits) and by
 `crates/dfin-llama/tests/tiny_model.rs`. Verified exact on tiny `llama`, `glm-dsa` and
-`kimi-k3` (attention residuals off) models, CPU and Vulkan.
+`kimi-k3` models, CPU and Vulkan. Architectures whose state between layers is wider than
+one residual vector (`glm5-next` hyper-connection streams, Kimi K3 attention-residual
+banks) expose the width through `llama_model_n_embd_inp` and `llama_model_n_embd_out`:
+a stage takes and produces rows of that width, and `stage_state_mult(il)` on the model
+class says how many `n_embd` vectors cross the boundary before layer `il`.
 
 ### Rebuilding
 

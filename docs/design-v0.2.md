@@ -18,7 +18,7 @@ A network that runs frontier-scale open-weight models, Chinese-lab models first 
 | Jurisdiction | Not addressed | **No network rule.** Region is a per-user preference, enforced by timing probes on direct nodes, impossible for cloaked nodes | Security-conscious users will not disclose location; operators may hide; the front door is in the US by construction |
 | Pipeline shape | Client calls each stage in turn (what Phase 0 built) | **Chain forwarding**: stage hands to stage; the client touches only the first and last through a relay | Required for anonymity, and the largest latency win |
 | Reference systems | Petals, BloomBee, Tor, Cashu | Add **Monero** as the model for keys-not-accounts, money, Tor integration and release practice. Nothing from its ledger cryptography | Already trusted by the users this is for |
-| Stage state | One hidden-state tensor per token | **A list of tensors** per token | GLM-5.3-Flash's hyper-connections and Kimi K3's attention-residual bank carry more than one residual stream between layers (Phase 0 finding) |
+| Stage state | One hidden-state tensor per token | **A row as wide as the architecture needs** per token, a multiple of `n_embd` known from the layer index | GLM-5.3-Flash's hyper-connections and Kimi K3's attention-residual bank carry more than one residual stream between layers (Phase 0 finding) |
 | Phases | One pod, friends, open swarm, anchors | Foundation (encrypted chain), **trust and money together**, then scale | Attested operators are paid professionals; they do not appear before money exists |
 
 ---
@@ -301,7 +301,7 @@ Pipeline parallelism across the internet, pipeline or expert parallelism inside 
 **Changes to the protocol that follow from Phase 0 and from this revision:**
 
 - **Chain forwarding** replaces the client-driven loop (section 8.2). The stage protocol gains route setup, next-hop forwarding and a trailer in which each stage reports its compute time so the client still sees per-stage cost.
-- **Stage state is a list of tensors.** GLM-5.3-Flash (`glm5-next`) carries four residual streams between layers; Kimi K3 carries an attention-residual bank that grows with depth. The activation frame carries `k` tensors with declared shapes, and the loader's refusal to split these models is lifted when the stage boundary carries them all.
+- **Stage state is as wide as the architecture needs.** GLM-5.3-Flash (`glm5-next`) carries four residual streams between layers; Kimi K3 carries an attention-residual bank that grows with depth. The activation frame's row is `k` times `n_embd` wide with `k` known from the model and the layer index, and the loader's refusal to split these models is lifted (done 6 November 2026, phase 1 protocol section 13).
 - **Boundary rules per architecture.** `glm-dsa` (GLM-5.3) stages must begin at layers that run the full indexer. Models with KDA layers (Kimi K3) cannot roll a session back, so prefix-cache rewind on those stages means re-prefill from the last snapshot; stages holding KDA layers keep periodic state snapshots.
 - **Weights are fetched by layer range.** A node downloads only the shards for its range (v0.1 section 13); the loader must open a sharded file set with its out-of-range shards absent.
 - **Locked weights by default.** Stages lock their mapped weights at load and refuse to serve before the lock completes, so the first request is as fast as the hundredth. Thread count defaults to the cores available to that process.

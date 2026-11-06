@@ -139,10 +139,32 @@ free one, and greedy decoding exposes it on near ties. The exactness tests in th
 repository use f32 for that reason; f16 (and later FP8) between stages needs the
 perplexity and task measurements the design's open question 3 asked for.
 
-## 8. Phase 1 scope still open
+## 8. Wide stage state (6 November 2026, night)
 
-Multi-tensor stage state for `glm5-next` and Kimi K3, failover of a live session
-without losing its context, region fencing from several vantage points, fuzzing of
-the frame decoders. The Linux build, a CPU-only container image (136 MB)
+The two architectures Phase 0 could not split now split. The mechanism is a per-model
+hook, `stage_state_mult(il)`, that says how many `n_embd` vectors make up the state
+entering layer `il`; the loader sets a partial model's input and output row widths from
+it, the graph builders unpack a wide input (streams for `glm5-next`, prefix sum plus
+bank for Kimi K3) and pack the output the same way, and the activation frame's row
+width is whatever the model says. Nothing else in the chain changed; the handshake now
+carries both widths so neighbouring pieces check each other.
+
+| Model | Pieces | Widths at the two boundaries | Max logit difference vs whole model |
+|---|---|---|---|
+| Tiny Kimi K3, residuals every 2 layers, split 2,5 | KDA and MLA layers | 2x and 4x `n_embd` | 2.7e-5 |
+| Tiny Kimi K3, split 3,6 | | 3x and 4x `n_embd` | 3.2e-4 |
+| Tiny GLM-5-next, 4 hyper-connection streams, split 2,5 | KDA, MLA with k-pool indexer, MoE | 4x and 4x `n_embd` | 9.1e-4 |
+
+The differences are float reassociation from assembling the state in pieces; argmax
+agrees at every position and the next decode step agrees as well. Two things had to
+be learned on the way: GLM-5-next's attention is nope-only (rope dimension count must be
+0, which the generator now does), and a piece with no attention layer builds the
+k-pool indexer inputs without consuming them, so their `set_input` must skip
+unallocated tensors, the same guard Phase 0 added for the hybrid memory inputs.
+
+## 9. Phase 1 scope still open
+
+Failover of a live session without losing its context, region fencing from several
+vantage points, fuzzing of the frame decoders. The Linux build, a CPU-only container image (136 MB)
 and continuous integration on GitHub Actions landed in pull request 1 (6.5 minutes
 cold; the Windows-generated bindings compile unchanged on Linux x86-64).

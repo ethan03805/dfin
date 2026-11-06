@@ -347,6 +347,9 @@ struct Engine {
     act_dtype: ActDtype,
     prefill_chunk: usize,
     n_embd: usize,
+    /// Row widths at the two local boundaries: what the head emits, what the tail takes.
+    head_out: usize,
+    tail_in: usize,
     per_session_ctx: usize,
     template: String,
     add_bos: bool,
@@ -523,6 +526,11 @@ impl Engine {
         )
         .context("creating tail context")?;
         let per_session_ctx = (head.n_ctx().min(tail.n_ctx()) / cfg.max_sessions) as usize;
+        let head_out = head.n_embd_out();
+        let tail_in = tail.n_embd_inp();
+        if head_out != n_embd as usize || tail_in != n_embd as usize {
+            tracing::info!(head_out, tail_in, n_embd, "stage state is wider than n_embd");
+        }
         tracing::info!(
             n_ctx = head.n_ctx(),
             max_sessions = cfg.max_sessions,
@@ -551,6 +559,8 @@ impl Engine {
                 rt.clone(),
                 fingerprint.clone(),
                 n_embd as u32,
+                head_out as u32,
+                tail_in as u32,
                 prefill_chunk as u32,
             );
             connect_with_backoff(&mut route, Duration::from_secs(60))
@@ -603,6 +613,8 @@ impl Engine {
                 act_dtype: cfg.act_dtype,
                 prefill_chunk,
                 n_embd: n_embd as usize,
+                head_out,
+                tail_in,
                 per_session_ctx,
                 template,
                 add_bos,
@@ -667,6 +679,8 @@ impl Engine {
                         self.rt.clone(),
                         route_fingerprint(route),
                         self.n_embd as u32,
+                        self.head_out as u32,
+                        self.tail_in as u32,
                         self.prefill_chunk as u32,
                     );
                     connect_with_backoff(&mut fresh, Duration::from_secs(5))?;
@@ -1022,30 +1036,31 @@ impl Engine {
         want_logits: bool,
     ) -> Result<Option<Vec<f32>>, EngineErr> {
         let n = tokens.len();
-        let n_embd = self.n_embd;
+        let head_out = self.head_out;
+        let tail_in = self.tail_in;
 
         let t = Instant::now();
         self.head
             .decode_tokens(tokens, pos0, slot, OutputMode::All)
             .map_err(|e| llama_err("head decode", e))?;
         let emb = self.head.embeddings();
-        if emb.len() != n * n_embd {
+        if emb.len() != n * head_out {
             return Err(EngineErr::Other(format!(
                 "head produced {} hidden values, expected {}",
                 emb.len(),
-                n * n_embd
+                n * head_out
             )));
         }
         let mut hidden = emb.to_vec();
         self.last_head_ms = t.elapsed().as_secs_f64() * 1e3;
 
         if let Some(route) = &mut self.route {
-            let act = Activations::from_f32(&hidden, n, n_embd, self.act_dtype);
+            let act = Activations::from_f32(&hidden, n, head_out, self.act_dtype);
             self.seq += 1;
             let (out, _hops) = route.forward(session, self.seq, pos0, act)?;
-            if out.n_tokens as usize != n || out.n_embd as usize != n_embd {
+            if out.n_tokens as usize != n || out.n_embd as usize != tail_in {
                 return Err(EngineErr::Other(format!(
-                    "route returned [{}, {}] activations, expected [{n}, {n_embd}]",
+                    "route returned [{}, {}] activations, expected [{n}, {tail_in}]",
                     out.n_tokens, out.n_embd
                 )));
             }

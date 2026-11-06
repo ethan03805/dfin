@@ -69,6 +69,8 @@ jobs:
           mkdir -p models
           python tools/make_tiny_llama.py models/tiny-llama-f32.gguf
           python tools/shard_gguf.py models/tiny-llama-f32.gguf --out models/tiny-shards
+          python tools/make_tiny_kimi_k3.py models/tiny-kimi-k3-res.gguf --attn-res-block-size 2
+          python tools/make_tiny_glm5_next.py models/tiny-glm5-next.gguf
 
       - name: cargo test --release --workspace
         run: cargo test --release --workspace --locked

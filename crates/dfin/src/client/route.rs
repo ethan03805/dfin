@@ -103,6 +103,10 @@ pub struct Route {
     rt: Handle,
     fingerprint: String,
     n_embd: u32,
+    /// Row width the first hop must take (the head's output) and the last hop must
+    /// produce (the tail's input).
+    width_in: u32,
+    width_out: u32,
     /// Largest forward (tokens) this client sends; bounds result frames.
     max_tokens: u32,
     route_id: u64,
@@ -140,6 +144,8 @@ impl Route {
         rt: Handle,
         fingerprint: String,
         n_embd: u32,
+        width_in: u32,
+        width_out: u32,
         max_tokens: u32,
     ) -> Route {
         let n = hops.len();
@@ -150,6 +156,8 @@ impl Route {
             rt,
             fingerprint,
             n_embd,
+            width_in,
+            width_out,
             max_tokens,
             route_id: 0,
             token: [0; 16],
@@ -176,7 +184,9 @@ impl Route {
         &self.fingerprint
     }
 
-    fn hello(&self, conn: &Connection, hop: &StageEndpoint) -> Result<String, RouteError> {
+    /// `Hello` with one hop; `want` is the row width this client expects it to take (first
+    /// hop) or to produce (last hop), checked against what it reports.
+    fn hello(&self, conn: &Connection, hop: &StageEndpoint, want: Option<(bool, u32)>) -> Result<String, RouteError> {
         let req = Request::Hello {
             version: PROTOCOL_VERSION,
             model_fingerprint: self.fingerprint.clone(),
@@ -191,10 +201,27 @@ impl Route {
                 layer_begin,
                 layer_end,
                 n_embd,
+                n_embd_inp,
+                n_embd_out,
                 node_id,
                 backend,
                 ..
             } => {
+                match want {
+                    Some((true, w)) if n_embd_inp != w => {
+                        return Err(RouteError::Protocol(format!(
+                            "stage {} takes rows of {n_embd_inp}, the head produces {w}",
+                            hop.addr
+                        )))
+                    }
+                    Some((false, w)) if n_embd_out != w => {
+                        return Err(RouteError::Protocol(format!(
+                            "stage {} produces rows of {n_embd_out}, the tail takes {w}",
+                            hop.addr
+                        )))
+                    }
+                    _ => {}
+                }
                 if n_embd != self.n_embd {
                     return Err(RouteError::Protocol(format!(
                         "stage {}: n_embd {n_embd}, client {}",
@@ -312,7 +339,7 @@ impl Route {
                 .rt
                 .block_on(self.endpoint.connect(&self.hops[0].addr, self.hops[0].node_id))?,
         };
-        self.backends[0] = self.hello(&first, &self.hops[0])?;
+        self.backends[0] = self.hello(&first, &self.hops[0], Some((true, self.width_in)))?;
         let last = match &self.policy {
             ReturnPolicy::Reverse => None,
             ReturnPolicy::Relay(_) => Some(first.clone()),
@@ -320,7 +347,7 @@ impl Route {
             ReturnPolicy::Direct => {
                 let hop = &self.hops[n - 1];
                 let c = self.rt.block_on(self.endpoint.connect(&hop.addr, hop.node_id))?;
-                self.backends[n - 1] = self.hello(&c, hop)?;
+                self.backends[n - 1] = self.hello(&c, hop, Some((false, self.width_out)))?;
                 Some(c)
             }
         };
@@ -355,7 +382,7 @@ impl Route {
         if let Some(last_conn) = &last {
             let (tx, rx) = mpsc::channel::<ReturnFrame>(16);
             let conn = last_conn.clone();
-            let limit = forward_frame_limit(self.max_tokens, self.n_embd);
+            let limit = forward_frame_limit(self.max_tokens, self.width_in.max(self.width_out));
             self.reader = Some(self.rt.spawn(async move {
                 loop {
                     let mut s = match conn.accept_uni().await {

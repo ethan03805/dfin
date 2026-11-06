@@ -128,6 +128,8 @@ every code path end to end:
 uv venv .venv; uv pip install --python .venv/Scripts/python.exe numpy -e vendor/llama.cpp/gguf-py
 .venv\Scripts\python.exe tools\make_tiny_llama.py models\tiny-llama-f32.gguf
 .venv\Scripts\python.exe tools\shard_gguf.py models\tiny-llama-f32.gguf --out models\tiny-shards
+.venv\Scripts\python.exe tools\make_tiny_kimi_k3.py models\tiny-kimi-k3-res.gguf --attn-res-block-size 2
+.venv\Scripts\python.exe tools\make_tiny_glm5_next.py models\tiny-glm5-next.gguf
 cargo test
 ```
 
@@ -302,7 +304,7 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [x] Cloaked stages: no inbound port, reachable through a relay-allocated port over the stage's own outbound tunnel, end-to-end QUIC, synthetic peer addresses
 - [x] Weight shards: per-layer split files with a hashed manifest, a loader that tolerates absent shards, stages serving the shards they hold, `--fetch` and `dfin fetch` from directory peers or HTTP seeds. GLM-4.7-Flash served from a 23-shard directory matches llama.cpp's single-file output at f32 activations; f16 activations flip near-tie tokens (`docs/phase1-findings.md` section 7)
 - [ ] MTP speculative decoding in the client tail
-- [ ] Stage state wider than `n_embd` for `glm5-next` (hyper-connections) and Kimi K3 attention residuals
+- [x] Stage state wider than `n_embd`: `glm5-next` hyper-connection streams (4 x `n_embd`) and Kimi K3 attention-residual banks (growing with depth) cross stage boundaries as wider rows; three-piece pipelines of tiny models match the whole model (`crates/dfin-llama/tests/wide_state.rs`)
 - [ ] Tool-call parsing in the OpenAI layer (requests with `tools` are accepted, calls are not parsed)
 - [ ] Micro-batching across sessions on a stage
 - [x] Real model on one machine: GLM-4.7-Flash 30B-A3B (deepseek2 arch, MLA + MoE) split into 4 pieces, identical output, 19.5 tok/s in-process versus 19.9 monolithic; see `docs/phase0-findings.md`
@@ -310,9 +312,9 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [ ] The scale gate: GLM-5.3 IQ4_XS across 4 to 8 machines at 3 tok/s or better (moved to phase 3 in design v0.2; needs rented hardware and sharded loading)
 
 Design v0.2 phase 1 (the encrypted chain) is under way. Done: node identities, the QUIC
-transport, chain forwarding, relays, the signed directory, cloaked stages, weight shards.
-Still to do in phase 1: multi-tensor stage state, failover of a live session, region
-fencing from several vantage points, fuzzing of the decoders. Until the integrity
+transport, chain forwarding, relays, the signed directory, cloaked stages, weight shards,
+wide stage state. Still to do in phase 1: failover of a live session, region fencing from
+several vantage points, fuzzing of the decoders. Until the integrity
 checks of phase 2 exist, only run stages for clients you know, and only list stages on a
 hub you run.
 

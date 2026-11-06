@@ -240,6 +240,33 @@ Not yet: swarm-style parallel chunks from several holders, resuming a partial fi
 the client fetching its own head and tail, and a signed manifest (the manifest is
 trusted as a file today; its hash is what a hub or a seed should publish).
 
+## 13. Stage state wider than one residual vector
+
+Two of the target architectures carry more than the residual stream between layers.
+GLM-5.3-Flash (`glm5-next`) keeps four parallel residual streams (manifold
+hyper-connections) that every layer mixes; Kimi K3 keeps, besides the running residual,
+a bank of raw layer inputs checkpointed every `attn_res_block_size` layers, which every
+later layer mixes in and the output head mixes last. A stage boundary inside such a model
+must carry all of it.
+
+The wire format needs no change: an `Activations` frame is `n_tokens` rows of
+`n_embd` values, and `n_embd` is simply the row width, which for these stages is a
+multiple of the model's `n_embd`. What changed is who knows the width. The llama.cpp
+patch gives each model class a `stage_state_mult(il)` hook (1 by default; the
+hyper-connection count for `glm5-next`; `2 + (il - 1) / block_size` for Kimi K3 with
+residuals on), sets the partial model's input and output widths from it, and the two
+graph builders split a wide input back into streams or bank plus prefix sum, and
+flatten them again at the stage's end. `llama_model_n_embd_inp` and
+`llama_model_n_embd_out` report the widths; `dfin` reads them, sends rows of that
+width, and `HelloOk` carries `n_embd_inp` and `n_embd_out` so a client checks that the
+first hop takes what its head produces, that the last hop produces what its tail takes,
+and every hop checks its successor the same way during route setup.
+
+Widths on the wire therefore vary by boundary: for Kimi K3 with block size 8 the state
+before layer 93 is 13 vectors, so a late boundary moves thirteen times the bytes of a
+plain one, as the Phase 0 findings predicted. The directory record still names the
+model's `n_embd`; the per-boundary widths follow from the model and the layer range.
+
 ## 8. Status, 6 November 2026
 
 Built and tested: identities, transport, sealed records, route setup, forwarding, all
@@ -248,9 +275,9 @@ routing with rerouting when a stage dies (section 10), cloaked nodes (section 11
 limits in section 2 except fuzzing. Verified with the tiny model (unit, protocol and
 end-to-end tests in every mode, including a hub, a stage killed mid-run, and a cloaked
 stage behind a relay) and on GLM-4.7-Flash on one machine (`docs/phase1-findings.md`).
-Weight shards (section 12) are in too. Not yet done from the phase 1 list:
-multi-tensor stage state, replay-log failover of a live session, region fencing from
-several vantage points.
+Weight shards (section 12) and wide stage state (section 13) are in too. Not yet done
+from the phase 1 list: replay-log failover of a live session, region fencing from several
+vantage points.
 
 ## 9. What changed from Phase 0 and why
 

@@ -27,7 +27,8 @@ Consequences:
   (anchor pods) matter even more for K3 than the design already argued, and the
   replay log for failover (section 7) must store the bank too.
 - The patch's state-width generalisation (stage state = `k * n_embd` per token with
-  `k` known from the layer index) is the next piece of runtime work, to be done on
+  `k` known from the layer index) landed on 6 November 2026 (`docs/phase1-findings.md`
+  section 8); both architectures now split. It was originally planned to be done on
   tiny synthetic `glm5-next` and `kimi-k3` models first.
 
 ## 2026-11-05: the layer-range patch is small and exact

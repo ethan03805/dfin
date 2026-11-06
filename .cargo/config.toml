@@ -4,3 +4,9 @@
 # on it, so the rpath has to be set for every link here.
 [target.'cfg(target_os = "macos")']
 rustflags = ["-C", "link-arg=-Wl,-rpath,@executable_path"]
+
+# Same on Linux: `cargo test` and `cargo run` add vendor/llama.cpp/build/bin to
+# LD_LIBRARY_PATH themselves, but a binary started by hand (or copied elsewhere together
+# with the .so files) needs $ORIGIN in its runpath to find libllama.so next to it.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]

@@ -319,7 +319,7 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
         None => std::env::current_exe().context("locating the dfin binary")?,
     };
     let n_layer = {
-        let p = opts.model.clone();
+        let p = crate::shards::resolve_model(&opts.model)?.gguf;
         tokio::task::spawn_blocking(move || model_n_layer(&p)).await??
     };
     let plan = plan_split(&opts.split, n_layer)?;

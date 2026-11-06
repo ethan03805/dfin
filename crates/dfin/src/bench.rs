@@ -537,6 +537,8 @@ fn print_table(rows: &[Row]) {
 }
 
 pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
+    let mut args = args;
+    args.model = crate::shards::resolve_model(&args.model)?.gguf;
     if args.prompt_tokens == 0 || args.gen_tokens == 0 {
         anyhow::bail!("--prompt-tokens and --gen-tokens must be at least 1");
     }

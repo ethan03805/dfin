@@ -836,3 +836,127 @@ async fn cloaked_stage_through_relay() {
     assert_eq!(status["route"][2]["addr"], via, "{status:#}");
     let _ = std::fs::remove_file(&cache);
 }
+
+/// Shards: a stage holding the whole shard set announces; a second stage starts with
+/// only the manifest and fetches its layers from the first through the directory; the
+/// client loads its head and tail from shards too. `dfin fetch` on its own pulls the
+/// head's shards the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn stage_fetches_its_shards_from_a_peer() {
+    if should_skip() {
+        return;
+    }
+    let shards = model_path().parent().unwrap().join("tiny-shards");
+    let manifest = shards.join("tiny-llama-f32.manifest.json");
+    if !manifest.exists() {
+        eprintln!("SKIP: {} not found (run tools/shard_gguf.py)", manifest.display());
+        return;
+    }
+    let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
+    let probe = Endpoint::client(NodeKey::generate()).unwrap();
+    let mut procs = Procs::default();
+
+    let hub_port = free_udp_port();
+    let hub_key = StageKey::new("hub");
+    let hub_addr = format!("127.0.0.1:{hub_port}");
+    let hub_args: Vec<String> = ["hub", "--listen", &hub_addr, "--identity", &hub_key.path.display().to_string()]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let hi = procs.spawn("hub", &hub_args);
+    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(60)).await;
+    let hub_flag = format!("{hub_addr}/{}", hub_key.id);
+
+    // Stage A holds every shard.
+    let (k1, k2) = (StageKey::new("s1"), StageKey::new("s2"));
+    let (p1, p2) = (free_udp_port(), free_udp_port());
+    let args1: Vec<String> = [
+        "stage", "--model", &manifest.display().to_string(), "--layers", "2:4",
+        "--listen", &format!("127.0.0.1:{p1}"), "--identity", &k1.path.display().to_string(),
+        "--hub", &hub_flag, "--announce-every", "5", "--n-gpu-layers", "0", "--act-dtype", "f32",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let s1 = procs.spawn("stage1-full", &args1);
+    procs.wait_stage(s1, p1, k1.id, Duration::from_secs(120)).await;
+    wait_listed(&probe, &hub_addr, hub_key.id, 1, &procs).await;
+
+    // Stage B starts with the manifest alone and fetches layers 4 and 5 from A.
+    let bdir = std::env::temp_dir().join(format!("dfin-e2e-shards-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bdir);
+    std::fs::create_dir_all(&bdir).unwrap();
+    std::fs::copy(&manifest, bdir.join("tiny-llama-f32.manifest.json")).unwrap();
+    let args2: Vec<String> = [
+        "stage", "--model", &bdir.join("tiny-llama-f32.manifest.json").display().to_string(),
+        "--layers", "4:6", "--fetch", "--fetch-wait", "90",
+        "--listen", &format!("127.0.0.1:{p2}"), "--identity", &k2.path.display().to_string(),
+        "--hub", &hub_flag, "--announce-every", "5", "--n-gpu-layers", "0", "--act-dtype", "f32",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let s2 = procs.spawn("stage2-fetched", &args2);
+    procs.wait_stage(s2, p2, k2.id, Duration::from_secs(180)).await;
+    wait_listed(&probe, &hub_addr, hub_key.id, 2, &procs).await;
+    let mut files: Vec<String> = std::fs::read_dir(&bdir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".gguf"))
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        vec![
+            "tiny-llama-f32-00001-of-00011.gguf",
+            "tiny-llama-f32-00007-of-00011.gguf",
+            "tiny-llama-f32-00008-of-00011.gguf",
+        ],
+        "stage B should hold exactly the first shard and layers 4 and 5"
+    );
+
+    // The client's head and tail come from the shard set as well.
+    let pc = free_port();
+    let args: Vec<String> = [
+        "client", "--model", &manifest.display().to_string(), "--head", "0:2", "--tail", "6:end",
+        "--hub", &hub_flag, "--directory-cache", &bdir.join("dir.cache").display().to_string(),
+        "--n-gpu-layers", "0", "--act-dtype", "f32", "--max-sessions", "2", "--n-ctx", "512",
+        "--listen", &format!("127.0.0.1:{pc}"),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let ci = procs.spawn("client", &args);
+    let base = format!("http://127.0.0.1:{pc}");
+    procs.wait_health(ci, &base, Duration::from_secs(120)).await;
+    exercise(&procs, &base, &expected).await;
+    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    assert_eq!(status["route"].as_array().unwrap().len(), 4, "{status:#}");
+    assert_eq!(status["route"][2]["node_id"], k2.id.to_string(), "{status:#}");
+
+    // `dfin fetch` alone: the head's shards (first, embedding, layers 0 and 1).
+    let fdir = std::env::temp_dir().join(format!("dfin-e2e-shards-f-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&fdir);
+    std::fs::create_dir_all(&fdir).unwrap();
+    std::fs::copy(&manifest, fdir.join("tiny-llama-f32.manifest.json")).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dfin"))
+        .args([
+            "fetch", "--manifest", &fdir.join("tiny-llama-f32.manifest.json").display().to_string(),
+            "--layers", "0:2", "--hub", &hub_flag, "--wait", "60",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dfin fetch failed: {}", String::from_utf8_lossy(&out.stderr));
+    let mut files: Vec<String> = std::fs::read_dir(&fdir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".gguf"))
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 4, "{files:?}");
+    assert!(files.contains(&"tiny-llama-f32-00002-of-00011.gguf".to_string()), "{files:?}");
+    let _ = std::fs::remove_dir_all(&bdir);
+    let _ = std::fs::remove_dir_all(&fdir);
+}

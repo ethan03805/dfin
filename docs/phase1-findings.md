@@ -96,10 +96,53 @@ endpoint about 150 lines, so no second encryption layer was needed. The cost of
 cloaking is one extra UDP hop through the relay for every packet to and from that
 stage; on a frontier route that is tens of kilobytes per token.
 
-## 7. Phase 1 scope still open
+## 7. Weight shards (6 November 2026, late)
 
-Per-layer weight shards with peer seeding, multi-tensor stage state for `glm5-next`
-and Kimi K3, failover of a live session without losing its context, region fencing
-from several vantage points, fuzzing of the frame decoders. The Linux build, a CPU-only container image (136 MB)
+The loader patch grew a dozen lines: when a layer range is set, split files absent
+from disk are skipped and the tensor count is taken from what is present; a needed
+tensor whose shard is absent says so. `tools/shard_gguf.py` writes one split per layer
+plus metadata, embedding and output splits, and a manifest whose hashed hashes are the
+model id. Pieces loaded from directories holding only their own shards match the full
+model to the last bit (`crates/dfin-llama/tests/shards.rs`). Stages serve any shard
+they hold; `dfin fetch` and `dfin stage --fetch` pull missing shards from directory
+peers or HTTP seeds with hash checks. End to end: a stage started with nothing but the
+manifest fetched its two layers and the first shard from a peer found through the hub,
+served them, and the client ran head and tail from shards, identical output, in five
+seconds on the tiny model. One bug found by the real model: the GGUF writer wants the
+byte shape of a quantized tensor, which the reader already provides.
+
+**The real model.** `tools/shard_gguf.py` cut GLM-4.7-Flash Q4_K_M (18.5 GB) into 50
+shards (metadata, embedding, 47 layers, output) in a few minutes of disk time. A stage
+for layers 24:46 was started from a directory holding only its 23 shards (8.0 GB, 24
+files) alongside a stage for 1:24 and a client whose head and tail came from the full
+set; it loaded in under 30 seconds with the weights locked, reported the same
+resident size as from the single file, and served its layers at the usual speed
+(decode-only chain round trip 50.7 ms for stage computes of 26 and 25 ms). Logs:
+`phase1-shards-glm47flash-2026-11-06.log` (f16 activations) and
+`phase1-shards-f32-glm47flash-2026-11-06.log` (f32).
+
+Three checks say the shard set is byte-faithful: every metadata field compares equal
+between the single file and the first shard; sampled tensors of every quantization
+type in the file (F32, Q4_K, Q5_K, Q6_K, Q8_0) hash identically; and llama.cpp's own
+`llama-completion` produces the same greedy text from the shard set as from the single
+file. The pipeline with the partial-directory stage reproduces that text token for
+token when activations cross the stage boundaries as f32.
+
+**What this exposed about f16 activations.** With f16 activations between stages,
+the same pipeline flips a near-tie token on this prompt after seven tokens
+("traditionally dated to 509 BC" becomes "c. 509 BC") and the continuations diverge.
+The two-machine WiFi run of 6 November had done the same at its own split point, and
+its "longer generation" had never been compared with the single-file text, only the
+benchmark prompt had. Phase 0's "identical tokens at f16" therefore holds for the
+prompts it tested and not in general: f16 at the boundary is a quality setting, not a
+free one, and greedy decoding exposes it on near ties. The exactness tests in this
+repository use f32 for that reason; f16 (and later FP8) between stages needs the
+perplexity and task measurements the design's open question 3 asked for.
+
+## 8. Phase 1 scope still open
+
+Multi-tensor stage state for `glm5-next` and Kimi K3, failover of a live session
+without losing its context, region fencing from several vantage points, fuzzing of
+the frame decoders. The Linux build, a CPU-only container image (136 MB)
 and continuous integration on GitHub Actions landed in pull request 1 (6.5 minutes
 cold; the Windows-generated bindings compile unchanged on Linux x86-64).

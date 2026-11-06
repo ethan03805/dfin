@@ -151,6 +151,8 @@ pub enum ErrorCode {
     Unreachable,
     /// A record's time stamp or lifetime is out of bounds.
     BadTimestamp,
+    /// The node does not hold the requested shard.
+    NoSuchShard,
 }
 
 /// Address and identity of a node to dial.
@@ -246,7 +248,18 @@ pub enum Request {
     Announce { record: SignedRecord },
     /// Anyone to hub: the current signed directory.
     DirectoryGet,
+    /// Fetch `len` bytes at `offset` of shard `split` of the model with id `model_id`
+    /// from a node that holds it. Replies `Shard`.
+    ShardGet {
+        model_id: String,
+        split: u32,
+        offset: u64,
+        len: u32,
+    },
 }
+
+/// Largest shard chunk a node sends in one reply.
+pub const MAX_SHARD_CHUNK: u32 = 4 << 20;
 
 impl Request {
     /// Postcard variant index of `Forward`, the one request allowed to be large.
@@ -279,6 +292,12 @@ pub enum Response {
     /// The public `host:port` the relay forwards to the cloaked node.
     RelayListening { addr: String },
     Directory { directory: SignedDirectory },
+    /// A piece of a shard file; `total` is the file's full length.
+    Shard {
+        total: u64,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
     Error { code: ErrorCode, message: String },
 }
 

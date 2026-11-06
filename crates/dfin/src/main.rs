@@ -6,15 +6,18 @@
 //! * `dfin relay`  pipes streams between a client and its route so stages never
 //!   learn the client's address.
 //! * `dfin hub`    publishes a signed directory of announced stages.
+//! * `dfin fetch`  downloads the shards a piece needs from nodes or seeds.
 //! * `dfin pod`    launches stages plus a client on this machine for testing.
 //! * `dfin bench`  measures monolithic versus pipelined decode on this machine.
 
 mod bench;
 mod client;
 mod config;
+mod fetch;
 mod hub;
 mod pod;
 mod relay;
+mod shards;
 mod stage;
 
 use clap::{Parser, Subcommand};
@@ -44,6 +47,8 @@ enum Cmd {
     Relay(relay::RelayArgs),
     /// Publish a signed directory of the stages that announce to this hub.
     Hub(hub::HubArgs),
+    /// Download the shards of a model that a layer range needs, from nodes or seeds.
+    Fetch(fetch::FetchArgs),
     /// Launch a local pod (stages plus client) on this machine.
     Pod(pod::PodArgs),
     /// Benchmark monolithic versus pipelined decode on this machine.
@@ -59,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Client(args) => client::run(args).await,
         Cmd::Relay(args) => relay::run(args).await,
         Cmd::Hub(args) => hub::run(args).await,
+        Cmd::Fetch(args) => fetch::run(args).await,
         Cmd::Pod(args) => pod::run(args).await,
         Cmd::Bench(args) => bench::run(args).await,
     }

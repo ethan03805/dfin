@@ -29,7 +29,8 @@ use std::sync::Arc;
 
 #[derive(Args, Debug)]
 pub struct ClientArgs {
-    /// GGUF model file. Optional with `--route` (which names the model itself).
+    /// The model: a GGUF file, the first file of a shard set, or a `*.manifest.json`.
+    /// Optional with `--route` (which names the model itself).
     #[arg(long)]
     pub model: Option<PathBuf>,
     /// Layers run locally before the first stage, e.g. `0:2`.
@@ -161,15 +162,19 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
             args.stages.clone(),
         ),
     };
-    let model_name = args.model_name.clone().unwrap_or_else(|| {
-        model_path
+    let resolved = crate::shards::resolve_model(&model_path)?;
+    let model_name = args.model_name.clone().unwrap_or_else(|| match &resolved.manifest {
+        Some(m) => m.model_name.clone(),
+        None => model_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "dfin".into())
+            .unwrap_or_else(|| "dfin".into()),
     });
+    let model_path = resolved.gguf.clone();
 
     let cfg = engine::EngineConfig {
         model_path,
+        fingerprint: resolved.fingerprint.clone(),
         head,
         tail,
         stages,

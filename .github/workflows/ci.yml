@@ -68,6 +68,7 @@ jobs:
           python -m pip install --quiet numpy vendor/llama.cpp/gguf-py
           mkdir -p models
           python tools/make_tiny_llama.py models/tiny-llama-f32.gguf
+          python tools/shard_gguf.py models/tiny-llama-f32.gguf --out models/tiny-shards
 
       - name: cargo test --release --workspace
         run: cargo test --release --workspace --locked

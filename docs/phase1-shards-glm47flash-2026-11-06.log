@@ -1,0 +1,20 @@
+### partial shard directory for layers 24:46
+copied 23 shards
+24 files, 8.0G
+### stage A 1:24 from the full shard set, stage B 24:46 from the partial directory
+stages up after 26s
+--- stage B's loader on the partial directory:
+2026-11-06T23:29:07.178349Z  INFO dfin::stage: model: deepseek2 30B.A3B Q4_K - Medium | 8169.0 MiB resident | layers 24:46 of 47 | n_embd 2048
+### client: head 0:1 and tail 46:end from the full shard set
+client up after 2s
+2026-11-06T23:29:17.413251Z  INFO dfin::client::route: route ready route=6172506028021586716 hops=2 mode="direct" setup_ms="16.6"
+2026-11-06T23:29:17.413590Z  INFO dfin::client: engine ready model=glm-4.7-flash-q4km route=0:1 -> 1:24 -> 24:46 -> 46:47
+### completion (greedy, 64 tokens, activations f16)
+{"completion_tokens": 64, "prompt_tokens": 7, "total_tokens": 71}
+ with the overthrow of the monarchy, c. 509 BC, and ends with the establishment of the Roman Empire, c. 27 BC. The Roman Republic was a period of time in which the Roman government was a republic. The Roman Republic was a period of time in which the Roman government was a republic.
+{"avg_rtt_ms": 53.431373437500014, "decode_avg_rtt_ms": 50.77132380952382, "decode_forwards": 63, "forwards": 64, "ping_ms": 0.0706, "rebuilds": 0, "return_mode": "direct", "setup_ms": 16.6148}
+{"addr": "127.0.0.1:7021", "avg_compute_ms": 26.84259521961212, "backend": "Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) Graphics), CPU", "decode_avg_compute_ms": 25.555531698559957, "decode_forwards": 63, "forwards": 64, "layers": "1:24", "node_id": "63ba0ae61f8eecf4bcfb974dc8389a568a93e2972c054077176ffb01f061e046"}
+{"addr": "127.0.0.1:7022", "avg_compute_ms": 25.736664175987244, "backend": "Vulkan0 (AMD Radeon RX 7800 XT), Vulkan1 (AMD Radeon(TM) Graphics), CPU", "decode_avg_compute_ms": 24.448106432717942, "decode_forwards": 63, "forwards": 64, "layers": "24:46", "node_id": "b6ebaf9069f6dec4ac1d430889b1c0b835951dc2c4c67597221046bc368fb6f1"}
+### reference from the single-file pipeline (docs/lan-pod-glm47flash-2026-11-06.log):
+ with the overthrow of the monarchy, traditionally dated to 509 BC, and ends in 27 BC with the establishment of the Roman Empire. The term "Roman Republic" refers to the period of time when the Roman state was a democratic republic, with the government being a mix of aristocratic and democratic elem
+### done

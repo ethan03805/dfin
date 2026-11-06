@@ -54,6 +54,7 @@ Requests:
 | `RelayListen` | cloaked node to relay | Allocate a public port for me; this stream becomes the tunnel (section 11) |
 | `Announce { record }` | node to hub | List me; `record` is a `SignedRecord` (section 10) |
 | `DirectoryGet` | anyone to hub | The current `SignedDirectory` |
+| `ShardGet { model_id, split, offset, len }` | fetcher to a node | Up to 4 MiB of a shard the node holds; replies `Shard { total, data }` (section 12) |
 
 Replies: `HelloOk { layer_begin, layer_end, n_embd, n_ctx, n_seq_max, backend, node_id }`,
 `RouteOk { hops }` (number of hops that acknowledged), `Ack`, `ForwardOk { session, seq,
@@ -211,6 +212,34 @@ The relay refuses registrations beyond `--max-cloaked`, allocates from `--port-r
 when one is given, and needs a public host (`--public-host`, or a specific `--listen`
 address) to name the ports by.
 
+## 12. Shards
+
+`tools/shard_gguf.py` writes a GGUF as split files llama.cpp loads as one model: the
+first holds all metadata and the small global tensors, the second the token embedding,
+one per transformer layer, and the last the output head when it is not tied to the
+embedding. The manifest (`NAME.manifest.json`) lists each split's number, file, size,
+SHA-256, kind and layer, plus optional HTTP seeds. The **model id** is SHA-256 over
+the text `dfin-shards-v1`, a newline, and one `no:sha256` line per split, computed
+identically by the tool and by `dfin`; it replaces the whole-file fingerprint in
+`Hello` and in directory records for sharded models.
+
+A piece needs: the first shard always, the embedding shard if it holds layer 0, the
+shards of its layers, and the output shard if it holds the last layer. The llama.cpp
+patch lets the loader skip split files that are absent when a layer range is set; a
+tensor the range needs whose shard is absent is a clear error.
+
+A stage loaded from a shard set answers `ShardGet` for any shard present on its disk
+(no `Hello` needed). `dfin fetch` and `dfin stage --fetch` download missing shards:
+first from directory nodes that serve the same model id (those whose layer range
+contains the shard's layer are tried first, then any), then from seeds. A download
+goes to `file.part`, is hashed against the manifest, and is renamed into place; a
+mismatch is deleted and the next source tried. The fetcher keeps retrying until
+`--wait` elapses, so a node can start before its peers are listed.
+
+Not yet: swarm-style parallel chunks from several holders, resuming a partial file,
+the client fetching its own head and tail, and a signed manifest (the manifest is
+trusted as a file today; its hash is what a hub or a seed should publish).
+
 ## 8. Status, 6 November 2026
 
 Built and tested: identities, transport, sealed records, route setup, forwarding, all
@@ -219,8 +248,9 @@ routing with rerouting when a stage dies (section 10), cloaked nodes (section 11
 limits in section 2 except fuzzing. Verified with the tiny model (unit, protocol and
 end-to-end tests in every mode, including a hub, a stage killed mid-run, and a cloaked
 stage behind a relay) and on GLM-4.7-Flash on one machine (`docs/phase1-findings.md`).
-Not yet done from the phase 1 list: per-layer shards, multi-tensor stage state,
-replay-log failover of a live session, region fencing from several vantage points.
+Weight shards (section 12) are in too. Not yet done from the phase 1 list:
+multi-tensor stage state, replay-log failover of a live session, region fencing from
+several vantage points.
 
 ## 9. What changed from Phase 0 and why
 

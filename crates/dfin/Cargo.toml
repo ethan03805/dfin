@@ -33,5 +33,7 @@ parking_lot.workspace = true
 rand.workspace = true
 postcard.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]

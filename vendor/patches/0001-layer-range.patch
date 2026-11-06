@@ -677,10 +677,79 @@ index 9213ac1..39110f7 100644
              continue;
          }
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 485483b..d43c805 100644
+index 485483b..15daac9 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -1189,8 +1189,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -546,8 +546,9 @@ llama_model_loader::llama_model_loader(
+         bool no_alloc,
+         bool load_mtp,
+         const llama_model_kv_override * param_overrides_p,
+-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
++        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
++        bool allow_missing_splits)
++        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud), allow_missing_splits(allow_missing_splits) {
+     int trace = 0;
+     if (getenv("LLAMA_TRACE")) {
+         trace = atoi(getenv("LLAMA_TRACE"));
+@@ -628,6 +629,16 @@ llama_model_loader::llama_model_loader(
+             for (idx = 1; idx < n_split; idx++) {
+                 const char * fname_split = splits[idx].c_str();
+ 
++                if (allow_missing_splits) {
++                    FILE * probe = ggml_fopen(fname_split, "rb");
++                    if (probe == nullptr) {
++                        LLAMA_LOG_INFO("%s: split %d (%s) is not on disk; skipping it (layer range)\n", __func__, idx, fname_split);
++                        n_splits_missing++;
++                        continue;
++                    }
++                    fclose(probe);
++                }
++
+                 struct gguf_init_params split_params = {
+                     /*.no_alloc = */ true,
+                     /*.ctx      = */ &ctx,
+@@ -661,7 +672,9 @@ llama_model_loader::llama_model_loader(
+                     }
+                     n_elements += ggml_nelements(cur);
+                     n_bytes    += ggml_nbytes(cur);
+-                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
++                    // the weight's index is its position in `files`, which differs from the split
++                    // number once absent splits are skipped
++                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), (uint16_t) (files.size() - 1), ctx_gguf.get(), cur));
+                 }
+             }
+ 
+@@ -671,11 +684,16 @@ llama_model_loader::llama_model_loader(
+             {
+                 const int n_tensors_loaded = (int) weights_map.size();
+                 if (n_tensors != n_tensors_loaded) {
+-                    throw std::runtime_error(format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
++                    if (n_splits_missing > 0) {
++                        LLAMA_LOG_INFO("%s: %d of %d tensors present (%d splits absent)\n", __func__, n_tensors_loaded, n_tensors, n_splits_missing);
++                        n_tensors = n_tensors_loaded;
++                    } else {
++                        throw std::runtime_error(format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
++                    }
+                 }
+             }
+ 
+-            LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
++            LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1 - n_splits_missing);
+         }
+     } else if (file != nullptr) {
+         struct ggml_context * ctx = NULL;
+@@ -862,6 +880,9 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
+ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weight(const char * name) const {
+     const llama_tensor_weight * weight = get_weight(name);
+     if (!weight) {
++        if (n_splits_missing > 0) {
++            throw std::runtime_error(format("%s: tensor '%s' not found: the shard holding it is not on disk", __func__, name));
++        }
+         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name));
+     }
+     return *weight;
+@@ -1189,8 +1210,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
          // skip unused tensors
          if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
@@ -705,7 +774,7 @@ index 485483b..d43c805 100644
              size_data -= nbytes;
              n_created++;
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index ed59079..def0216 100644
+index ed59079..6561d76 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
 @@ -73,6 +73,10 @@ struct llama_model_loader {
@@ -719,6 +788,22 @@ index ed59079..def0216 100644
      uint64_t n_elements = 0;
      size_t   n_bytes    = 0;
  
+@@ -181,7 +185,14 @@ struct llama_model_loader {
+         bool no_alloc,
+         bool load_mtp,
+         const llama_model_kv_override * param_overrides_p,
+-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
++        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
++        bool allow_missing_splits = false);
++
++    // pipeline stage: split files that are absent on disk are skipped instead of being an
++    // error, so a node can hold only the shards for its layer range. A tensor the model
++    // needs whose shard is absent is still an error.
++    bool allow_missing_splits = false;
++    int n_splits_missing = 0;
+ 
+     template<typename T>
+     typename std::enable_if<std::is_integral<T>::value, bool>::type
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 03aab32..049aba2 100644
 --- a/src/llama-model.cpp
@@ -849,6 +934,23 @@ index 03aab32..049aba2 100644
  int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
      return model->hparams.dflash_selector_top_k;
  }
+diff --git a/src/llama.cpp b/src/llama.cpp
+index e3699ea..ccfbb3b 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -316,8 +316,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
+ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+     try {
++        // a pipeline stage holds only the shards for its layer range
++        const bool allow_missing_splits = params.layer_begin > 0 || params.layer_end >= 0;
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
++            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides,
++            allow_missing_splits);
+ 
+         ml.lazy.mode = params.lazy_mode;
+ 
 diff --git a/src/models/deepseek2.cpp b/src/models/deepseek2.cpp
 index 36c8ea9..347dcdc 100644
 --- a/src/models/deepseek2.cpp

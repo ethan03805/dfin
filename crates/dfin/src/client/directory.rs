@@ -33,26 +33,31 @@ pub fn fetch(
     endpoint: &Endpoint,
     hub: &NextHop,
 ) -> Result<(SignedDirectory, Directory), String> {
+    rt.block_on(fetch_async(endpoint, hub))
+}
+
+/// The same, from async code.
+pub async fn fetch_async(
+    endpoint: &Endpoint,
+    hub: &NextHop,
+) -> Result<(SignedDirectory, Directory), String> {
     let hub_id = NodeId(hub.node_id);
-    let signed: SignedDirectory = rt
-        .block_on(async {
-            let conn = endpoint
-                .connect(&hub.addr, hub_id)
-                .await
-                .map_err(|e| format!("hub {}: {e}", hub.addr))?;
-            let r: Response = conn
-                .call(&Request::DirectoryGet, MAX_DIRECTORY_BYTES, CONTROL_TIMEOUT)
-                .await
-                .map_err(|e| format!("hub {}: {e}", hub.addr))?;
-            conn.close("done");
-            match r {
-                Response::Directory { directory } => Ok(directory),
-                Response::Error { code, message } => {
-                    Err(format!("hub {} ({code:?}): {message}", hub.addr))
-                }
-                other => Err(format!("hub {}: unexpected reply {other:?}", hub.addr)),
-            }
-        })?;
+    let conn = endpoint
+        .connect(&hub.addr, hub_id)
+        .await
+        .map_err(|e| format!("hub {}: {e}", hub.addr))?;
+    let r: Response = conn
+        .call(&Request::DirectoryGet, MAX_DIRECTORY_BYTES, CONTROL_TIMEOUT)
+        .await
+        .map_err(|e| format!("hub {}: {e}", hub.addr))?;
+    conn.close("done");
+    let signed = match r {
+        Response::Directory { directory } => directory,
+        Response::Error { code, message } => {
+            return Err(format!("hub {} ({code:?}): {message}", hub.addr))
+        }
+        other => return Err(format!("hub {}: unexpected reply {other:?}", hub.addr)),
+    };
     let dir = verify_directory(&signed, &hub_id)
         .map_err(|e| format!("hub {}: directory does not verify: {e}", hub.addr))?;
     Ok((signed, dir))

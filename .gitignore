@@ -8,3 +8,8 @@
 /*.log
 __pycache__/
 .DS_Store
+models/**/*.manifest.json
+models/**/*.part
+models/*-partial-*/
+/*.key
+/*.cache

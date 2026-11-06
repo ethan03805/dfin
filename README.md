@@ -127,6 +127,7 @@ every code path end to end:
 ```powershell
 uv venv .venv; uv pip install --python .venv/Scripts/python.exe numpy -e vendor/llama.cpp/gguf-py
 .venv\Scripts\python.exe tools\make_tiny_llama.py models\tiny-llama-f32.gguf
+.venv\Scripts\python.exe tools\shard_gguf.py models\tiny-llama-f32.gguf --out models\tiny-shards
 cargo test
 ```
 
@@ -182,6 +183,28 @@ the signature, dials the stage to confirm it answers, and publishes a signed lis
 picks the chain with the fewest hops between its head and tail, keeps a copy of the list
 in `--directory-cache` for when the hub is down, and when a stage dies it fetches the
 list again and moves to another chain. The hub never chooses routes for anyone.
+
+### Shards: fetching only your layers
+
+A 365 GB model should not have to be downloaded whole by a node that serves a tenth of
+it. `tools/shard_gguf.py` cuts a GGUF into split files, one per layer plus one each for
+the metadata, the embedding and the output head, and writes a manifest with every
+shard's size and SHA-256. The model id is a hash over those hashes, so a node holding
+three shards and a client holding the whole set agree on what model it is.
+
+```powershell
+.venv\Scripts\python.exe tools\shard_gguf.py model.gguf --out shards\ --seed https://example.org/shards
+dfin stage  --model shards\model.manifest.json --layers 40:77 --fetch --hub ... --identity node.key
+dfin fetch  --manifest shards\model.manifest.json --layers 0:3 --hub ...
+```
+
+A stage given a manifest and `--fetch` downloads the shards its layers need before
+loading: from nodes in the hub's directory that serve the same model (they serve any
+shard they hold over the same QUIC transport), or from the HTTP seeds named in the
+manifest or with `--seed`. Every download is checked against the manifest before it is
+used, and the loader skips shards that are not on disk, so a node's directory holds its
+own layers and nothing else. The client takes a manifest too (its head and tail need
+the embedding and output shards).
 
 ### Running a stage without opening a port
 
@@ -277,6 +300,7 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [x] Linux build, Docker image and CI (pull request 1)
 - [x] Signed directory: `dfin hub`, stage announcements with reachability checks, client-side route choice, cache, rerouting when a stage dies
 - [x] Cloaked stages: no inbound port, reachable through a relay-allocated port over the stage's own outbound tunnel, end-to-end QUIC, synthetic peer addresses
+- [x] Weight shards: per-layer split files with a hashed manifest, a loader that tolerates absent shards, stages serving the shards they hold, `--fetch` and `dfin fetch` from directory peers or HTTP seeds. GLM-4.7-Flash served from a 23-shard directory matches llama.cpp's single-file output at f32 activations; f16 activations flip near-tie tokens (`docs/phase1-findings.md` section 7)
 - [ ] MTP speculative decoding in the client tail
 - [ ] Stage state wider than `n_embd` for `glm5-next` (hyper-connections) and Kimi K3 attention residuals
 - [ ] Tool-call parsing in the OpenAI layer (requests with `tools` are accepted, calls are not parsed)
@@ -286,9 +310,9 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [ ] The scale gate: GLM-5.3 IQ4_XS across 4 to 8 machines at 3 tok/s or better (moved to phase 3 in design v0.2; needs rented hardware and sharded loading)
 
 Design v0.2 phase 1 (the encrypted chain) is under way. Done: node identities, the QUIC
-transport, chain forwarding, relays, the signed directory, cloaked stages. Still to do in
-phase 1: per-layer weight shards, multi-tensor stage state, failover of a live session,
-region fencing from several vantage points, fuzzing of the decoders. Until the integrity
+transport, chain forwarding, relays, the signed directory, cloaked stages, weight shards.
+Still to do in phase 1: multi-tensor stage state, failover of a live session, region
+fencing from several vantage points, fuzzing of the decoders. Until the integrity
 checks of phase 2 exist, only run stages for clients you know, and only list stages on a
 hub you run.
 

@@ -132,7 +132,11 @@ pub enum Event {
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
+    /// The GGUF to load (a single file or the first split of a shard set).
     pub model_path: PathBuf,
+    /// Model identity for `Hello` and the directory: a shard set's model id, or the
+    /// whole-file fingerprint.
+    pub fingerprint: String,
     pub head: LayerRange,
     pub tail: LayerRange,
     /// Explicit stages; empty means "ask the hub" (or head and tail only without a hub).
@@ -419,11 +423,7 @@ impl Engine {
         let n_embd = head_model.n_embd();
 
         // Stages come from the flags, or from the hub's directory.
-        let fingerprint = if cfg.stages.is_empty() && cfg.hub.is_none() {
-            String::new()
-        } else {
-            dfin_proto::model_fingerprint(&cfg.model_path).context("fingerprinting model")?
-        };
+        let fingerprint = cfg.fingerprint.clone();
         let (stages, resolver) = if !cfg.stages.is_empty() {
             (cfg.stages.clone(), None)
         } else if let Some(hub) = &cfg.hub {

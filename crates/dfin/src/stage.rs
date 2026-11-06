@@ -11,6 +11,7 @@
 mod engine;
 
 use crate::config::{parse_node_addr, LayerRange};
+use crate::shards::{resolve_model, Manifest};
 use anyhow::{bail, Context as _};
 use clap::{Args, ValueEnum};
 use dfin_llama::{Context, ContextParams, FlashAttn, KvType, Model, ModelParams};
@@ -62,9 +63,21 @@ impl From<FlashAttnArg> for FlashAttn {
 
 #[derive(Args, Debug)]
 pub struct StageArgs {
-    /// GGUF model file (the full file; only this stage's layers are loaded).
+    /// The model: a GGUF file, the first file of a shard set, or a `*.manifest.json`.
+    /// Only this stage's layers are loaded either way.
     #[arg(long)]
     pub model: PathBuf,
+    /// With a manifest: download the shards this stage's layers need before loading,
+    /// from nodes in the hub's directory or from `--seed` URLs.
+    #[arg(long)]
+    pub fetch: bool,
+    /// HTTP URL prefix serving the shard files (repeatable; the manifest's seeds are
+    /// tried too).
+    #[arg(long = "seed")]
+    pub seeds: Vec<String>,
+    /// Seconds `--fetch` keeps looking for a source.
+    #[arg(long, default_value_t = 120)]
+    pub fetch_wait: u64,
     /// Half-open layer range `a:b` this stage serves. Must not include layer 0's
     /// embedding or the LM head (those run on the client).
     #[arg(long)]
@@ -204,13 +217,34 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         args.identity.display()
     );
 
-    let model_path = args.model.clone();
-    let fingerprint = {
-        let p = model_path.clone();
-        tokio::task::spawn_blocking(move || dfin_proto::model_fingerprint(&p))
-            .await?
-            .with_context(|| format!("fingerprinting {}", model_path.display()))?
+    let resolved = {
+        let p = args.model.clone();
+        tokio::task::spawn_blocking(move || resolve_model(&p)).await??
     };
+    if args.fetch {
+        let Some(manifest) = &resolved.manifest else {
+            bail!("--fetch needs a sharded model (a *.manifest.json or its first split)");
+        };
+        if args.hubs.is_empty() && args.seeds.is_empty() && manifest.seeds.is_empty() {
+            bail!("--fetch needs a --hub or a --seed to fetch from");
+        }
+        let ep = Endpoint::client(key.clone()).context("creating fetch endpoint")?;
+        let n = crate::fetch::fetch_missing(
+            &ep,
+            manifest,
+            &resolved.dir,
+            args.layers.begin,
+            args.layers.end,
+            args.hubs.first(),
+            &args.seeds,
+            Duration::from_secs(args.fetch_wait),
+        )
+        .await
+        .context("fetching shards")?;
+        info!("fetched {n} shard(s)");
+    }
+    let model_path = resolved.gguf.clone();
+    let fingerprint = resolved.fingerprint.clone();
 
     let mparams = ModelParams {
         n_gpu_layers: args.n_gpu_layers,
@@ -333,6 +367,7 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         next_handle: AtomicU64::new(1),
         max_routes: args.max_routes.max(1),
         cloak_addrs: Mutex::new(Vec::new()),
+        shards: resolved.manifest.clone().map(|m| (m, resolved.dir.clone())),
     });
 
     for relay in &args.cloaks {
@@ -353,11 +388,14 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
             node_id: *stage.info.node_id.as_bytes(),
             addrs: Vec::new(),
             model_fingerprint: stage.info.fingerprint.clone(),
-            model_name: args
-                .model
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            model_name: match &resolved.manifest {
+                Some(m) => m.model_name.clone(),
+                None => args
+                    .model
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            },
             layer_begin,
             layer_end,
             n_layer: model.n_layer(),
@@ -629,6 +667,8 @@ struct Stage {
     max_routes: usize,
     /// Public addresses relays currently forward to this stage.
     cloak_addrs: Mutex<Vec<String>>,
+    /// The shard set this stage was loaded from, so it can serve shards it holds.
+    shards: Option<(Manifest, PathBuf)>,
 }
 
 /// How a request frame failed to arrive.
@@ -738,6 +778,22 @@ impl Stage {
                 }
             }
             Request::Ping => Response::Pong,
+            Request::ShardGet {
+                model_id,
+                split,
+                offset,
+                len,
+            } => match &self.shards {
+                None => error(ErrorCode::NoSuchShard, "this node holds no shard set"),
+                Some((manifest, dir)) => {
+                    match crate::fetch::serve_shard(manifest, dir, &model_id, split, offset, len)
+                        .await
+                    {
+                        Ok((total, data)) => Response::Shard { total, data },
+                        Err(m) => error(ErrorCode::NoSuchShard, m),
+                    }
+                }
+            },
             _ if !st.hello.load(Ordering::SeqCst) => {
                 error(ErrorCode::BadRequest, "Hello must come first")
             }

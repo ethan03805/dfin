@@ -190,8 +190,35 @@ the trust the client places in the hub it pinned. Letting clients query probes d
 and probes signing their answers, are the obvious next steps if hubs are ever run by
 people other than the probe operators.
 
-## 10. Phase 1 scope still open
+## 10. Fuzzing (7 November 2026)
 
-Failover of a live session without losing its context, fuzzing of the frame decoders. The Linux build, a CPU-only container image (136 MB)
+Every decoder that takes bytes from a peer now has a fuzz target (`crates/dfin-fuzz`,
+protocol section 15), and the same targets run as ordinary tests over seeds, every
+truncation and bit flip of every seed, spliced tails and random noise: about a hundred
+thousand inputs per `cargo test`, in eight seconds once the curve arithmetic is
+compiled optimised even in debug builds (it was six minutes before that, almost all of
+it in unoptimised Ed25519 and X25519). The libFuzzer wrappers in `fuzz/` build on
+stable; running them needs nightly, which this machine does not have, so the first real
+fuzz runs are CI's: twenty seconds per target under the address sanitizer on each push,
+with anything found kept as an artifact that the ordinary tests replay.
+
+What the byte-level targets found: nothing. The decoders are postcard over bounded
+frames, and postcard rejects what it cannot read without allocating for claimed lengths
+beyond the bytes it has; the sealed-box and signature checks refuse short or wrong
+input before any slice; the tunnel packet reader checks its minimum length first. The
+one thing the first run caught was in the harness itself (a seed that did not decode).
+
+What the generated-value tests found: one real gap in the hub's record check. With
+`issued_at` near the end of the unsigned 64-bit range the lifetime arithmetic
+saturates, so a record would have been accepted whose expiry equals its issue time and
+which the directory then never drops. Unreachable with a sane clock, one line to
+refuse, refused now. Route choice over hostile directories (bad signatures, empty
+address lists, inverted ranges, NaN and infinite round trips, expired and far-future
+records, random fences and exclusions) never panicked and never returned a chain that
+failed to tile the requested layers.
+
+## 11. Phase 1 scope still open
+
+Failover of a live session without losing its context. The Linux build, a CPU-only container image (136 MB)
 and continuous integration on GitHub Actions landed in pull request 1 (6.5 minutes
 cold; the Windows-generated bindings compile unchanged on Linux x86-64).

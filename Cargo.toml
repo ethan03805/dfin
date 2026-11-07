@@ -6,7 +6,10 @@ members = [
     "crates/dfin-llama-sys",
     "crates/dfin-llama",
     "crates/dfin",
+    "crates/dfin-fuzz",
 ]
+# The cargo-fuzz driver needs nightly; it is built on its own (see fuzz/Cargo.toml).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.1"
@@ -42,3 +45,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 
 [profile.release]
 debug = 1
+
+# Unoptimised curve arithmetic makes a signature check cost milliseconds, and the tests
+# sign, verify, seal and open thousands of times; keep the crypto fast in debug builds.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.x25519-dalek]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3

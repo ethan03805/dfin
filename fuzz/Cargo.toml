@@ -1,0 +1,108 @@
+# cargo-fuzz driver crate (nightly only; excluded from the workspace). The targets are
+# one-liners over `crates/dfin-fuzz`, so the same functions also run as ordinary tests.
+#
+#   cargo install cargo-fuzz
+#   cargo run -p dfin-fuzz --bin dfin-fuzz-seeds -- fuzz/corpus
+#   cargo +nightly fuzz run request -- -max_total_time=60
+[package]
+name = "dfin-fuzz-run"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dfin-fuzz = { path = "../crates/dfin-fuzz" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "response"
+path = "fuzz_targets/response.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "return_frame"
+path = "fuzz_targets/return_frame.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "hop_record"
+path = "fuzz_targets/hop_record.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "sealed"
+path = "fuzz_targets/sealed.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "signed_record"
+path = "fuzz_targets/signed_record.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "signed_directory"
+path = "fuzz_targets/signed_directory.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "tunnel_packet"
+path = "fuzz_targets/tunnel_packet.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "node_id_text"
+path = "fuzz_targets/node_id_text.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "activations"
+path = "fuzz_targets/activations.rs"
+test = false
+doc = false
+bench = false

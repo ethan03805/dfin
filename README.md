@@ -136,6 +136,25 @@ cargo test
 The integration tests split the tiny model into head, middle and tail pieces and check
 that the pipelined logits equal the monolithic ones.
 
+### Fuzzing the decoders
+
+Every byte a node reads from a peer goes through a decoder in `crates/dfin-fuzz`: one
+function per wire type (requests, responses, return frames, hop records, sealed boxes,
+signed records and directories, tunnel packets, length-prefixed frames, node ids,
+activations), each taking arbitrary bytes and never allowed to panic. `cargo test`
+runs them all over their seeds, every truncation and bit flip of every seed, and random
+noise, on any platform. For a real fuzzer, the `fuzz/` crate wraps the same functions
+for libFuzzer (nightly, Linux or macOS):
+
+```bash
+cargo install cargo-fuzz
+cargo run --release -p dfin-fuzz --bin dfin-fuzz-seeds -- fuzz/corpus
+cargo +nightly fuzz run request -- -max_total_time=120
+```
+
+CI runs every target for a short time on each push; anything it finds lands in
+`fuzz/artifacts`, which the ordinary tests replay afterwards.
+
 ## Run a local pod
 
 ```powershell
@@ -324,6 +343,7 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [x] Signed directory: `dfin hub`, stage announcements with reachability checks, client-side route choice, cache, rerouting when a stage dies
 - [x] Cloaked stages: no inbound port, reachable through a relay-allocated port over the stage's own outbound tunnel, end-to-end QUIC, synthetic peer addresses
 - [x] Region fencing: `dfin probe` vantage points with allow lists, per-probe round trips in the signed directory, client `--region label:ms` fence that excludes cloaked nodes (`docs/phase1-protocol.md` section 14)
+- [x] Fuzzed decoders: libFuzzer targets for every wire type (`fuzz/`), the same targets as ordinary tests over mutated seeds and noise, generated-value tests for route choice and the hub's record check, a short fuzz run in CI
 - [x] Weight shards: per-layer split files with a hashed manifest, a loader that tolerates absent shards, stages serving the shards they hold, `--fetch` and `dfin fetch` from directory peers or HTTP seeds. GLM-4.7-Flash served from a 23-shard directory matches llama.cpp's single-file output at f32 activations; f16 activations flip near-tie tokens (`docs/phase1-findings.md` section 7)
 - [ ] MTP speculative decoding in the client tail
 - [x] Stage state wider than `n_embd`: `glm5-next` hyper-connection streams (4 x `n_embd`) and Kimi K3 attention-residual banks (growing with depth) cross stage boundaries as wider rows; three-piece pipelines of tiny models match the whole model (`crates/dfin-llama/tests/wide_state.rs`)
@@ -335,8 +355,8 @@ criteria. Status of the pieces is tracked in this section as they land.
 
 Design v0.2 phase 1 (the encrypted chain) is under way. Done: node identities, the QUIC
 transport, chain forwarding, relays, the signed directory, cloaked stages, weight shards,
-wide stage state, region fencing. Still to do in phase 1: failover of a live session,
-fuzzing of the decoders. Until the integrity
+wide stage state, region fencing, fuzzed decoders. Still to do in phase 1: failover of a
+live session. Until the integrity
 checks of phase 2 exist, only run stages for clients you know, and only list stages on a
 hub you run.
 

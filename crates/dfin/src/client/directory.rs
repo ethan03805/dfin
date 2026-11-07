@@ -392,4 +392,96 @@ mod tests {
         assert!("us".parse::<RegionFence>().is_err());
         assert!("us:0".parse::<RegionFence>().is_err());
     }
+
+    /// Generated directories: whatever a hub lists (bad signatures, empty address lists,
+    /// absurd ranges, NaN round trips, expired or far-future records), route choice must
+    /// not panic, and a route it returns must tile the requested layers exactly with
+    /// nodes that have an address and, under a fence, are not cloaked.
+    #[test]
+    fn generated_directories_never_break_route_choice() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0xd1f);
+        let keys: Vec<NodeKey> = (0..6).map(|_| NodeKey::generate()).collect();
+        for round in 0..600 {
+            let n = rng.random_range(0..8);
+            let mut entries = Vec::new();
+            for _ in 0..n {
+                let key = &keys[rng.random_range(0..keys.len())];
+                let fp = if rng.random_bool(0.8) { "fp" } else { "other" };
+                let (a, b) = (rng.random_range(-2..10), rng.random_range(-2..10));
+                let rtt = [f32::NAN, -1.0, 0.0, 0.5, 3.0, f32::INFINITY][rng.random_range(0..6)];
+                let mut e = entry(key, a, b, rtt, fp);
+                let mut rec = verify_record(&e.record).unwrap();
+                if rng.random_bool(0.2) {
+                    rec.n_embd = 65;
+                }
+                if rng.random_bool(0.2) {
+                    rec.addrs.clear();
+                }
+                if rng.random_bool(0.2) {
+                    rec.addrs.push("x".repeat(200));
+                }
+                if rng.random_bool(0.2) {
+                    rec.cloaked = true;
+                }
+                if rng.random_bool(0.1) {
+                    rec.protocol = 0;
+                }
+                if rng.random_bool(0.1) {
+                    rec.issued_at = 0;
+                }
+                if rng.random_bool(0.1) {
+                    rec.issued_at = u64::MAX;
+                    rec.ttl_secs = u32::MAX;
+                }
+                let signer = if rng.random_bool(0.9) { key } else { &keys[0] };
+                e.record = sign_record(signer, &rec).unwrap();
+                if rng.random_bool(0.3) {
+                    e.record.signature[0] ^= 1;
+                }
+                let probes: Vec<(&str, f32)> = (0..rng.random_range(0..4))
+                    .map(|_| {
+                        (
+                            ["us", "eu"][rng.random_range(0..2)],
+                            [f32::NAN, 1.0, 49.0, 51.0, f32::INFINITY][rng.random_range(0..5)],
+                        )
+                    })
+                    .collect();
+                e = probed(e, &probes);
+                e.seen_at = rng.random();
+                entries.push(e);
+            }
+            let d_ = dir(entries);
+            let (begin, end) = (rng.random_range(-2..10), rng.random_range(-2..10));
+            let exclude: HashSet<NodeId> = keys
+                .iter()
+                .filter(|_| rng.random_bool(0.3))
+                .map(|k| k.id())
+                .collect();
+            let fence: Option<RegionFence> = match rng.random_range(0..3) {
+                0 => None,
+                1 => Some("us:50".parse().unwrap()),
+                _ => Some("eu:1".parse().unwrap()),
+            };
+            let now = [0u64, 1010, u64::MAX][rng.random_range(0..3)];
+            let s = select_route(&d_, now, "fp", 64, begin, end, &exclude, fence.as_ref());
+            assert_eq!(s.listed, d_.entries.len());
+            assert!(s.fenced_out <= s.usable && s.usable <= s.listed);
+            let Some(route) = s.route else { continue };
+            assert!(begin == end || !route.is_empty(), "round {round}: empty route");
+            let mut cur = begin;
+            for hop in &route {
+                assert_eq!(hop.layers.begin, cur, "round {round}: gap in the chain");
+                assert!(hop.layers.end > hop.layers.begin, "round {round}");
+                assert!(!hop.addr.is_empty(), "round {round}: hop without an address");
+                if let Some(f) = &fence {
+                    assert!(!hop.cloaked, "round {round}: cloaked hop inside a fence");
+                    assert_eq!(hop.fenced.as_deref(), Some(f.region.as_str()));
+                }
+                cur = hop.layers.end;
+            }
+            assert_eq!(cur, end, "round {round}: chain does not reach the end");
+        }
+    }
 }

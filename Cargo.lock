@@ -539,6 +539,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dfin-fuzz"
+version = "0.0.1"
+dependencies = [
+ "dfin-net",
+ "dfin-proto",
+ "postcard",
+ "rand 0.9.5",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "dfin-llama"
 version = "0.0.1"
 dependencies = [

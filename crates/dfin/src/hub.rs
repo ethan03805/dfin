@@ -268,6 +268,10 @@ impl Hub {
         if record.ttl_secs == 0 || record.ttl_secs > MAX_RECORD_TTL_SECS {
             return Err(error(ErrorCode::BadTimestamp, "ttl out of range"));
         }
+        if record.issued_at.checked_add(record.ttl_secs as u64).is_none() {
+            // `expires_at` saturates; a record that never expires is not listed.
+            return Err(error(ErrorCode::BadTimestamp, "record lifetime overflows"));
+        }
         if record.issued_at.abs_diff(now) > MAX_CLOCK_SKEW_SECS {
             return Err(error(
                 ErrorCode::BadTimestamp,
@@ -442,5 +446,105 @@ impl Hub {
             Ok(signed) => Response::Directory { directory: signed },
             Err(e) => error(ErrorCode::Internal, e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    /// Generated records: the check never panics, and whatever it accepts has the bounds
+    /// the hub relies on afterwards: a first address to dial, a middle layer range inside
+    /// the model, a lifetime it can expire, text it can store.
+    #[test]
+    fn generated_records_are_checked_without_panics() {
+        let mut rng = StdRng::seed_from_u64(0x4b);
+        let base = 1_800_000_000u64;
+        let mut accepted = 0;
+        for _ in 0..5000 {
+            // Start from a record the hub accepts and push a few fields to edge values,
+            // so both outcomes happen often and every bound gets tested on its own.
+            let now = [0u64, base, u64::MAX][rng.random_range(0..3)];
+            let mut record = NodeRecord {
+                node_id: rng.random(),
+                addrs: vec!["10.0.0.5:7001".into()],
+                model_fingerprint: "fp".into(),
+                model_name: "tiny".into(),
+                layer_begin: 2,
+                layer_end: 6,
+                n_layer: 8,
+                n_embd: 64,
+                n_ctx_seq: 4096,
+                n_seq_max: 4,
+                act_dtype: dfin_proto::ActDtype::F16,
+                backend: "CPU".into(),
+                protocol: PROTOCOL_VERSION,
+                region: "us".into(),
+                attested: false,
+                cloaked: false,
+                issued_at: now,
+                ttl_secs: 180,
+            };
+            let ints = [i32::MIN, -1, 0, 1, 2, 5, 6, 8, 9, i32::MAX];
+            let lens = [0usize, 1, 64, 65, 128, 129, 256, 257, 4096];
+            let mut p = |rng: &mut StdRng| rng.random_bool(0.25);
+            if p(&mut rng) {
+                let n = [0usize, 1, 2, 8, 9, 40][rng.random_range(0..6)];
+                record.addrs = (0..n).map(|_| "a".repeat(lens[rng.random_range(0..lens.len())])).collect();
+            }
+            if p(&mut rng) {
+                record.model_fingerprint = "f".repeat(lens[rng.random_range(0..lens.len())]);
+            }
+            if p(&mut rng) {
+                record.model_name = "m".repeat(lens[rng.random_range(0..lens.len())]);
+            }
+            if p(&mut rng) {
+                record.backend = "b".repeat(lens[rng.random_range(0..lens.len())]);
+            }
+            if p(&mut rng) {
+                record.region = "r".repeat(lens[rng.random_range(0..lens.len())]);
+            }
+            if p(&mut rng) {
+                record.layer_begin = ints[rng.random_range(0..ints.len())];
+            }
+            if p(&mut rng) {
+                record.layer_end = ints[rng.random_range(0..ints.len())];
+            }
+            if p(&mut rng) {
+                record.n_layer = ints[rng.random_range(0..ints.len())];
+            }
+            if p(&mut rng) {
+                record.protocol = [0, u32::MAX][rng.random_range(0..2)];
+            }
+            if p(&mut rng) {
+                record.issued_at = [
+                    0,
+                    now.saturating_sub(601),
+                    now.saturating_sub(600),
+                    now.saturating_add(600),
+                    now.saturating_add(601),
+                    u64::MAX,
+                ][rng.random_range(0..6)];
+            }
+            if p(&mut rng) {
+                record.ttl_secs = [0, 1, 3600, 3601, u32::MAX][rng.random_range(0..5)];
+            }
+            record.cloaked = rng.random_bool(0.5);
+            record.attested = rng.random_bool(0.5);
+            if Hub::check(&record, now).is_ok() {
+                accepted += 1;
+                assert!((1..=8).contains(&record.addrs.len()));
+                assert!(record.addrs.iter().all(|a| (1..=128).contains(&a.len())));
+                assert!(record.layer_begin > 0 && record.layer_end > record.layer_begin);
+                assert!(record.layer_end <= record.n_layer);
+                assert!((1..=MAX_RECORD_TTL_SECS).contains(&record.ttl_secs));
+                assert!(record.issued_at.abs_diff(now) <= MAX_CLOCK_SKEW_SECS);
+                assert!(record.expires_at() > record.issued_at);
+                assert_eq!(record.protocol, PROTOCOL_VERSION);
+            }
+        }
+        assert!(accepted > 0, "the generator never produced an acceptable record");
     }
 }

@@ -80,3 +80,46 @@ jobs:
           cargo build --release --locked -p dfin
           env -u LD_LIBRARY_PATH target/release/dfin --help
           ldd target/release/dfin | grep -E "llama|ggml"
+
+  fuzz:
+    name: Fuzz the wire decoders (libFuzzer, nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Seed corpus from valid encodings
+        run: cargo run --release -p dfin-fuzz --bin dfin-fuzz-seeds -- fuzz/corpus
+
+      # A short run of every target with the address sanitizer. Anything libFuzzer finds
+      # lands in fuzz/artifacts and fails the step; the smoke test (cargo test in the
+      # Linux job) replays those artifacts on later runs.
+      - name: Fuzz every target for 20 seconds
+        run: |
+          set -e
+          for t in $(cargo fuzz list); do
+            echo "::group::$t"
+            cargo fuzz run "$t" -- -max_total_time=20 -max_len=8192 -timeout=10
+            echo "::endgroup::"
+          done
+
+      - name: Keep anything found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

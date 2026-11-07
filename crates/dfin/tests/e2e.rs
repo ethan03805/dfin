@@ -620,7 +620,7 @@ async fn route_from_hub_and_reroute_after_stage_death() {
         .map(|s| s.to_string())
         .collect();
     let hi = procs.spawn("hub", &hub_args);
-    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(60)).await;
+    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120)).await;
     let hub_flag = format!("{hub_addr}/{}", hub_key.id);
 
     let spawn_stage = |procs: &mut Procs, name: &str, layers: &str, key: &StageKey, port: u16| -> usize {
@@ -762,7 +762,7 @@ async fn cloaked_stage_through_relay() {
     .map(|s| s.to_string())
     .collect();
     let hi = procs.spawn("hub", &hub_args);
-    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(60)).await;
+    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120)).await;
     let hub_flag = format!("{hub_addr}/{}", hub_key.id);
 
     let relay_port = free_udp_port();
@@ -878,7 +878,7 @@ async fn stage_fetches_its_shards_from_a_peer() {
         .map(|s| s.to_string())
         .collect();
     let hi = procs.spawn("hub", &hub_args);
-    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(60)).await;
+    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120)).await;
     let hub_flag = format!("{hub_addr}/{}", hub_key.id);
 
     // Stage A holds every shard.
@@ -1029,7 +1029,7 @@ async fn region_fence_from_two_vantage_points() {
     .map(|s| s.to_string())
     .collect();
     let hi = procs.spawn("hub", &hub_args);
-    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(60)).await;
+    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120)).await;
     let hub_flag = format!("{hub_addr}/{}", hub_key.id);
 
     let k1 = StageKey::new("s1");

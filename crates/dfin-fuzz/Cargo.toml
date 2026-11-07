@@ -1,0 +1,16 @@
+[package]
+name = "dfin-fuzz"
+description = "Fuzz targets for everything dfin decodes from a peer: each must return, never panic, on any input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dfin-proto = { path = "../dfin-proto" }
+dfin-net = { path = "../dfin-net" }
+postcard.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["rt", "io-util"] }
+
+[dev-dependencies]
+rand.workspace = true

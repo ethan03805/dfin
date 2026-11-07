@@ -304,17 +304,50 @@ directory already, and probe results are part of that trust. A hub operator who 
 to be checked publishes the probe ids, and a later version can let clients ask the
 probes themselves.
 
+## 15. Fuzzing
+
+Every decoder that reads bytes from a peer has a fuzz target in `crates/dfin-fuzz`: a
+function from arbitrary bytes to "decoded or not" that must never panic, and that, when
+the bytes do decode, does what the real code does next: re-encodes the value and checks
+the encoding is stable, converts activations both ways, verifies signatures, opens inner
+sealed records, parses addresses. The targets are `request`, `response`,
+`return_frame`, `hop_record`, `sealed`, `signed_record`, `signed_directory`,
+`tunnel_packet`, `frame` (the length-prefixed reader under each limit a receiver uses,
+plus the rule that only `Forward` may carry the Forward tag in its first byte),
+`node_id_text` and `activations`. Sealed and signed inputs use a fixed key, so a
+fuzzer can evolve past the cryptographic checks and reach the code behind them.
+
+The same functions run three ways. `cargo test` runs each over its seeds, every
+truncation of every seed, byte and bit flips, random bytes behind a valid prefix, and
+pure noise, on every platform, and replays whatever a libFuzzer run left in
+`fuzz/corpus` and `fuzz/artifacts`. The `fuzz/` crate at the repository root wraps each
+function for cargo-fuzz (nightly; excluded from the workspace), with a seed writer
+(`dfin-fuzz-seeds`) that gives libFuzzer valid encodings to start from. CI runs every
+target under the address sanitizer for a short time on each push.
+
+The value-level rules of the binary are covered by generated-value tests rather than
+byte fuzzing, since the types already decoded: route choice over directories with bad
+signatures, empty address lists, absurd layer ranges, NaN round trips, expired and
+far-future records, under random fences and exclusions, must never panic and must only
+return chains that tile the requested layers with addressable, unfenced nodes; and the
+hub's record check must accept only records with the bounds the hub relies on
+afterwards.
+
+Not fuzzed here: QUIC and TLS (quinn and rustls fuzz their own decoders), and the
+model computation (llama.cpp's problem; a stage's activation input is bounded in shape
+before it reaches the model).
+
 ## 8. Status, 6 November 2026
 
 Built and tested: identities, transport, sealed records, route setup, forwarding, all
 three return modes, `dfin relay`, the signed directory with `dfin hub` and client-side
 routing with rerouting when a stage dies (section 10), cloaked nodes (section 11), the
-limits in section 2 except fuzzing. Verified with the tiny model (unit, protocol and
+limits in section 2 including fuzzing (section 15). Verified with the tiny model (unit, protocol and
 end-to-end tests in every mode, including a hub, a stage killed mid-run, and a cloaked
 stage behind a relay) and on GLM-4.7-Flash on one machine (`docs/phase1-findings.md`).
 Weight shards (section 12), wide stage state (section 13) and region fencing with
 `dfin probe` (section 14) are in too. Not yet done from the phase 1 list: replay-log
-failover of a live session, fuzzing of the frame decoders.
+failover of a live session.
 
 ## 9. What changed from Phase 0 and why
 

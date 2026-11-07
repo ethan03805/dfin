@@ -69,6 +69,14 @@ Tests run in the isolated checkout with generated tiny CPU models and loopback-o
 
 The design also incorrectly implied that client-side route choice prevents a hub from steering. A hub can personalize the directory it returns; the corrected design states this limitation and separates independent-directory work from present guarantees.
 
+### P07 — Directory consumers accepted invalid signed lifetimes
+
+**Status:** fixed; all 88 regular Windows tests pass. Route selection and shard discovery checked expiry and signatures but did not enforce the hub's bounds on lifetimes, future timestamps, text, addresses, or model ranges. A signed future-dated record loaded from a signed cache was accepted by the new regression on the original implementation. A signature authenticates a claim; it does not establish that the claim is valid.
+
+**Fix:** share record validation across the hub, routing, and shard discovery. Reject zero/excessive TTLs, arithmetic overflow, expiry, timestamps beyond the allowed future skew, and invalid field bounds. Clients still accept older records until their bounded TTL expires, preserving outage fallback; newly received hub announcements additionally retain the tighter age check. Directory signatures are now verified before decoding their body because the expected hub key is already known.
+
+**Scope:** a malicious hub can still bias or personalize an otherwise valid directory. This does not add independent directory agreement, Sybil resistance, or proof that a node's self-description is true.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -101,3 +109,8 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P05 fix | Five fast relay tests plus eight existing end-to-end tests | 13 passed, 0 failed |
 | P05 expiration | Real two-minute unattached-session deadline | Passed in 120.54 seconds; both client and first-hop connections closed |
 | P01–P06 | Complete Windows release workspace | 86 passed, 0 failed; no fixture skips; real Tor and the slow expiration check separately opt-in |
+| P01–P06 revision `c1c09fc` | Real Tor 0.4.9.15, private nine-node network | All return modes passed; integration portion 56.65 seconds; children stopped |
+| P07 reproduction | Future-dated signed record in an authentic signed cache | Failed as expected: route selection accepted it |
+| P01–P07 | Complete Windows release workspace | 88 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+
+Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.

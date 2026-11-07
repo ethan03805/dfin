@@ -13,12 +13,12 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Args;
-use dfin_net::directory::{sign_directory, verify_record};
+use dfin_net::directory::{sign_directory, validate_record, verify_record};
 use dfin_net::transport::{reply, CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
 use dfin_net::{Connection, Endpoint, NodeId, NodeKey};
 use dfin_proto::{
     read_frame_max, Directory, DirectoryEntry, ErrorCode, NextHop, NodeRecord, ProbeRtt, Request,
-    Response, SignedRecord, MAX_CLOCK_SKEW_SECS, MAX_RECORD_TTL_SECS, PROTOCOL_VERSION,
+    Response, SignedRecord, MAX_CLOCK_SKEW_SECS,
 };
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -255,46 +255,7 @@ impl Hub {
     }
 
     fn check(record: &NodeRecord, now: u64) -> Result<(), Response> {
-        let bad = |m: &str| Err(error(ErrorCode::BadRequest, m));
-        if record.protocol != PROTOCOL_VERSION {
-            return Err(error(
-                ErrorCode::VersionMismatch,
-                format!(
-                    "record speaks protocol {}, hub {}",
-                    record.protocol, PROTOCOL_VERSION
-                ),
-            ));
-        }
-        if record.addrs.is_empty() || record.addrs.len() > 8 {
-            return bad("a record names between one and eight addresses");
-        }
-        if record.addrs.iter().any(|a| a.is_empty() || a.len() > 128) {
-            return bad("address too long");
-        }
-        if record.model_fingerprint.len() > 128
-            || record.model_name.len() > 256
-            || record.backend.len() > 256
-            || record.region.len() > 64
-        {
-            return bad("text field too long");
-        }
-        if record.layer_begin <= 0
-            || record.layer_end <= record.layer_begin
-            || record.layer_end > record.n_layer
-        {
-            return bad("layer range must be a middle piece inside the model");
-        }
-        if record.ttl_secs == 0 || record.ttl_secs > MAX_RECORD_TTL_SECS {
-            return Err(error(ErrorCode::BadTimestamp, "ttl out of range"));
-        }
-        if record
-            .issued_at
-            .checked_add(record.ttl_secs as u64)
-            .is_none()
-        {
-            // `expires_at` saturates; a record that never expires is not listed.
-            return Err(error(ErrorCode::BadTimestamp, "record lifetime overflows"));
-        }
+        validate_record(record, now).map_err(|(code, message)| error(code, message))?;
         if record.issued_at.abs_diff(now) > MAX_CLOCK_SKEW_SECS {
             return Err(error(
                 ErrorCode::BadTimestamp,
@@ -487,6 +448,7 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dfin_proto::{MAX_RECORD_TTL_SECS, PROTOCOL_VERSION};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 

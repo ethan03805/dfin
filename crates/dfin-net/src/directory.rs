@@ -5,7 +5,10 @@
 //! a domain separator so a record can never be mistaken for a directory.
 
 use crate::identity::{NodeId, NodeKey};
-use dfin_proto::{Directory, NodeRecord, SignedDirectory, SignedRecord};
+use dfin_proto::{
+    Directory, ErrorCode, NodeRecord, SignedDirectory, SignedRecord, MAX_CLOCK_SKEW_SECS,
+    MAX_RECORD_TTL_SECS, PROTOCOL_VERSION,
+};
 use ed25519_dalek::{Signature, Signer};
 
 const RECORD_DOMAIN: &[u8] = b"dfin-node-record-v1\0";
@@ -52,6 +55,52 @@ pub fn verify_record(signed: &SignedRecord) -> Result<NodeRecord, SignError> {
     Ok(record)
 }
 
+/// Check the bounds every consumer needs, even when both signatures are valid.
+/// This validates claims, not their truth or the directory's completeness.
+/// Old records remain usable until their bounded TTL expires; hubs separately
+/// impose a tighter age limit on newly received announcements.
+pub fn validate_record(record: &NodeRecord, now: u64) -> Result<(), (ErrorCode, &'static str)> {
+    let bad = |message| Err((ErrorCode::BadRequest, message));
+    if record.protocol != PROTOCOL_VERSION {
+        return Err((ErrorCode::VersionMismatch, "record protocol does not match"));
+    }
+    if record.addrs.is_empty() || record.addrs.len() > 8 {
+        return bad("a record names between one and eight addresses");
+    }
+    if record.addrs.iter().any(|a| a.is_empty() || a.len() > 128) {
+        return bad("address empty or too long");
+    }
+    if record.model_fingerprint.len() > 128
+        || record.model_name.len() > 256
+        || record.backend.len() > 256
+        || record.region.len() > 64
+    {
+        return bad("text field too long");
+    }
+    if record.layer_begin <= 0
+        || record.layer_end <= record.layer_begin
+        || record.layer_end > record.n_layer
+    {
+        return bad("layer range must be a middle piece inside the model");
+    }
+    if record.ttl_secs == 0 || record.ttl_secs > MAX_RECORD_TTL_SECS {
+        return Err((ErrorCode::BadTimestamp, "ttl out of range"));
+    }
+    let Some(expires) = record.issued_at.checked_add(record.ttl_secs as u64) else {
+        return Err((ErrorCode::BadTimestamp, "record lifetime overflows"));
+    };
+    if expires <= now {
+        return Err((ErrorCode::BadTimestamp, "record expired"));
+    }
+    if record.issued_at.saturating_sub(now) > MAX_CLOCK_SKEW_SECS {
+        return Err((
+            ErrorCode::BadTimestamp,
+            "record timestamp is too far in the future",
+        ));
+    }
+    Ok(())
+}
+
 pub fn sign_directory(key: &NodeKey, dir: &Directory) -> Result<SignedDirectory, SignError> {
     let body = postcard::to_stdvec(dir).map_err(|e| SignError::Encode(e.to_string()))?;
     let sig = key.signing_key().sign(&message(DIRECTORY_DOMAIN, &body));
@@ -63,12 +112,13 @@ pub fn sign_directory(key: &NodeKey, dir: &Directory) -> Result<SignedDirectory,
 
 /// Decode the directory and check that `hub` signed it and is the hub named inside.
 pub fn verify_directory(signed: &SignedDirectory, hub: &NodeId) -> Result<Directory, SignError> {
+    // The expected signer is already known: authenticate bytes before decoding.
+    verify(hub, DIRECTORY_DOMAIN, &signed.body, &signed.signature)?;
     let dir: Directory =
         postcard::from_bytes(&signed.body).map_err(|e| SignError::Decode(e.to_string()))?;
     if dir.hub_id != hub.0 {
         return Err(SignError::Signature);
     }
-    verify(hub, DIRECTORY_DOMAIN, &signed.body, &signed.signature)?;
     Ok(dir)
 }
 

@@ -6,12 +6,11 @@
 //! directory do not all pile onto one node.
 
 use crate::config::{LayerRange, RegionFence, StageEndpoint};
-use dfin_net::directory::{verify_directory, verify_record};
+use dfin_net::directory::{validate_record, verify_directory, verify_record};
 use dfin_net::transport::CONTROL_TIMEOUT;
 use dfin_net::{Endpoint, NodeId};
 use dfin_proto::{
     Directory, NextHop, NodeRecord, Request, Response, SignedDirectory, MAX_DIRECTORY_BYTES,
-    PROTOCOL_VERSION,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -139,12 +138,9 @@ fn candidates(
         let Ok(record) = verify_record(&e.record) else {
             continue;
         };
-        if record.protocol != PROTOCOL_VERSION
+        if validate_record(&record, now).is_err()
             || record.model_fingerprint != fingerprint
             || record.n_embd != n_embd
-            || record.expires_at() <= now
-            || record.addrs.is_empty()
-            || record.layer_end <= record.layer_begin
         {
             continue;
         }
@@ -272,7 +268,7 @@ mod tests {
     use super::*;
     use dfin_net::directory::sign_record;
     use dfin_net::NodeKey;
-    use dfin_proto::{ActDtype, DirectoryEntry};
+    use dfin_proto::{ActDtype, DirectoryEntry, PROTOCOL_VERSION};
 
     fn entry(key: &NodeKey, begin: i32, end: i32, rtt: f32, fp: &str) -> DirectoryEntry {
         let record = NodeRecord {
@@ -352,6 +348,79 @@ mod tests {
         assert!(sel(&directory, 2, 6, &HashSet::new(), None).unwrap()[0]
             .addr
             .ends_with(".onion:7001"));
+    }
+
+    #[test]
+    fn signed_cached_records_must_have_bounded_lifetimes_and_valid_fields() {
+        use dfin_net::directory::sign_directory;
+        use dfin_proto::{MAX_CLOCK_SKEW_SECS, MAX_RECORD_TTL_SECS};
+
+        let node = NodeKey::generate();
+        let hub = NodeKey::generate();
+        let original = entry(&node, 2, 6, 1.0, "fp");
+        let mutations: &[(&str, fn(&mut NodeRecord))] = &[
+            ("future", |r| r.issued_at = 1010 + MAX_CLOCK_SKEW_SECS + 1),
+            ("overflow", |r| r.issued_at = u64::MAX),
+            ("excessive lifetime", |r| {
+                r.ttl_secs = MAX_RECORD_TTL_SECS + 1
+            }),
+            ("zero lifetime", |r| {
+                r.issued_at = 1011;
+                r.ttl_secs = 0;
+            }),
+            ("expired", |r| {
+                r.issued_at = 1000;
+                r.ttl_secs = 10;
+            }),
+            ("range outside model", |r| r.n_layer = 5),
+            ("too many addresses", |r| {
+                r.addrs = vec!["10.0.0.1:7001".into(); 9]
+            }),
+            ("oversized address", |r| r.addrs = vec!["a".repeat(129)]),
+            ("oversized description", |r| r.model_name = "m".repeat(257)),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("dfin-cache-test-{:016x}", rand::random::<u64>()));
+        let hub_hop = NextHop {
+            addr: "unused".into(),
+            node_id: hub.id().0,
+        };
+        for (case, mutate) in mutations {
+            let mut record = verify_record(&original.record).unwrap();
+            mutate(&mut record);
+            let mut entry = original.clone();
+            entry.record = sign_record(&node, &record).unwrap();
+            let mut directory = dir(vec![entry]);
+            directory.hub_id = hub.id().0;
+            save_cache(&path, &sign_directory(&hub, &directory).unwrap());
+            let cached = load_cache(&path, &hub_hop).expect("authentic hub signature");
+            std::fs::remove_file(&path).unwrap();
+            let selected = select_route(&cached, 1010, "fp", 64, 2, 6, &HashSet::new(), None);
+            assert!(
+                selected.route.is_none(),
+                "accepted signed cached record: {case}"
+            );
+            assert_eq!(selected.usable, 0, "{case}");
+        }
+
+        // Consumers can use records older than the announcement clock-skew limit
+        // while their bounded TTL remains valid, including during a hub outage.
+        let mut valid = original.clone();
+        let mut record = verify_record(&valid.record).unwrap();
+        record.ttl_secs = MAX_RECORD_TTL_SECS;
+        valid.record = sign_record(&node, &record).unwrap();
+        assert!(select_route(
+            &dir(vec![valid]),
+            3010,
+            "fp",
+            64,
+            2,
+            6,
+            &HashSet::new(),
+            None
+        )
+        .route
+        .is_some());
     }
 
     #[test]

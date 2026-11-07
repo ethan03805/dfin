@@ -7,9 +7,9 @@ use crate::config::{parse_node_addr, LayerRange};
 use crate::shards::{have_split, sha256_file, Manifest, Split};
 use anyhow::{bail, Context as _};
 use clap::Args;
-use dfin_net::directory::verify_record;
+use dfin_net::directory::{validate_record, verify_record};
 use dfin_net::{Endpoint, NodeId, NodeKey};
-use dfin_proto::{NextHop, Request, Response, MAX_SHARD_CHUNK, PROTOCOL_VERSION};
+use dfin_proto::{NextHop, Request, Response, MAX_SHARD_CHUNK};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -197,12 +197,7 @@ fn peers_for(dir: &dfin_proto::Directory, model_id: &str) -> Vec<Peer> {
     dir.entries
         .iter()
         .filter_map(|e| verify_record(&e.record).ok())
-        .filter(|r| {
-            r.model_fingerprint == model_id
-                && r.protocol == PROTOCOL_VERSION
-                && r.expires_at() > now
-                && !r.addrs.is_empty()
-        })
+        .filter(|r| r.model_fingerprint == model_id && validate_record(r, now).is_ok())
         .map(|r| Peer {
             addr: r.addrs[0].clone(),
             id: NodeId(r.node_id),
@@ -385,4 +380,53 @@ pub async fn serve_shard(
     let mut data = vec![0u8; len];
     f.read_exact(&mut data).await.map_err(|e| e.to_string())?;
     Ok((split.size, data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dfin_net::{directory::sign_record, NodeKey};
+    use dfin_proto::{ActDtype, Directory, DirectoryEntry, NodeRecord, PROTOCOL_VERSION};
+
+    #[test]
+    fn shard_discovery_rejects_signed_records_with_unbounded_lifetimes() {
+        let key = NodeKey::generate();
+        let now = crate::hub::unix_now();
+        let mut record = NodeRecord {
+            node_id: key.id().0,
+            addrs: vec!["127.0.0.1:7001".into()],
+            model_fingerprint: "fp".into(),
+            model_name: "tiny".into(),
+            layer_begin: 2,
+            layer_end: 6,
+            n_layer: 8,
+            n_embd: 64,
+            n_ctx_seq: 512,
+            n_seq_max: 2,
+            act_dtype: ActDtype::F16,
+            backend: String::new(),
+            region: String::new(),
+            protocol: PROTOCOL_VERSION,
+            attested: false,
+            cloaked: false,
+            issued_at: now,
+            ttl_secs: 180,
+        };
+        let directory = |record: &NodeRecord| Directory {
+            hub_id: key.id().0,
+            issued_at: now,
+            entries: vec![DirectoryEntry {
+                record: sign_record(&key, record).unwrap(),
+                hub_rtt_ms: 1.0,
+                seen_at: now,
+                probes: vec![],
+            }],
+        };
+        assert_eq!(peers_for(&directory(&record), "fp").len(), 1);
+        record.issued_at = u64::MAX;
+        assert!(peers_for(&directory(&record), "fp").is_empty());
+        record.issued_at = now;
+        record.ttl_secs = u32::MAX;
+        assert!(peers_for(&directory(&record), "fp").is_empty());
+    }
 }

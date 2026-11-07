@@ -171,7 +171,7 @@ async fn pending(
     (peer, conn, send, task)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_setup_reserves_the_route_number() {
     let f = Fixture::new(2, 4, 2);
     let (_ep, client) = f.client().await;
@@ -197,7 +197,7 @@ async fn pending_setup_reserves_the_route_number() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_setup_counts_toward_route_capacity() {
     let f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -223,7 +223,7 @@ async fn pending_setup_counts_toward_route_capacity() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_cancels_pending_downstream_setup() {
     let f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -236,7 +236,7 @@ async fn disconnect_cancels_pending_downstream_setup() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_setup_does_not_keep_a_downstream_connection() {
     let f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -271,7 +271,7 @@ async fn rejected_setup_does_not_keep_a_downstream_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn different_clients_can_use_the_same_route_number_downstream() {
     let first = Fixture::new(2, 4, 2);
     let second = Fixture::new(4, 6, 2);
@@ -297,7 +297,7 @@ async fn different_clients_can_use_the_same_route_number_downstream() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_a_route_cancels_its_pending_engine_reply() {
     let mut f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -367,7 +367,7 @@ async fn closing_a_route_cancels_its_pending_engine_reply() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overflowing_downstream_hop_count_is_rejected_and_released() {
     let f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -396,7 +396,7 @@ async fn overflowing_downstream_hop_count_is_rejected_and_released() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn downstream_setup_error_does_not_reveal_hidden_hop_or_peer_text() {
     let f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -421,7 +421,7 @@ async fn downstream_setup_error_does_not_reveal_hidden_hop_or_peer_text() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unexpected_setup_response_does_not_reflect_its_payload() {
     let f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -443,7 +443,7 @@ async fn unexpected_setup_response_does_not_reflect_its_payload() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn downstream_forward_error_does_not_reflect_peer_text() {
     let mut f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -501,7 +501,7 @@ async fn downstream_forward_error_does_not_reflect_peer_text() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn downstream_control_error_does_not_reflect_hidden_details() {
     let f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -532,7 +532,7 @@ async fn downstream_control_error_does_not_reflect_hidden_details() {
     assert!(!message.contains(&peer.local_addr().unwrap().to_string()));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_direct_return_does_not_reveal_the_last_hops_client_id() {
     let f = Fixture::new(2, 4, 1);
     let (_ep, client) = f.client().await;
@@ -562,4 +562,40 @@ async fn absent_direct_return_does_not_reveal_the_last_hops_client_id() {
         !message.contains(&return_id.short()),
         "exposed a sealed return identity: {message}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_disconnects_release_client_identities_and_engine_handles() {
+    let mut f = Fixture::new(2, 4, 1);
+    let mut handles = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let (endpoint, client) = f.client().await;
+        assert!(matches!(
+            call(
+                &client,
+                Request::RouteSetup {
+                    route: 1,
+                    hop: f.hop(None, vec![]),
+                }
+            )
+            .await,
+            Response::RouteOk { hops: 1 }
+        ));
+        client.close("iteration finished");
+        let Some(Job::CloseConn { conn }) =
+            tokio::time::timeout(WAIT, f._jobs.recv()).await.unwrap()
+        else {
+            panic!("route did not enqueue engine cleanup");
+        };
+        assert!(handles.insert(conn), "reused an old engine handle");
+        endpoint.close();
+    }
+    tokio::time::timeout(WAIT, async {
+        while !f.stage.clients.lock().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnected client identities remained in stage state");
+    assert_eq!(handles.len(), 100);
 }

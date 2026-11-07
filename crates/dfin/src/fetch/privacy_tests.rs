@@ -67,7 +67,7 @@ async fn seed(response: &'static [u8]) -> (String, JoinHandle<()>) {
     (url, task)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_download_preserves_an_existing_partial_file() {
     let folder = Folder::new();
     let old = folder.0.join("test.gguf.part");
@@ -86,7 +86,7 @@ async fn completed_download_preserves_an_existing_partial_file() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chunked_seed_cannot_exceed_manifest_size_even_with_a_matching_hash() {
     let folder = Folder::new();
     let (url, server) = seed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\nTOOLONG\r\n0\r\n\r\n").await;
@@ -114,7 +114,7 @@ async fn answer_shard(conn: &Connection, total: u64, data: Vec<u8>) {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_cannot_exceed_the_requested_range_even_with_a_matching_hash() {
     let folder = Folder::new();
     let endpoint = Endpoint::direct_client(NodeKey::generate()).unwrap();
@@ -144,7 +144,7 @@ async fn peer_cannot_exceed_the_requested_range_even_with_a_matching_hash() {
     assert!(std::fs::read_dir(&folder.0).unwrap().next().is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_a_download_removes_its_partial_file() {
     let folder = Folder::new();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -188,7 +188,7 @@ async fn cancelling_a_download_removes_its_partial_file() {
     .expect("cancelled download left its partial file behind");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn short_or_bad_hash_seed_does_not_install_or_keep_a_partial_file() {
     for response in [
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nGO\r\n0\r\n\r\n".as_slice(),

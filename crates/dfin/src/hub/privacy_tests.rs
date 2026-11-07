@@ -162,7 +162,7 @@ async fn finish_probe(conn: &Connection, mut first: SendStream) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_announcements_cannot_overfill_the_directory() {
     let f = Fixture::new(1);
     let first = Node::new();
@@ -201,7 +201,7 @@ async fn concurrent_announcements_cannot_overfill_the_directory() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_pending_announcements_do_not_start_another_probe() {
     let f = Fixture::new(2);
     let mut node = Node::new();
@@ -225,7 +225,7 @@ async fn duplicate_pending_announcements_do_not_start_another_probe() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_cancels_announcement_probe_and_releases_capacity() {
     let f = Fixture::new(1);
     let node = Node::new();
@@ -257,7 +257,7 @@ async fn disconnect_cancels_announcement_probe_and_releases_capacity() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_probe_closes_its_connection_and_releases_the_reservation() {
     let f = Fixture::new(1);
     let mut node = Node::new();
@@ -281,7 +281,7 @@ async fn failed_probe_closes_its_connection_and_releases_the_reservation() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_large_directory_still_bounds_simultaneous_probes() {
     let f = Fixture::new(1000);
     let mut held = Vec::new();
@@ -309,4 +309,45 @@ async fn a_large_directory_still_bounds_simultaneous_probes() {
         ),
         "{response:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_cancelled_announcements_release_all_reservations() {
+    let f = Fixture::new(1);
+    for _ in 0..40 {
+        let node = Node::new();
+        let (endpoint, client) = f.client().await;
+        let copy = client.clone();
+        let signed = node.signed.clone();
+        let request = tokio::spawn(async move {
+            copy.call::<_, Response>(
+                &Request::Announce { record: signed },
+                MAX_CONTROL_FRAME,
+                WAIT,
+            )
+            .await
+        });
+        let (probe, _send) = node.hold_first_ping().await;
+        client.close("cancelled iteration");
+        request.abort();
+        let _ = request.await;
+        assert!(tokio::time::timeout(WAIT, probe.closed()).await.is_ok());
+        tokio::time::timeout(WAIT, async {
+            while !f.hub.state.lock().pending.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled announcement retained a reservation");
+        assert!(f.hub.state.lock().entries.is_empty());
+        endpoint.close();
+    }
+    let mut final_node = Node::new();
+    final_node.answer_later_connections();
+    assert!(matches!(
+        tokio::time::timeout(WAIT, f.hub.announce(final_node.signed.clone()))
+            .await
+            .unwrap(),
+        Response::Ack
+    ));
 }

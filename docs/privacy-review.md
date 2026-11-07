@@ -144,6 +144,17 @@ Reference: Rust's [`create_new` semantics](https://doc.rust-lang.org/std/fs/stru
 - The local generation API already uses nonblocking bounded queue admission; it rejects a full queue instead of retaining unlimited waiting generation jobs.
 - Request sequence counters are already reset and directory lookups already use separate temporary identities.
 
+## Concurrency validation
+
+The stage, hub, and download adversarial fixtures now run with two Tokio worker
+threads, matching the production scheduler more closely than the default single-thread
+test runtime. Two additional tests exercise 100 stage disconnects and 40 cancelled hub
+announcements on the same long-lived instances, checking that client identities,
+engine handles, and pending reservations are released. All 24 targeted tests passed.
+A bounded run repeated all 24 checks 32 times: 768 test executions and 4,480
+disconnect/cancellation cycles passed. This is regression evidence, not a proof
+that all races or denial-of-service cases are absent.
+
 ## Test results
 
 The starting revision passed 73 regular tests, a real Tor integration test on Windows and Linux, and CI wire-decoder fuzzing. New results are recorded here as they complete.
@@ -198,6 +209,10 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P14 initial fixes | All ten stage ownership/error regressions | 10 passed, 0 failed |
 | P01–P13 revision `b1719c2` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42402718052) | Both jobs passed |
 | P01–P14 | Complete Windows release workspace, including control/return error disclosure | 117 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| P01–P14 revision `062d7f2` | Real Tor 0.4.9.15, private nine-node network | All return modes passed; integration portion 59.35 seconds; children stopped |
+| Multi-worker lifecycle validation | 24 adversarial tests, including 140 repeated disconnect/cancellation cycles | Passed; no new finding in this run |
+| Repeated multi-worker lifecycle validation | 32 rounds: 768 checks and 4,480 disconnect/cancellation cycles | All passed; no new finding in this run |
+| P01–P14 revision `062d7f2` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42403373198) | Both jobs passed |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.
 

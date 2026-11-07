@@ -225,6 +225,27 @@ with a synthetic one before the stage sees it, so a cloaked stage learns nobody'
 nobody but the relay learns the stage's. Such a stage cannot be placed by timing, and the
 directory says so (`cloaked: true`).
 
+### Fencing a route to a region
+
+Where a node's network interface is can be bounded by timing from several places. Run
+probes in the places you care about, tell the hub about them, and let clients choose:
+
+```powershell
+dfin probe  --listen 0.0.0.0:7300 --identity probe-east.key --region us --allow <hub id>
+dfin probe  --listen 0.0.0.0:7300 --identity probe-west.key --region us --allow <hub id>
+dfin hub    ... --probe 198.51.100.7:7300/<probe-east id> --probe 203.0.113.40:7300/<probe-west id>
+dfin client ... --hub ... --region us:50
+```
+
+Each probe pings every announcing node on the hub's request and reports the best round
+trip under its own label; the directory publishes all of them. A client fenced to
+`us:50` uses only nodes that every probe labelled `us` reaches within 50 ms, which with
+one probe on each coast puts the node in North America and nowhere else. Cloaked nodes
+are never inside a fence, since only their relay can be timed. `GET /status` says which
+hops passed the fence and how many usable nodes it excluded. A fence bounds where the
+node's network interface is, not where it runs the computation; attestation in phase 2
+is what closes that.
+
 On a node that only serves a stage, the model file must be byte-identical to the
 client's (the handshake checks a fingerprint); each stage maps only its own layers, so a
 node needs memory for its range, not for the whole model. Pick the range by the node's
@@ -302,6 +323,7 @@ criteria. Status of the pieces is tracked in this section as they land.
 - [x] Linux build, Docker image and CI (pull request 1)
 - [x] Signed directory: `dfin hub`, stage announcements with reachability checks, client-side route choice, cache, rerouting when a stage dies
 - [x] Cloaked stages: no inbound port, reachable through a relay-allocated port over the stage's own outbound tunnel, end-to-end QUIC, synthetic peer addresses
+- [x] Region fencing: `dfin probe` vantage points with allow lists, per-probe round trips in the signed directory, client `--region label:ms` fence that excludes cloaked nodes (`docs/phase1-protocol.md` section 14)
 - [x] Weight shards: per-layer split files with a hashed manifest, a loader that tolerates absent shards, stages serving the shards they hold, `--fetch` and `dfin fetch` from directory peers or HTTP seeds. GLM-4.7-Flash served from a 23-shard directory matches llama.cpp's single-file output at f32 activations; f16 activations flip near-tie tokens (`docs/phase1-findings.md` section 7)
 - [ ] MTP speculative decoding in the client tail
 - [x] Stage state wider than `n_embd`: `glm5-next` hyper-connection streams (4 x `n_embd`) and Kimi K3 attention-residual banks (growing with depth) cross stage boundaries as wider rows; three-piece pipelines of tiny models match the whole model (`crates/dfin-llama/tests/wide_state.rs`)
@@ -313,8 +335,8 @@ criteria. Status of the pieces is tracked in this section as they land.
 
 Design v0.2 phase 1 (the encrypted chain) is under way. Done: node identities, the QUIC
 transport, chain forwarding, relays, the signed directory, cloaked stages, weight shards,
-wide stage state. Still to do in phase 1: failover of a live session, region fencing from
-several vantage points, fuzzing of the decoders. Until the integrity
+wide stage state, region fencing. Still to do in phase 1: failover of a live session,
+fuzzing of the decoders. Until the integrity
 checks of phase 2 exist, only run stages for clients you know, and only list stages on a
 hub you run.
 

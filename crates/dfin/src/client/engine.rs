@@ -9,7 +9,7 @@ use super::sampling::{Sampler, SamplingParams};
 use super::directory::{self, DirectoryInfo};
 use super::route::{HopCounters, ReturnPolicy, Route, RouteCounters, RouteError};
 use super::text::{StopMatcher, Utf8Accumulator};
-use crate::config::{LayerRange, RouteConfig, StageEndpoint, StageEndpointToml};
+use crate::config::{LayerRange, RegionFence, RouteConfig, StageEndpoint, StageEndpointToml};
 use anyhow::Context as _;
 use dfin_llama::{
     ChatMessage, Context, ContextParams, FlashAttn, KvType, Model, ModelParams, OutputMode, SeqId,
@@ -144,6 +144,8 @@ pub struct EngineConfig {
     pub return_policy: ReturnPolicy,
     pub hub: Option<NextHop>,
     pub directory_cache: Option<PathBuf>,
+    /// Only use directory nodes inside this region fence.
+    pub fence: Option<RegionFence>,
     pub n_ctx: u32,
     pub n_gpu_layers: i32,
     /// Tensor-name regexes kept on the CPU buffer type (MoE experts in RAM).
@@ -168,6 +170,10 @@ pub struct RouteEntry {
     pub layers: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cloaked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fenced: Option<String>,
 }
 
 /// Facts fixed at startup, for `/status`.
@@ -265,6 +271,7 @@ fn llama_err(what: &str, e: dfin_llama::Error) -> EngineErr {
 struct Resolver {
     hub: NextHop,
     cache: Option<PathBuf>,
+    fence: Option<RegionFence>,
     fingerprint: String,
     n_embd: u32,
     begin: i32,
@@ -297,7 +304,7 @@ impl Resolver {
                 }
             }
         };
-        let (route, listed, usable) = directory::select_route(
+        let sel = directory::select_route(
             &dir,
             now,
             &self.fingerprint,
@@ -305,17 +312,25 @@ impl Resolver {
             self.begin,
             self.end,
             exclude,
+            self.fence.as_ref(),
         );
+        let (listed, usable, fenced_out) = (sel.listed, sel.usable, sel.fenced_out);
         self.info = DirectoryInfo {
             hub: self.hub.addr.clone(),
             issued_at: dir.issued_at,
             from_cache,
             nodes_listed: listed,
             nodes_usable: usable,
+            fence: self.fence.as_ref().map(|f| format!("{}:{}", f.region, f.max_rtt_ms)),
+            nodes_fenced_out: fenced_out,
         };
-        let route = route.ok_or_else(|| {
+        let route = sel.route.ok_or_else(|| {
+            let fence = match &self.fence {
+                Some(f) => format!(", {fenced_out} outside the fence {}:{} ms", f.region, f.max_rtt_ms),
+                None => String::new(),
+            };
             format!(
-                "no chain of stages in the directory covers layers {}:{} for this model ({usable} usable of {listed} listed)",
+                "no chain of stages in the directory covers layers {}:{} for this model ({usable} usable of {listed} listed{fence})",
                 self.begin, self.end
             )
         })?;
@@ -433,6 +448,7 @@ impl Engine {
             let mut res = Resolver {
                 hub: hub.clone(),
                 cache: cfg.directory_cache.clone(),
+                fence: cfg.fence.clone(),
                 fingerprint: fingerprint.clone(),
                 n_embd: n_embd as u32,
                 begin: cfg.head.end,
@@ -1104,6 +1120,8 @@ fn route_entries(head: LayerRange, tail: LayerRange, route: Option<&Route>) -> V
         node_id: None,
         layers: head.to_string(),
         backend: None,
+        cloaked: false,
+        fenced: None,
     }];
     if let Some(r) = route {
         for (i, s) in r.hops.iter().enumerate() {
@@ -1113,6 +1131,8 @@ fn route_entries(head: LayerRange, tail: LayerRange, route: Option<&Route>) -> V
                 node_id: Some(s.node_id.to_string()),
                 layers: s.layers.to_string(),
                 backend: Some(r.backends[i].clone()).filter(|b| !b.is_empty()),
+                cloaked: s.cloaked,
+                fenced: s.fenced.clone(),
             });
         }
     }
@@ -1122,6 +1142,8 @@ fn route_entries(head: LayerRange, tail: LayerRange, route: Option<&Route>) -> V
         node_id: None,
         layers: tail.to_string(),
         backend: None,
+        cloaked: false,
+        fenced: None,
     });
     out
 }

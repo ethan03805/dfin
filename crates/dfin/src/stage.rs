@@ -867,7 +867,8 @@ impl Stage {
             | Request::RelayAttach { .. }
             | Request::RelayListen
             | Request::Announce { .. }
-            | Request::DirectoryGet => {
+            | Request::DirectoryGet
+            | Request::Probe { .. } => {
                 error(ErrorCode::BadRequest, "this node is a stage, not a relay or hub")
             }
         }

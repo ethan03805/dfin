@@ -161,7 +161,7 @@ version, one to eight addresses, text lengths, a middle layer range inside the m
 lifetime of at most an hour, a time stamp within ten minutes of its clock), dials the
 first address pinned to the node id and pings it three times, and refuses the
 announcement if it does not answer (`Unreachable`). It keeps the best ping as
-`hub_rtt_ms`, the first evidence for region fencing. Records are dropped when they
+`hub_rtt_ms`, one vantage point; section 14 adds more. Records are dropped when they
 expire. `DirectoryGet` returns a `Directory` (hub id, `issued_at`, entries sorted by node
 id, each a signed record plus the hub's observations) signed by the hub under the domain
 `dfin-directory-v1`. With `--http`, the same list is served as JSON for people.
@@ -267,6 +267,43 @@ before layer 93 is 13 vectors, so a late boundary moves thirteen times the bytes
 plain one, as the Phase 0 findings predicted. The directory record still names the
 model's `n_embd`; the per-boundary widths follow from the model and the layer range.
 
+## 14. Region fencing
+
+The directory's `hub_rtt_ms` is one vantage point. Fencing needs several, so a hub can
+be given **probes**: `dfin probe --region <label> --allow <hub id>` is a small node that
+answers `Probe { addr, node_id }` from an allowed asker by dialing `addr` pinned to
+`node_id`, pinging it three times, and replying `Probed { rtt_ms, region }` with the best
+round trip and its own label. It answers nobody else (`BadRequest`), caps how many
+probes it runs per minute (`RateLimited`), and reports `Unreachable` when the target
+does not answer. With no `--allow` it answers anyone and says so in its log, which makes
+it a scanner for whoever finds it; a public probe should always carry an allow list.
+
+The hub (`--probe host:port/<probe id>`, repeatable) asks every probe about each
+announcing node after its own reachability check, in sequence, and stores the answers in
+the entry as `probes: Vec<ProbeRtt { probe_id, region, rtt_ms }>`; `--region <label>` on
+the hub makes its own ping count as a probe in that region. A cloaked node gets no
+measurements: its address is a relay's, so any round trip would place the relay. Probes
+that fail or refuse are left out rather than failing the announcement. The signed
+directory and the JSON view both carry the list.
+
+The client turns the evidence into a policy with `--region <label>:<ms>`: a node is
+inside the fence only if it is not cloaked, at least one probe labelled `<label>`
+measured it, and every such probe measured it at or under `<ms>`. The route is chosen
+from the nodes inside the fence by the usual rule (fewest hops, then lowest hub round
+trip), and if no chain remains the client says how many usable nodes the fence excluded
+and refuses to start, or to reroute. `/status` shows the fence in force, the count it
+excluded, and on each hop `fenced: "<label>"` or `cloaked: true`.
+
+What a fence proves is what design v0.2 section 9 says it proves: light in fibre allows
+about 100 km per millisecond of round trip, so a node that every probe in a region
+reaches within a bound has its network interface within that distance of all of them.
+It says nothing about where the computation runs; a fenced node could forward
+activations anywhere. Attestation (phase 2) is what closes that gap. Nor does the fence
+defend against a hub that lies: the client trusts the hub it pinned for the whole
+directory already, and probe results are part of that trust. A hub operator who wants
+to be checked publishes the probe ids, and a later version can let clients ask the
+probes themselves.
+
 ## 8. Status, 6 November 2026
 
 Built and tested: identities, transport, sealed records, route setup, forwarding, all
@@ -275,9 +312,9 @@ routing with rerouting when a stage dies (section 10), cloaked nodes (section 11
 limits in section 2 except fuzzing. Verified with the tiny model (unit, protocol and
 end-to-end tests in every mode, including a hub, a stage killed mid-run, and a cloaked
 stage behind a relay) and on GLM-4.7-Flash on one machine (`docs/phase1-findings.md`).
-Weight shards (section 12) and wide stage state (section 13) are in too. Not yet done
-from the phase 1 list: replay-log failover of a live session, region fencing from several
-vantage points.
+Weight shards (section 12), wide stage state (section 13) and region fencing with
+`dfin probe` (section 14) are in too. Not yet done from the phase 1 list: replay-log
+failover of a live session, fuzzing of the frame decoders.
 
 ## 9. What changed from Phase 0 and why
 

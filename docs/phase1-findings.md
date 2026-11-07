@@ -162,9 +162,36 @@ be learned on the way: GLM-5-next's attention is nope-only (rope dimension count
 k-pool indexer inputs without consuming them, so their `set_input` must skip
 unallocated tensors, the same guard Phase 0 added for the hybrid memory inputs.
 
-## 9. Phase 1 scope still open
+## 9. Region fencing (6 November 2026, night)
 
-Failover of a live session without losing its context, region fencing from several
-vantage points, fuzzing of the frame decoders. The Linux build, a CPU-only container image (136 MB)
+A hub can now be given vantage points. `dfin probe` is a node of its own: it holds a key,
+a region label and a list of hubs allowed to ask it, and on request it pings a node
+three times and answers with the best round trip and its label. The hub asks every probe
+about each announcing node and publishes the answers in the entry beside its own ping;
+cloaked nodes get none, since only their relay could be timed. The client's
+`--region us:50` keeps the nodes that at least one probe labelled `us` has measured and
+that every such probe reached within 50 ms, picks the route among those, and refuses to
+start or reroute when none remain, saying how many the fence excluded. `/status` shows
+the fence and marks each hop as fenced or cloaked.
+
+The end-to-end test runs a hub standing in `us`, a `us` probe and an `eu` probe that
+adds 100 ms to what it measures (a hidden test flag that stands in for distance), and
+one stage: the directory lists three measurements for it, a client fenced to `us:50`
+generates the reference text and reports the hop as fenced, and a client fenced to
+`eu:50` stops with the count of nodes outside the fence. A unit test covers the rule
+itself: a node that one probe in the region reaches in time and another does not is
+out, a node with no probe in the region is out, a cloaked node is out even when probed.
+
+What the fence is and is not: it bounds the node's network interface to within about
+100 km per millisecond of every probe in the region, which with probes on both US
+coasts is a continent-level statement. It does not say where the computation happens,
+and it rests on the hub telling the truth about what its probes said, which is already
+the trust the client places in the hub it pinned. Letting clients query probes directly,
+and probes signing their answers, are the obvious next steps if hubs are ever run by
+people other than the probe operators.
+
+## 10. Phase 1 scope still open
+
+Failover of a live session without losing its context, fuzzing of the frame decoders. The Linux build, a CPU-only container image (136 MB)
 and continuous integration on GitHub Actions landed in pull request 1 (6.5 minutes
 cold; the Windows-generated bindings compile unchanged on Linux x86-64).

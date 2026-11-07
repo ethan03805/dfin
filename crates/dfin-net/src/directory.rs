@@ -133,6 +133,7 @@ mod tests {
                 record: sign_record(&node, &record(&node)).unwrap(),
                 hub_rtt_ms: 1.5,
                 seen_at: 1_800_000_000,
+                probes: vec![],
             }],
         };
         let signed = sign_directory(&hub, &dir).unwrap();

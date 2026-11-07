@@ -59,6 +59,10 @@ pub struct ClientArgs {
     /// Where the last verified directory is kept, so routing survives a hub outage.
     #[arg(long, default_value = "dfin-directory.cache")]
     pub directory_cache: PathBuf,
+    /// Only use directory nodes that every probe labelled `region` reaches within `ms`,
+    /// written `region:ms` (e.g. `us:50`). Cloaked nodes are never inside a fence.
+    #[arg(long, value_parser = parse_fence)]
+    pub region: Option<crate::config::RegionFence>,
     /// Route TOML (model, head, tail, stages) instead of the flags above.
     #[arg(long)]
     pub route: Option<PathBuf>,
@@ -124,6 +128,10 @@ fn parse_hub(s: &str) -> Result<dfin_proto::NextHop, String> {
     crate::config::parse_node_addr(s).map_err(|e| format!("hub {e}"))
 }
 
+fn parse_fence(s: &str) -> Result<crate::config::RegionFence, String> {
+    s.parse()
+}
+
 fn parse_act_dtype(s: &str) -> Result<ActDtype, String> {
     s.parse()
 }
@@ -184,6 +192,7 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
         },
         hub: args.hub.clone(),
         directory_cache: Some(args.directory_cache.clone()),
+        fence: args.region.clone(),
         n_ctx: args.n_ctx,
         n_gpu_layers: args.n_gpu_layers,
         cpu_tensors: args.cpu_tensors.clone(),

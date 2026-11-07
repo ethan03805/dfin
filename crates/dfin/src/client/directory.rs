@@ -5,7 +5,7 @@
 //! of hub-measured round trips, then chance, so that two clients with the same
 //! directory do not all pile onto one node.
 
-use crate::config::{LayerRange, StageEndpoint};
+use crate::config::{LayerRange, RegionFence, StageEndpoint};
 use dfin_net::directory::{verify_directory, verify_record};
 use dfin_net::transport::CONTROL_TIMEOUT;
 use dfin_net::{Endpoint, NodeId};
@@ -25,6 +25,9 @@ pub struct DirectoryInfo {
     pub from_cache: bool,
     pub nodes_listed: usize,
     pub nodes_usable: usize,
+    /// The region fence in force, as `region:ms`, and how many usable nodes it excluded.
+    pub fence: Option<String>,
+    pub nodes_fenced_out: usize,
 }
 
 /// Fetch the hub's directory over QUIC (pinned to the hub's key) and verify it.
@@ -81,6 +84,25 @@ pub fn save_cache(path: &Path, signed: &SignedDirectory) {
 struct Candidate {
     record: NodeRecord,
     rtt_ms: f32,
+    probes: Vec<dfin_proto::ProbeRtt>,
+}
+
+/// Does every probe labelled with the fence's region reach the node in time? A node
+/// with no probe in that region, or a cloaked node, is never inside a fence.
+fn inside(c: &Candidate, fence: &RegionFence) -> bool {
+    if c.record.cloaked {
+        return false;
+    }
+    let mut seen = false;
+    for p in &c.probes {
+        if p.region == fence.region {
+            seen = true;
+            if !(p.rtt_ms <= fence.max_rtt_ms) {
+                return false;
+            }
+        }
+    }
+    seen
 }
 
 fn candidates(
@@ -106,6 +128,7 @@ fn candidates(
         out.push(Candidate {
             record,
             rtt_ms: e.hub_rtt_ms,
+            probes: e.probes.clone(),
         });
     }
     (dir.entries.len(), out)
@@ -117,8 +140,18 @@ struct Path_ {
     rtt_sum: f32,
 }
 
+/// What `select_route` found.
+pub struct Selection {
+    pub route: Option<Vec<StageEndpoint>>,
+    pub listed: usize,
+    pub usable: usize,
+    /// Usable nodes a region fence excluded.
+    pub fenced_out: usize,
+}
+
 /// Choose a chain tiling `[begin, end)`; nodes in `exclude` are avoided when any other
-/// chain exists. Returns the route and how many listed records were usable.
+/// chain exists; with a `fence`, only nodes inside it are considered at all.
+#[allow(clippy::too_many_arguments)]
 pub fn select_route(
     dir: &Directory,
     now: u64,
@@ -127,9 +160,15 @@ pub fn select_route(
     begin: i32,
     end: i32,
     exclude: &HashSet<NodeId>,
-) -> (Option<Vec<StageEndpoint>>, usize, usize) {
-    let (listed, cands) = candidates(dir, now, fingerprint, n_embd);
-    let usable = cands.len();
+    fence: Option<&RegionFence>,
+) -> Selection {
+    let (listed, all) = candidates(dir, now, fingerprint, n_embd);
+    let usable = all.len();
+    let cands: Vec<Candidate> = match fence {
+        Some(f) => all.into_iter().filter(|c| inside(c, f)).collect(),
+        None => all,
+    };
+    let fenced_out = usable - cands.len();
     let pick = |excluded: &HashSet<NodeId>| -> Option<Vec<StageEndpoint>> {
         // Dynamic programme over the cursor: best known chain ending at each layer.
         let mut best: HashMap<i32, Path_> = HashMap::new();
@@ -185,6 +224,8 @@ pub fn select_route(
                         addr: r.addrs[0].clone(),
                         node_id: NodeId(r.node_id),
                         layers: LayerRange::new(r.layer_begin, r.layer_end),
+                        cloaked: r.cloaked,
+                        fenced: fence.map(|f| f.region.clone()),
                     }
                 })
                 .collect(),
@@ -197,7 +238,12 @@ pub fn select_route(
             pick(&HashSet::new())
         }
     });
-    (route, listed, usable)
+    Selection {
+        route,
+        listed,
+        usable,
+        fenced_out,
+    }
 }
 
 #[cfg(test)]
@@ -232,7 +278,24 @@ mod tests {
             record: sign_record(key, &record).unwrap(),
             hub_rtt_ms: rtt,
             seen_at: 1000,
+            probes: vec![],
         }
+    }
+
+    fn probed(mut e: DirectoryEntry, probes: &[(&str, f32)]) -> DirectoryEntry {
+        e.probes = probes
+            .iter()
+            .map(|(region, rtt_ms)| dfin_proto::ProbeRtt {
+                probe_id: [7; 32],
+                region: region.to_string(),
+                rtt_ms: *rtt_ms,
+            })
+            .collect();
+        e
+    }
+
+    fn sel(d: &Directory, begin: i32, end: i32, exclude: &HashSet<NodeId>, fence: Option<&RegionFence>) -> Option<Vec<StageEndpoint>> {
+        select_route(d, 1010, "fp", 64, begin, end, exclude, fence).route
     }
 
     fn dir(entries: Vec<DirectoryEntry>) -> Directory {
@@ -269,28 +332,64 @@ mod tests {
             entry(&other, 2, 6, 0.1, "zz"),
             stale_e,
         ]);
-        let (route, listed, usable) =
-            select_route(&d_, 1010, "fp", 64, 2, 6, &HashSet::new());
-        assert_eq!((listed, usable), (6, 4));
-        let route = route.unwrap();
+        let s = select_route(&d_, 1010, "fp", 64, 2, 6, &HashSet::new(), None);
+        assert_eq!((s.listed, s.usable, s.fenced_out), (6, 4, 0));
+        let route = s.route.unwrap();
         assert_eq!(route.len(), 1);
         assert_eq!(route[0].node_id, c.id(), "one hop beats two, lower rtt beats higher");
 
         let exclude: HashSet<NodeId> = [c.id()].into_iter().collect();
-        let (route, _, _) = select_route(&d_, 1010, "fp", 64, 2, 6, &exclude);
-        assert_eq!(route.unwrap()[0].node_id, d.id());
+        assert_eq!(sel(&d_, 2, 6, &exclude, None).unwrap()[0].node_id, d.id());
 
         let exclude: HashSet<NodeId> = [c.id(), d.id()].into_iter().collect();
-        let (route, _, _) = select_route(&d_, 1010, "fp", 64, 2, 6, &exclude);
-        let route = route.unwrap();
+        let route = sel(&d_, 2, 6, &exclude, None).unwrap();
         assert_eq!(route.len(), 2);
         assert_eq!((route[0].node_id, route[1].node_id), (a.id(), b.id()));
 
         // Nothing covers 2:7; and excluding everything falls back to the best chain.
-        let (route, _, _) = select_route(&d_, 1010, "fp", 64, 2, 7, &HashSet::new());
-        assert!(route.is_none());
+        assert!(sel(&d_, 2, 7, &HashSet::new(), None).is_none());
         let all: HashSet<NodeId> = [a.id(), b.id(), c.id(), d.id()].into_iter().collect();
-        let (route, _, _) = select_route(&d_, 1010, "fp", 64, 2, 6, &all);
-        assert_eq!(route.unwrap()[0].node_id, c.id());
+        assert_eq!(sel(&d_, 2, 6, &all, None).unwrap()[0].node_id, c.id());
+    }
+
+    #[test]
+    fn region_fence_keeps_only_nodes_every_probe_reaches_in_time() {
+        let near = NodeKey::generate(); // 2:6, reached fast from both us probes
+        let far = NodeKey::generate(); // 2:6, fast from us-east, slow from us-west
+        let unknown = NodeKey::generate(); // 2:6, no probe data
+        let cloaked = NodeKey::generate(); // 2:6, cloaked, even if probed
+        let mut cl = entry(&cloaked, 2, 6, 0.1, "fp");
+        cl.record = sign_record(
+            &cloaked,
+            &NodeRecord {
+                cloaked: true,
+                ..verify_record(&cl.record).unwrap()
+            },
+        )
+        .unwrap();
+        let d_ = dir(vec![
+            probed(entry(&near, 2, 6, 5.0, "fp"), &[("us", 20.0), ("us", 35.0), ("eu", 90.0)]),
+            probed(entry(&far, 2, 6, 1.0, "fp"), &[("us", 10.0), ("us", 70.0)]),
+            entry(&unknown, 2, 6, 0.5, "fp"),
+            probed(cl, &[("us", 1.0)]),
+        ]);
+        // No fence: the lowest hub round trip wins (the cloaked one).
+        assert_eq!(sel(&d_, 2, 6, &HashSet::new(), None).unwrap()[0].node_id, cloaked.id());
+        // us:50 admits only the near node: far fails its second probe, unknown has none,
+        // cloaked is never inside a fence.
+        let fence: RegionFence = "us:50".parse().unwrap();
+        let s = select_route(&d_, 1010, "fp", 64, 2, 6, &HashSet::new(), Some(&fence));
+        let route = s.route.unwrap();
+        assert_eq!(route[0].node_id, near.id());
+        assert_eq!(route[0].fenced.as_deref(), Some("us"));
+        assert_eq!(s.fenced_out, 3);
+        // us:80 admits far as well, and it has the lower hub round trip.
+        let fence: RegionFence = "us:80".parse().unwrap();
+        assert_eq!(sel(&d_, 2, 6, &HashSet::new(), Some(&fence)).unwrap()[0].node_id, far.id());
+        // eu:50 admits nobody.
+        let fence: RegionFence = "eu:50".parse().unwrap();
+        assert!(sel(&d_, 2, 6, &HashSet::new(), Some(&fence)).is_none());
+        assert!("us".parse::<RegionFence>().is_err());
+        assert!("us:0".parse::<RegionFence>().is_err());
     }
 }

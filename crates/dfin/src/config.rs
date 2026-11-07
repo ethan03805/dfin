@@ -70,6 +70,12 @@ pub struct StageEndpoint {
     /// The stage's node id; the connection is refused if another key answers.
     pub node_id: NodeId,
     pub layers: LayerRange,
+    /// The address is a relay's; the node cannot be placed (from the directory).
+    #[serde(default)]
+    pub cloaked: bool,
+    /// The region fence this node satisfied when it was chosen (from the directory).
+    #[serde(default)]
+    pub fenced: Option<String>,
 }
 
 impl FromStr for StageEndpoint {
@@ -93,6 +99,8 @@ impl FromStr for StageEndpoint {
             addr: addr.to_string(),
             node_id,
             layers: layers.parse()?,
+            cloaked: false,
+            fenced: None,
         })
     }
 }
@@ -162,6 +170,8 @@ impl RouteConfig {
                 addr: s.addr.clone(),
                 node_id: s.node_id,
                 layers: s.layers,
+                cloaked: false,
+                fenced: None,
             })
             .collect()
     }
@@ -214,6 +224,36 @@ pub mod layer_range_str {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<LayerRange, D::Error> {
         let s = String::deserialize(d)?;
         s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parse a bare node id (64 hex characters).
+pub fn parse_node_id(s: &str) -> Result<NodeId, String> {
+    s.parse::<NodeId>().map_err(|e| format!("{s:?}: {e}"))
+}
+
+/// A region requirement: every probe labelled `region` must reach the node within
+/// `max_rtt_ms`. Written `region:ms`, e.g. `us:50`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionFence {
+    pub region: String,
+    pub max_rtt_ms: f32,
+}
+
+impl FromStr for RegionFence {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (region, ms) = s
+            .rsplit_once(':')
+            .ok_or_else(|| format!("region fence {s:?} must look like region:ms, e.g. us:50"))?;
+        let max_rtt_ms: f32 = ms.trim().parse().map_err(|_| format!("bad milliseconds {ms:?}"))?;
+        if region.is_empty() || !(max_rtt_ms > 0.0) {
+            return Err(format!("region fence {s:?} needs a label and a positive bound"));
+        }
+        Ok(RegionFence {
+            region: region.to_string(),
+            max_rtt_ms,
+        })
     }
 }
 

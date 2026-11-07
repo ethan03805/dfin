@@ -185,6 +185,20 @@ impl Procs {
         }
     }
 
+    /// Wait for a process to exit on its own; returns its log.
+    async fn wait_exit(&mut self, i: usize, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(_)) = self.0[i].child.try_wait() {
+                return std::fs::read_to_string(&self.0[i].log).unwrap_or_default();
+            }
+            if Instant::now() > deadline {
+                panic!("{} did not exit\n{}", self.0[i].name, self.logs());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     async fn wait_stage(&mut self, i: usize, port: u16, id: NodeId, timeout: Duration) {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let probe = Endpoint::client(NodeKey::generate()).unwrap();
@@ -959,4 +973,138 @@ async fn stage_fetches_its_shards_from_a_peer() {
     assert!(files.contains(&"tiny-llama-f32-00002-of-00011.gguf".to_string()), "{files:?}");
     let _ = std::fs::remove_dir_all(&bdir);
     let _ = std::fs::remove_dir_all(&fdir);
+}
+
+/// Region fencing: a hub with two vantage points (one "us" at no added delay, one "eu"
+/// that reports 100 ms more) publishes per-probe round trips; a client fenced to
+/// `us:50` routes through the stage and says so, a client fenced to `eu:50` finds no
+/// route and stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn region_fence_from_two_vantage_points() {
+    if should_skip() {
+        return;
+    }
+    let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
+    let model = model_path().display().to_string();
+    let probe = Endpoint::client(NodeKey::generate()).unwrap();
+    let mut procs = Procs::default();
+
+    // Two probes, allowed to answer the hub only.
+    let hub_key = StageKey::new("hub");
+    let (pu_port, pe_port) = (free_udp_port(), free_udp_port());
+    let (pu_key, pe_key) = (StageKey::new("probe-us"), StageKey::new("probe-eu"));
+    let pu_args: Vec<String> = [
+        "probe", "--listen", &format!("127.0.0.1:{pu_port}"),
+        "--identity", &pu_key.path.display().to_string(),
+        "--region", "us", "--allow", &hub_key.id.to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let pe_args: Vec<String> = [
+        "probe", "--listen", &format!("127.0.0.1:{pe_port}"),
+        "--identity", &pe_key.path.display().to_string(),
+        "--region", "eu", "--allow", &hub_key.id.to_string(),
+        "--add-delay-ms", "100",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let pu = procs.spawn("probe-us", &pu_args);
+    let pe = procs.spawn("probe-eu", &pe_args);
+    procs.wait_stage(pu, pu_port, pu_key.id, Duration::from_secs(60)).await;
+    procs.wait_stage(pe, pe_port, pe_key.id, Duration::from_secs(60)).await;
+
+    // The hub stands in "us" too, so "us" has two vantage points and "eu" one.
+    let hub_port = free_udp_port();
+    let hub_http = free_port();
+    let hub_addr = format!("127.0.0.1:{hub_port}");
+    let hub_args: Vec<String> = [
+        "hub", "--listen", &hub_addr, "--identity", &hub_key.path.display().to_string(),
+        "--http", &format!("127.0.0.1:{hub_http}"), "--region", "us",
+        "--probe", &format!("127.0.0.1:{pu_port}/{}", pu_key.id),
+        "--probe", &format!("127.0.0.1:{pe_port}/{}", pe_key.id),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let hi = procs.spawn("hub", &hub_args);
+    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(60)).await;
+    let hub_flag = format!("{hub_addr}/{}", hub_key.id);
+
+    let k1 = StageKey::new("s1");
+    let p1 = free_udp_port();
+    let args1: Vec<String> = [
+        "stage", "--model", &model, "--layers", "2:6",
+        "--listen", &format!("127.0.0.1:{p1}"),
+        "--identity", &k1.path.display().to_string(),
+        "--hub", &hub_flag, "--announce-every", "5",
+        "--n-gpu-layers", "0", "--act-dtype", "f32",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let s1 = procs.spawn("stage1", &args1);
+    procs.wait_stage(s1, p1, k1.id, Duration::from_secs(120)).await;
+    wait_listed(&probe, &hub_addr, hub_key.id, 1, &procs).await;
+
+    // The hub's JSON view carries one measurement per vantage point.
+    let listing: Value = reqwest::get(format!("http://127.0.0.1:{hub_http}/directory"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let node = &listing["nodes"][0];
+    assert_eq!(node["node_id"], k1.id.to_string(), "{listing:#}");
+    let probes = node["probes"].as_array().unwrap_or_else(|| panic!("{listing:#}"));
+    assert_eq!(probes.len(), 3, "{listing:#}");
+    let rtt = |region: &str, who: &str| -> f32 {
+        probes
+            .iter()
+            .find(|p| p["region"] == region && p["probe"] == who)
+            .unwrap_or_else(|| panic!("no {region} probe {who}: {listing:#}"))["rtt_ms"]
+            .as_f64()
+            .unwrap() as f32
+    };
+    assert!(rtt("us", &hub_key.id.short()) < 50.0, "{listing:#}");
+    assert!(rtt("us", &pu_key.id.short()) < 50.0, "{listing:#}");
+    assert!(rtt("eu", &pe_key.id.short()) >= 100.0, "{listing:#}");
+
+    // Fenced to us:50 the client routes, and /status says which fence the hop passed.
+    let pc = free_port();
+    let cache = std::env::temp_dir().join(format!("dfin-e2e-fence-{}.cache", std::process::id()));
+    let _ = std::fs::remove_file(&cache);
+    let client_args = |port: u16, fence: &str| -> Vec<String> {
+        [
+            "client", "--model", &model, "--head", "0:2", "--tail", "6:end",
+            "--hub", &hub_flag, "--directory-cache", &cache.display().to_string(),
+            "--region", fence,
+            "--n-gpu-layers", "0", "--act-dtype", "f32", "--max-sessions", "2", "--n-ctx", "512",
+            "--listen", &format!("127.0.0.1:{port}"),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    };
+    let ci = procs.spawn("client-us", &client_args(pc, "us:50"));
+    let base = format!("http://127.0.0.1:{pc}");
+    procs.wait_health(ci, &base, Duration::from_secs(120)).await;
+    exercise(&procs, &base, &expected).await;
+    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    assert_eq!(status["route"].as_array().unwrap().len(), 3, "{status:#}");
+    assert_eq!(status["route"][1]["fenced"], "us", "{status:#}");
+    assert_eq!(status["directory"]["fence"], "us:50", "{status:#}");
+    assert_eq!(status["directory"]["nodes_fenced_out"], 0, "{status:#}");
+    procs.kill(ci);
+
+    // Fenced to eu:50 nothing qualifies: the client reports it and stops.
+    let pc2 = free_port();
+    let c2 = procs.spawn("client-eu", &client_args(pc2, "eu:50"));
+    let log = procs.wait_exit(c2, Duration::from_secs(120)).await;
+    assert!(
+        log.contains("1 outside the fence eu:50"),
+        "client-eu did not refuse the route:\n{log}"
+    );
+    let _ = std::fs::remove_file(&cache);
 }

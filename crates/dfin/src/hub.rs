@@ -6,6 +6,7 @@
 //! routes: clients build their own from the list, so a hub cannot steer a user onto
 //! chosen nodes. Protocol: `docs/phase1-protocol.md` section 10.
 
+use crate::config::parse_node_addr;
 use anyhow::Context as _;
 use axum::extract::State;
 use axum::routing::get;
@@ -15,8 +16,8 @@ use dfin_net::directory::{sign_directory, verify_record};
 use dfin_net::transport::{reply, CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
 use dfin_net::{Connection, Endpoint, NodeId, NodeKey};
 use dfin_proto::{
-    read_frame_max, Directory, DirectoryEntry, ErrorCode, NodeRecord, Request, Response,
-    SignedRecord, MAX_CLOCK_SKEW_SECS, MAX_RECORD_TTL_SECS, PROTOCOL_VERSION,
+    read_frame_max, Directory, DirectoryEntry, ErrorCode, NextHop, NodeRecord, ProbeRtt, Request,
+    Response, SignedRecord, MAX_CLOCK_SKEW_SECS, MAX_RECORD_TTL_SECS, PROTOCOL_VERSION,
 };
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -44,6 +45,13 @@ pub struct HubArgs {
     /// Seconds allowed for the reachability probe of an announcing node.
     #[arg(long, default_value_t = 5)]
     pub probe_timeout: u64,
+    /// A vantage point (`host:port/<node id>` of a `dfin probe`) asked to ping every
+    /// announcing node. Repeatable.
+    #[arg(long = "probe", value_parser = parse_node_addr)]
+    pub probes: Vec<NextHop>,
+    /// Region label of the hub's own vantage point; with it the hub's ping counts as a probe.
+    #[arg(long)]
+    pub region: Option<String>,
 }
 
 pub fn unix_now() -> u64 {
@@ -58,6 +66,7 @@ struct Entry {
     signed: SignedRecord,
     hub_rtt_ms: f32,
     seen_at: u64,
+    probes: Vec<ProbeRtt>,
 }
 
 pub struct Hub {
@@ -65,6 +74,10 @@ pub struct Hub {
     entries: Mutex<HashMap<NodeId, Entry>>,
     max_records: usize,
     probe_timeout: Duration,
+    probes: Vec<NextHop>,
+    region: Option<String>,
+    /// Connections to probes, reused across announcements.
+    probe_conns: tokio::sync::Mutex<HashMap<NodeId, Connection>>,
 }
 
 pub async fn run(args: HubArgs) -> anyhow::Result<()> {
@@ -87,7 +100,13 @@ pub async fn run(args: HubArgs) -> anyhow::Result<()> {
         entries: Mutex::new(HashMap::new()),
         max_records: args.max_records.max(1),
         probe_timeout: Duration::from_secs(args.probe_timeout.max(1)),
+        probes: args.probes.clone(),
+        region: args.region.clone(),
+        probe_conns: tokio::sync::Mutex::new(HashMap::new()),
     });
+    if !args.probes.is_empty() {
+        info!("{} vantage point(s) configured", args.probes.len());
+    }
 
     if let Some(http) = &args.http {
         let app = Router::new()
@@ -160,6 +179,11 @@ async fn http_directory(State(hub): State<Arc<Hub>>) -> Json<Value> {
                 "attested": r.attested,
                 "cloaked": r.cloaked,
                 "hub_rtt_ms": e.hub_rtt_ms,
+                "probes": e.probes.iter().map(|p| json!({
+                    "region": p.region,
+                    "rtt_ms": p.rtt_ms,
+                    "probe": NodeId(p.probe_id).short(),
+                })).collect::<Vec<_>>(),
                 "seen_secs_ago": now.saturating_sub(e.seen_at),
                 "expires_in_secs": r.expires_at().saturating_sub(now),
             })
@@ -280,12 +304,26 @@ impl Hub {
                 )
             }
         };
+        // Vantage points: the hub's own ping if it has a region, then every probe. A
+        // cloaked node's address is a relay's, so it gets no measurements at all.
+        let mut probes = Vec::new();
+        if !record.cloaked {
+            if let Some(region) = &self.region {
+                probes.push(ProbeRtt {
+                    probe_id: *self.endpoint.node_id().as_bytes(),
+                    region: region.clone(),
+                    rtt_ms: rtt,
+                });
+            }
+            probes.extend(self.ask_probes(&record.addrs[0], id).await);
+        }
         info!(
             node = %id.short(),
             addr = %record.addrs[0],
             layers = format!("{}:{}", record.layer_begin, record.layer_end),
             model = %record.model_name,
             rtt_ms = format!("{rtt:.2}"),
+            probes = probes.len(),
             "announce"
         );
         self.entries.lock().insert(
@@ -295,9 +333,60 @@ impl Hub {
                 signed,
                 hub_rtt_ms: rtt,
                 seen_at: now,
+                probes,
             },
         );
         Response::Ack
+    }
+
+    /// Ask every configured probe about `addr`; probes that fail are left out.
+    async fn ask_probes(&self, addr: &str, id: NodeId) -> Vec<ProbeRtt> {
+        let mut out = Vec::new();
+        for p in &self.probes {
+            let pid = NodeId(p.node_id);
+            let conn = {
+                let mut conns = self.probe_conns.lock().await;
+                match conns.get(&pid).filter(|c| !c.is_closed()) {
+                    Some(c) => c.clone(),
+                    None => match self.endpoint.connect(&p.addr, pid).await {
+                        Ok(c) => {
+                            conns.insert(pid, c.clone());
+                            c
+                        }
+                        Err(e) => {
+                            warn!(probe = %p.addr, "cannot reach probe: {e}");
+                            continue;
+                        }
+                    },
+                }
+            };
+            let r: Result<Response, _> = conn
+                .call(
+                    &Request::Probe {
+                        addr: addr.to_string(),
+                        node_id: *id.as_bytes(),
+                    },
+                    MAX_CONTROL_FRAME,
+                    Duration::from_secs(15),
+                )
+                .await;
+            match r {
+                Ok(Response::Probed { rtt_ms, region }) => out.push(ProbeRtt {
+                    probe_id: *pid.as_bytes(),
+                    region,
+                    rtt_ms,
+                }),
+                Ok(Response::Error { code, message }) => {
+                    debug!(probe = %p.addr, ?code, "probe refused: {message}");
+                }
+                Ok(other) => warn!(probe = %p.addr, "unexpected probe reply {other:?}"),
+                Err(e) => {
+                    warn!(probe = %p.addr, "probe failed: {e}");
+                    self.probe_conns.lock().await.remove(&pid);
+                }
+            }
+        }
+        out
     }
 
     /// Best of three pings to `addr`, pinned to `id`; `None` if it does not answer.
@@ -338,6 +427,7 @@ impl Hub {
                         record: e.signed.clone(),
                         hub_rtt_ms: e.hub_rtt_ms,
                         seen_at: e.seen_at,
+                        probes: e.probes.clone(),
                     },
                 )
             })

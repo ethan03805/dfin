@@ -153,6 +153,8 @@ pub enum ErrorCode {
     BadTimestamp,
     /// The node does not hold the requested shard.
     NoSuchShard,
+    /// The node answers no more requests of this kind for now.
+    RateLimited,
 }
 
 /// Address and identity of a node to dial.
@@ -248,6 +250,8 @@ pub enum Request {
     Announce { record: SignedRecord },
     /// Anyone to hub: the current signed directory.
     DirectoryGet,
+    /// Hub to probe: ping `addr` (pinned to `node_id`) and report the round trip.
+    Probe { addr: String, node_id: [u8; 32] },
     /// Fetch `len` bytes at `offset` of shard `split` of the model with id `model_id`
     /// from a node that holds it. Replies `Shard`.
     ShardGet {
@@ -296,6 +300,8 @@ pub enum Response {
     Pong,
     /// The public `host:port` the relay forwards to the cloaked node.
     RelayListening { addr: String },
+    /// A probe's answer: best-of-three round trip and the probe's region label.
+    Probed { rtt_ms: f32, region: String },
     Directory { directory: SignedDirectory },
     /// A piece of a shard file; `total` is the file's full length.
     Shard {
@@ -365,6 +371,15 @@ pub struct SignedRecord {
     pub signature: Vec<u8>,
 }
 
+/// One vantage point's measurement of a node: best-of-three ping round trip from a
+/// probe standing in `region`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProbeRtt {
+    pub probe_id: [u8; 32],
+    pub region: String,
+    pub rtt_ms: f32,
+}
+
 /// One directory line: a node's signed record plus what the hub observed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
@@ -373,6 +388,9 @@ pub struct DirectoryEntry {
     pub hub_rtt_ms: f32,
     /// Unix seconds when the hub last accepted an announcement from this node.
     pub seen_at: u64,
+    /// Round trips from the hub's vantage points (empty for cloaked nodes, whose
+    /// addresses are relays).
+    pub probes: Vec<ProbeRtt>,
 }
 
 /// The hub's list. Signed by the hub (`SignedDirectory`).

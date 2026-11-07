@@ -7,6 +7,7 @@
 //!   learn the client's address.
 //! * `dfin hub`    publishes a signed directory of announced stages.
 //! * `dfin fetch`  downloads the shards a piece needs from nodes or seeds.
+//! * `dfin probe`  a vantage point that pings nodes for hubs.
 //! * `dfin pod`    launches stages plus a client on this machine for testing.
 //! * `dfin bench`  measures monolithic versus pipelined decode on this machine.
 
@@ -16,6 +17,7 @@ mod config;
 mod fetch;
 mod hub;
 mod pod;
+mod probe;
 mod relay;
 mod shards;
 mod stage;
@@ -49,6 +51,8 @@ enum Cmd {
     Hub(hub::HubArgs),
     /// Download the shards of a model that a layer range needs, from nodes or seeds.
     Fetch(fetch::FetchArgs),
+    /// A vantage point: ping nodes on a hub's request and report the round trip.
+    Probe(probe::ProbeArgs),
     /// Launch a local pod (stages plus client) on this machine.
     Pod(pod::PodArgs),
     /// Benchmark monolithic versus pipelined decode on this machine.
@@ -65,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Relay(args) => relay::run(args).await,
         Cmd::Hub(args) => hub::run(args).await,
         Cmd::Fetch(args) => fetch::run(args).await,
+        Cmd::Probe(args) => probe::run(args).await,
         Cmd::Pod(args) => pod::run(args).await,
         Cmd::Bench(args) => bench::run(args).await,
     }

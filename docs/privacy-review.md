@@ -135,6 +135,25 @@ Reference: Rust's [`create_new` semantics](https://doc.rust-lang.org/std/fs/stru
 
 **Scope:** this prevents honest software from adding or forwarding these details in errors. It cannot stop colluding or modified nodes from communicating what they observe, and does not conceal activations or traffic patterns. Client-facing errors from directly contacted peers still need to be treated as untrusted operational information.
 
+### P15 — Cancelled queued stage work still allocated model state
+
+**Status:** fixed; model-backed reproduction now passes. A stage handler could be
+cancelled while its forward waited in the native engine queue. The engine still
+performed that inference and allocated a session before processing the later
+disconnect cleanup. This wasted compute and could temporarily deny another client
+the last session slot.
+
+**Reproduction:** enqueue a forward whose response receiver has been dropped,
+then another client's live forward, then disconnect cleanup. With a real tiny
+model and one session slot, the original engine rejected the live request with
+`SessionLimit`. The corrected engine completes it. A second regression checks
+that a close request still frees existing state even if its receiver has gone.
+
+**Fix and limit:** discard cancelled forwards before native execution. Cleanup
+jobs still run. A native call already in progress cannot be interrupted by this
+check, and previously delivered activations cannot be recalled. This fixes queued
+work retention and availability; it does not conceal activations from the stage.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -213,6 +232,9 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | Multi-worker lifecycle validation | 24 adversarial tests, including 140 repeated disconnect/cancellation cycles | Passed; no new finding in this run |
 | Repeated multi-worker lifecycle validation | 32 rounds: 768 checks and 4,480 disconnect/cancellation cycles | All passed; no new finding in this run |
 | P01–P14 revision `062d7f2` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42403373198) | Both jobs passed |
+| P15 reproduction | Cancelled queued forward followed by a live client on a one-slot model engine | Failed as expected: the live request received `SessionLimit` |
+| P15 initial fix | 25 adversarial tests, including the model-backed queue reproduction | Passed; no fixture skips |
+| P01–P15 | Complete Windows release workspace, including cleanup after a cancelled close reply | 121 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.
 

@@ -245,19 +245,46 @@ const KNOWN_COMMON: &[&str] = &[
     "stream_options",
 ];
 
-/// Warn once per process for each request field we accept but ignore
-/// (`tools`, `tool_choice`, `response_format`, `logprobs`, `n`, penalties, `user`, ...).
-/// Tool-call parsing is a Phase 0 TODO.
+const UNSUPPORTED_COMMON: &[&str] = &[
+    "tools",
+    "tool_choice",
+    "response_format",
+    "logprobs",
+    "n",
+    "presence_penalty",
+    "frequency_penalty",
+    "user",
+];
+
+/// Return only static labels: arbitrary field names may carry private metadata,
+/// control characters, or unlimited distinct strings. Do not retain or log them.
+fn ignored_field_label(field: &str) -> Option<&'static str> {
+    if KNOWN_COMMON.contains(&field) || field == "prompt" || field == "messages" {
+        return None;
+    }
+    Some(
+        UNSUPPORTED_COMMON
+            .iter()
+            .copied()
+            .find(|known| *known == field)
+            .unwrap_or("unrecognized (name omitted)"),
+    )
+}
+
+/// Warn once for each recognized unsupported option and once for all other names.
 fn warn_ignored(extra: &Map<String, Value>) {
-    static WARNED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    static WARNED: OnceLock<std::sync::Mutex<HashSet<&'static str>>> = OnceLock::new();
     let set = WARNED.get_or_init(Default::default);
     let mut set = set.lock().unwrap_or_else(|e| e.into_inner());
     for k in extra.keys() {
-        if KNOWN_COMMON.contains(&k.as_str()) || k == "prompt" || k == "messages" {
+        let Some(label) = ignored_field_label(k) else {
             continue;
-        }
-        if set.insert(k.clone()) {
-            tracing::warn!("ignoring unsupported request field `{k}` (logged once)");
+        };
+        if set.insert(label) {
+            tracing::warn!(
+                field = label,
+                "ignoring unsupported request field (logged once)"
+            );
         }
     }
 }
@@ -553,6 +580,52 @@ fn final_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignored_request_field_names_do_not_enter_logs() {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        let mut extra = Map::new();
+        extra.insert("private-field-canary\n\u{1b}[31m".into(), Value::Null);
+        tracing::subscriber::with_default(subscriber, || warn_ignored(&extra));
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            !log.contains("private-field-canary"),
+            "request-controlled field name entered logs: {log:?}"
+        );
+        assert!(
+            !log.contains('\u{1b}'),
+            "request-controlled terminal escape entered logs"
+        );
+    }
+
+    #[test]
+    fn arbitrary_ignored_fields_share_one_static_warning_label() {
+        let labels: HashSet<_> = (0..10_000)
+            .filter_map(|i| ignored_field_label(&format!("private-field-{i}")))
+            .collect();
+        assert_eq!(labels, HashSet::from(["unrecognized (name omitted)"]));
+        assert_eq!(ignored_field_label("tools"), Some("tools"));
+        for supported in ["model", "messages", "prompt", "temperature"] {
+            assert!(ignored_field_label(supported).is_none());
+        }
+    }
 
     #[test]
     fn content_parts_concatenate_text() {

@@ -127,13 +127,18 @@ Hop 1 must have received `Hello` on the incoming connection. Later hops check th
 model fingerprint and the range from their sealed record instead; the hop-to-hop
 connection carries a `Hello` too, with the range `-1:-1` meaning "whatever you serve",
 which is how a hop learns its successor runs the same weights before it forwards
-anything. Hop-to-hop connections are reused across routes.
+anything. Each route owns its hop-to-hop connection; connections are not pooled
+across clients or routes.
 
 ## 5. Forwarding and return modes
 
 `Forward` enters at hop 1. Each hop runs its layers, appends its `HopStat`, and sends
 `Forward` with its output to the next hop. What happens at the last hop depends on
 the return mode in its record:
+
+The IP-visibility column below describes explicit direct transport. Tor hides the
+client's IP from dfin peers in every return mode; request timing, model state, and
+application identities remain visible according to each peer's role.
 
 | Mode | Last hop does | Hop i's reply upstream | Who learns the client's address |
 |---|---|---|---|

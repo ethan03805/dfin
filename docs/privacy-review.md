@@ -121,11 +121,18 @@ Reference: Rust's [`create_new` semantics](https://doc.rust-lang.org/std/fs/stru
 
 **Fix:** validate the expected destination key at the shared transport entry point before direct resolution/packets or SOCKS activity. Tests cover both Tor and explicit direct transport. This is early rejection of impossible identity pins, not a TLS authentication bypass or evidence of an IP leak; the existing handshake would still refuse the peer.
 
+### P13 — Unknown API field names were retained and logged
+
+**Status:** fixed; all 112 regular Windows tests pass. The API retained every distinct ignored JSON field name for the process lifetime and printed it in a warning. Field names are arbitrary client-supplied text. A captured-log regression showed a dummy private marker in the log; this test does not claim that ordinary prompt values were logged.
+
+**Fix:** warnings use a small fixed set of recognized unsupported option names and one generic label for all other names. Unknown names are neither copied into permanent warning state nor emitted. A regression checks that 10,000 distinct arbitrary names share one static label, and the captured-log test checks that the private marker is absent. Other operational metadata and error logs still exist as documented.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
 - TLS uses the node key from the certificate and verifies the handshake signature; pinning alone is not substituted for proof of key possession.
 - Sealed-route key exchange rejects non-contributory X25519 shared secrets.
+- Return-path client identifiers and relay tokens are already included only in the last hop's sealed record; intermediate records use reverse return mode.
 - Request sequence counters are already reset and directory lookups already use separate temporary identities.
 
 ## Test results
@@ -175,6 +182,9 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P01–P10 revision `86b3a46` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42401459065) | Both jobs passed, including Unix permissions and shard symlink regressions |
 | P12 reproduction | Weak raw destination identities with a valid onion target | Failed as expected: two proxy contacts before rejection |
 | P12 fix | Network unit and transport tests, including no direct packet / no proxy contact | 22 passed, 0 failed |
+| P13 reproduction | Arbitrary ignored request key with a dummy private marker | Failed as expected: marker appeared in captured logs |
+| P01–P13 | Complete Windows release workspace | 112 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| P01–P11 revision `b3b9c88` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42402118564) | Both jobs passed |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.
 

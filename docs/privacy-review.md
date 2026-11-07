@@ -163,6 +163,35 @@ work retention and availability; it does not conceal activations from the stage.
 - The local generation API already uses nonblocking bounded queue admission; it rejects a full queue instead of retaining unlimited waiting generation jobs.
 - Request sequence counters are already reset and directory lookups already use separate temporary identities.
 
+## Dependency advisory review
+
+On 7 November 2026, `cargo-audit 0.22.2` checked the workspace lockfile against
+[RustSec](https://github.com/RustSec/rustsec/tree/main/cargo-audit), database revision
+`309392b18f6b17022f82c701f300433126901068` (1,422 advisories). The initial 325-package
+scan reported no listed vulnerabilities and two maintenance warnings:
+
+- [RUSTSEC-2023-0089](https://rustsec.org/advisories/RUSTSEC-2023-0089.html):
+  `atomic-polyfill`, reached through Postcard's unused default `heapless` feature.
+  dfin uses standard vectors. Disabling that default feature removes six packages
+  from the lockfile without changing package versions or the wire format.
+- [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html):
+  `paste 1.0.15`, a build-time macro dependency of `tor-error 0.48.0`, through the
+  maintained Tor SOCKS library. It remains documented and unsuppressed. This is a
+  maintenance notice, not a reported exploitable vulnerability; dfin does not fork
+  Tor's dependency tree merely to hide it.
+
+After removal, the 319-package workspace scan and a separately resolved
+227-package fuzz-driver scan both report zero listed vulnerabilities and the one
+`paste` warning. CI now checks the committed workspace lockfile and the fuzz
+driver's generated lockfile before running those respective test suites. Listed
+vulnerabilities fail CI; maintenance warnings remain visible. The fuzz-driver
+lockfile remains generated/ignored as before, rather than committed.
+
+This scan covers RustSec's Rust-package advisories, not a source audit, native
+llama.cpp, the Tor executable, GPU drivers, or unknown vulnerabilities. The first
+attempt to scan the fuzz driver found no generated lockfile; generating it allowed
+the subsequent scan to run. That setup error is not counted as a passed scan.
+
 ## Concurrency validation
 
 The stage, hub, and download adversarial fixtures now run with two Tokio worker
@@ -235,6 +264,9 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P15 reproduction | Cancelled queued forward followed by a live client on a one-slot model engine | Failed as expected: the live request received `SessionLimit` |
 | P15 initial fix | 25 adversarial tests, including the model-backed queue reproduction | Passed; no fixture skips |
 | P01–P15 | Complete Windows release workspace, including cleanup after a cancelled close reply | 121 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| Dependency advisory scans | 319 workspace packages and 227 generated fuzz-driver packages | Zero listed vulnerabilities; one documented maintenance warning in each |
+| Dependency feature removal + P15 | Complete Windows release workspace | 121 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| Multi-worker revision `e8953e6` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42403925196) | Both jobs passed |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.
 

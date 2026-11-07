@@ -136,6 +136,41 @@ fn frame_limit_saturates_at_the_frame_cap() {
     assert_eq!(forward_frame_limit(2, 4), 32 + 65536);
 }
 
+/// What libFuzzer found second: the activation length check overflowed on a hostile
+/// shape. An overflowing shape is a shape error now, never a panic.
+#[test]
+fn hostile_activation_shapes_are_shape_errors() {
+    use dfin_proto::{ActDtype, Activations};
+    for (n_tokens, n_embd) in [(u32::MAX, u32::MAX), (u32::MAX, 2), (1 << 31, 1 << 31)] {
+        for dtype in [ActDtype::F16, ActDtype::F32] {
+            let act = Activations {
+                dtype,
+                n_tokens,
+                n_embd,
+                data: vec![0; 8],
+            };
+            assert!(act.to_f32().is_err(), "{n_tokens}x{n_embd} {dtype:?}");
+        }
+    }
+}
+
+/// What libFuzzer found next: postcard accepts a non-minimal varint, so `[0x82, 0x00]`
+/// also decodes as variant 2 (`Forward`) while its first byte is not the Forward tag.
+/// A stage refuses such a tag byte, and the frame target mirrors that.
+#[test]
+fn non_canonical_tags_are_refused() {
+    use dfin_proto::Request;
+    let mut body = postcard::to_stdvec(&seeds::requests()[3]).unwrap();
+    assert_eq!(body[0], Request::FORWARD_TAG);
+    body.splice(0..1, [0x80 | Request::FORWARD_TAG, 0x00]);
+    let decoded: Request = postcard::from_bytes(&body).expect("postcard accepts it");
+    assert!(matches!(decoded, Request::Forward { .. }));
+    let mut framed = vec![2u8];
+    framed.extend((body.len() as u32).to_le_bytes());
+    framed.extend(&body);
+    assert!(!dfin_fuzz::frame(&framed), "a non-canonical tag must be refused");
+}
+
 /// The stage's cheap size check keys on the first body byte: no request but `Forward`
 /// may start with the Forward tag, in any encoding the seeds produce.
 #[test]

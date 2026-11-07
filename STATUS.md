@@ -29,7 +29,7 @@ money) and 3 (scale) have not started.
 | Weight shards: per-layer split files with a hashed manifest, a loader that tolerates absent shards, nodes serving the shards they hold, fetching from directory peers or HTTP seeds | protocol section 10, `tools/shard_gguf.py` | End-to-end test of a stage fetching from a peer; GLM-4.7-Flash from shards matches the single file (f32) |
 | Stage state wider than one residual vector, for `glm5-next` hyper-connections and Kimi K3 attention-residual banks | protocol section 11 | Three-piece pipelines of tiny models match the whole model (`crates/dfin-llama/tests/wide_state.rs`) |
 | Region fencing: `dfin probe` vantage points, per-probe round trips in the directory, a client fence that excludes cloaked nodes | protocol section 12 | End-to-end test with two probes, one of them far |
-| Fuzzed decoders: a libFuzzer target per wire type, the same targets as ordinary tests, generated-value tests for route choice and the hub's checks, a fuzz run in CI | protocol section 13, `crates/dfin-fuzz`, `fuzz/` | CI's first run found an overflow in the frame-limit helper, fixed |
+| Fuzzed decoders: a libFuzzer target per wire type, the same targets as ordinary tests, generated-value tests for route choice and the hub's checks, a fuzz run in CI | protocol section 13, `crates/dfin-fuzz`, `fuzz/` | CI's first runs found two shape-arithmetic overflows and a tag ambiguity in the first second of fuzzing; all three fixed with regression tests (`docs/phase1-findings.md` section 10) |
 | Hardening: frame size limits by message type, read and idle timeouts, route and stream caps per connection | protocol section 2 | Protocol tests (`crates/dfin/tests/stage_proto.rs`) |
 
 ## Open

@@ -313,6 +313,12 @@ pub fn frame(data: &[u8]) -> bool {
         2 => MAX_CONTROL_FRAME,
         _ => MAX_DIRECTORY_BYTES,
     };
+    // A stage refuses a tag byte with the varint continuation bit set: postcard would
+    // accept the non-minimal encoding, but then the first byte no longer names the
+    // variant. Mirror that rule, so the tag check below is exact.
+    if stream.len() > 4 && stream[4] & 0x80 != 0 {
+        return false;
+    }
     let mut cursor = stream;
     match rt().block_on(read_frame_max::<_, Request>(&mut cursor, max)) {
         Ok(req) => {

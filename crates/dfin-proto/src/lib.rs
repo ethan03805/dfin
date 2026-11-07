@@ -94,14 +94,19 @@ impl Activations {
 
     /// Unpack to f32 (token-major).
     pub fn to_f32(&self) -> Result<Vec<f32>, ProtoError> {
-        let n = self.n_tokens as usize * self.n_embd as usize;
-        let expected = n * self.dtype.bytes_per_elem();
+        // Checked: a peer can claim any shape, and an overflowed product must not slip
+        // past the length check by wrapping to the right number.
+        let expected = (self.n_tokens as usize)
+            .checked_mul(self.n_embd as usize)
+            .and_then(|n| n.checked_mul(self.dtype.bytes_per_elem()))
+            .unwrap_or(usize::MAX);
         if self.data.len() != expected {
             return Err(ProtoError::BadActivationLength {
                 got: self.data.len(),
                 expected,
             });
         }
+        let n = self.data.len() / self.dtype.bytes_per_elem();
         let mut out = Vec::with_capacity(n);
         match self.dtype {
             ActDtype::F32 => {

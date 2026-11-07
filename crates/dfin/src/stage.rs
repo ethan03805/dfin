@@ -743,6 +743,12 @@ impl Stage {
             Ok(Err(e)) => return Err(ReadErr::Net(e.into())),
             Err(_) => return Err(ReadErr::Bad("timed out reading the request header".into())),
         };
+        // The tag is a postcard varint. A canonical one for this enum is a single byte
+        // below 0x80; a continuation bit means a non-minimal encoding, which postcard
+        // would accept but which makes the tag ambiguous. Refuse it outright.
+        if tag & 0x80 != 0 {
+            return Err(ReadErr::Bad("non-canonical request tag".into()));
+        }
         let (max, budget) = if tag == Request::FORWARD_TAG {
             (self.max_forward_frame(), FORWARD_READ_TIMEOUT)
         } else {

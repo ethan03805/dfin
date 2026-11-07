@@ -202,17 +202,30 @@ stable; running them needs nightly, which this machine does not have, so the fir
 fuzz runs are CI's: twenty seconds per target under the address sanitizer on each push,
 with anything found kept as an artifact that the ordinary tests replay.
 
-What the byte-level targets found. The smoke test found nothing. libFuzzer's first run
-in CI found a panic within a fifth of a second: `forward_frame_limit` multiplied the
-token count by the row width in 64 bits, which overflows for the values a hostile peer
-can advertise near the 32-bit limit; in a release build the product wrapped silently
-and the frame limit came out wrong. It saturates at the frame cap now. The lesson is in
-the numbers: a coverage-guided fuzzer with its dictionary of boundary values found in
-0.2 s what ten thousand random inputs per target did not, so the smoke test now salts
-its noise with boundary bytes, and the CI fuzz job is the one that counts. The decoders
-themselves held: postcard rejects what it cannot read without allocating for claimed
-lengths beyond the bytes it has; the sealed-box and signature checks refuse short or
-wrong input before any slice; the tunnel packet reader checks its minimum length first.
+What the byte-level targets found. The smoke test found nothing. libFuzzer's first two
+runs in CI found three things within seconds of starting, each in the first second of
+its target:
+
+- `forward_frame_limit` multiplied the token count by the row width in 64 bits, which
+  overflows for the values a hostile peer can advertise near the 32-bit limit; in a
+  release build the product wrapped silently and the frame limit came out wrong. It
+  saturates at the frame cap now.
+- The activation batch's expected byte length was the same multiplication, with the
+  same overflow, inside the length check that is supposed to refuse a malformed batch.
+  It is checked arithmetic now, and an overflow is a shape error.
+- postcard accepts a non-minimal varint, so a `Forward` whose tag is written as two
+  bytes (`0x82 0x00`) decodes as a `Forward` while its first byte is not the Forward
+  tag. The stage's cheap size check keys on that first byte; the safe direction held (no
+  other request can claim the large limit), but the tag was not the exact rule it was
+  meant to be. The stage now refuses any tag byte with the continuation bit set.
+
+The lesson is in the numbers: a coverage-guided fuzzer with its dictionary of boundary
+values found in under a second what ten thousand random inputs per target did not, so
+the smoke test now salts its noise with boundary bytes, carries a regression test for
+each finding, and the CI fuzz job is the one that counts. The decoders themselves held:
+postcard rejects what it cannot read without allocating for claimed lengths beyond the
+bytes it has; the sealed-box and signature checks refuse short or wrong input before
+any slice; the tunnel packet reader checks its minimum length first.
 
 What the generated-value tests found: one real gap in the hub's record check. With
 `issued_at` near the end of the unsigned 64-bit range the lifetime arithmetic

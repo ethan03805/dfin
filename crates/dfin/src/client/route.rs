@@ -255,8 +255,9 @@ impl Route {
                 format!("hello rejected: {message}"),
             )),
             other => Err(RouteError::Protocol(format!(
-                "stage {}: unexpected hello reply {other:?}",
-                hop.addr
+                "stage {}: unexpected hello reply {}",
+                hop.addr,
+                other.kind()
             ))),
         }
     }
@@ -333,8 +334,9 @@ impl Route {
                     }
                     other => {
                         return Err(RouteError::Protocol(format!(
-                            "relay {}: unexpected reply {other:?}",
-                            relay.addr
+                            "relay {}: unexpected reply {}",
+                            relay.addr,
+                            other.kind()
                         )))
                     }
                 }
@@ -382,7 +384,8 @@ impl Route {
             }
             other => {
                 return Err(RouteError::Protocol(format!(
-                    "unexpected route setup reply {other:?}"
+                    "unexpected route setup reply {}",
+                    other.kind()
                 )))
             }
         }
@@ -610,7 +613,8 @@ impl Route {
             }
             Response::Error { code, message } => Err(stage_err(&first_addr, code, message)),
             other => Err(RouteError::Protocol(format!(
-                "unexpected forward reply {other:?}"
+                "unexpected forward reply {}",
+                other.kind()
             ))),
         }
     }
@@ -628,7 +632,10 @@ impl Route {
         match r? {
             Response::Ack => Ok(()),
             Response::Error { code, message } => Err(stage_err(&self.hops[0].addr, code, message)),
-            other => Err(RouteError::Protocol(format!("unexpected reply {other:?}"))),
+            other => Err(RouteError::Protocol(format!(
+                "unexpected reply {}",
+                other.kind()
+            ))),
         }
     }
 

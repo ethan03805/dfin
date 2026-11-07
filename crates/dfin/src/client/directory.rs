@@ -65,7 +65,13 @@ pub async fn fetch_async(
         Response::Error { code, message } => {
             return Err(format!("hub {} ({code:?}): {message}", hub.addr))
         }
-        other => return Err(format!("hub {}: unexpected reply {other:?}", hub.addr)),
+        other => {
+            return Err(format!(
+                "hub {}: unexpected reply {}",
+                hub.addr,
+                other.kind()
+            ))
+        }
     };
     let dir = verify_directory(&signed, &hub_id)
         .map_err(|e| format!("hub {}: directory does not verify: {e}", hub.addr))?;

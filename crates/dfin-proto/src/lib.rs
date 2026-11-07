@@ -346,6 +346,25 @@ pub enum Response {
     },
 }
 
+impl Response {
+    /// A bounded diagnostic label that never includes model states, addresses,
+    /// directory contents, shard data, or peer-controlled error text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::HelloOk { .. } => "HelloOk",
+            Self::RouteOk { .. } => "RouteOk",
+            Self::Ack => "Ack",
+            Self::ForwardOk { .. } => "ForwardOk",
+            Self::Pong => "Pong",
+            Self::RelayListening { .. } => "RelayListening",
+            Self::Probed { .. } => "Probed",
+            Self::Directory { .. } => "Directory",
+            Self::Shard { .. } => "Shard",
+            Self::Error { .. } => "Error",
+        }
+    }
+}
+
 /// A result delivered to a return target (direct or relay mode) on a one-way stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReturnFrame {

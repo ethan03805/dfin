@@ -127,12 +127,21 @@ Reference: Rust's [`create_new` semantics](https://doc.rust-lang.org/std/fs/stru
 
 **Fix:** warnings use a small fixed set of recognized unsupported option names and one generic label for all other names. Unknown names are neither copied into permanent warning state nor emitted. A regression checks that 10,000 distinct arbitrary names share one static label, and the captured-log test checks that the private marker is absent. Other operational metadata and error logs still exist as documented.
 
+### P14 — Error propagation exposed sealed-route details and response payloads
+
+**Status:** fixed; all 117 regular Windows tests pass, including five disclosure regressions. Three regressions failed on the original stage: setup errors contained the next hop's address and its arbitrary error text; an unexpected setup response was copied with its payload; and forward errors relayed downstream text verbatim. A previous hop could therefore learn details beyond its immediate neighbor through otherwise sealed route handling.
+
+**Fix:** stage errors report bounded operation descriptions and typed error codes, omitting downstream addresses, return-client identifiers, and peer-provided messages. Forward error codes remain intact for recovery. Unexpected network responses throughout the application use a fixed response-type label instead of formatting payloads. Added control-error and missing-direct-return coverage. Existing metadata such as layer/timing statistics remains visible and is now described accurately in the protocol.
+
+**Scope:** this prevents honest software from adding or forwarding these details in errors. It cannot stop colluding or modified nodes from communicating what they observe, and does not conceal activations or traffic patterns. Client-facing errors from directly contacted peers still need to be treated as untrusted operational information.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
 - TLS uses the node key from the certificate and verifies the handshake signature; pinning alone is not substituted for proof of key possession.
 - Sealed-route key exchange rejects non-contributory X25519 shared secrets.
 - Return-path client identifiers and relay tokens are already included only in the last hop's sealed record; intermediate records use reverse return mode.
+- The local generation API already uses nonblocking bounded queue admission; it rejects a full queue instead of retaining unlimited waiting generation jobs.
 - Request sequence counters are already reset and directory lookups already use separate temporary identities.
 
 ## Test results
@@ -185,6 +194,10 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P13 reproduction | Arbitrary ignored request key with a dummy private marker | Failed as expected: marker appeared in captured logs |
 | P01–P13 | Complete Windows release workspace | 112 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
 | P01–P11 revision `b3b9c88` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42402118564) | Both jobs passed |
+| P14 reproduction | Setup address/message disclosure, unexpected response payload, forwarded error text | All three failed as expected on the original stage |
+| P14 initial fixes | All ten stage ownership/error regressions | 10 passed, 0 failed |
+| P01–P13 revision `b1719c2` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42402718052) | Both jobs passed |
+| P01–P14 | Complete Windows release workspace, including control/return error disclosure | 117 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.
 

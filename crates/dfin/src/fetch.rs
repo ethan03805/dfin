@@ -380,7 +380,7 @@ async fn from_peer(
                 offset += data.len() as u64;
             }
             Response::Error { code, message } => bail!("{code:?}: {message}"),
-            other => bail!("unexpected reply {other:?}"),
+            other => bail!("unexpected reply {}", other.kind()),
         }
     }
     finish(dir, split, partial).await

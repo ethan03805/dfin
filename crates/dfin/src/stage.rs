@@ -527,7 +527,7 @@ async fn cloak_once(stage: &Arc<Stage>, relay: &NextHop) -> anyhow::Result<()> {
     let public = match resp {
         Response::RelayListening { addr } => addr,
         Response::Error { code, message } => bail!("relay refused ({code:?}): {message}"),
-        other => bail!("unexpected relay reply {other:?}"),
+        other => bail!("unexpected relay reply {}", other.kind()),
     };
     let (sock, inbound, outbound) = tunnel_socket();
     let ep = Endpoint::over_tunnel(stage.endpoint.key().clone(), sock)
@@ -619,7 +619,9 @@ async fn announce_loop(
                     warn!(hub = %hub.addr, ?code, "announcement refused: {message}");
                     announced.insert(id, false);
                 }
-                Ok(other) => warn!(hub = %hub.addr, "unexpected announce reply {other:?}"),
+                Ok(other) => {
+                    warn!(hub = %hub.addr, reply = other.kind(), "unexpected announce reply")
+                }
                 Err(e) => {
                     warn!(hub = %hub.addr, "announce failed: {e}");
                     conns.remove(&id);
@@ -1057,7 +1059,7 @@ impl Stage {
             self.endpoint
                 .connect(&nh.addr, id)
                 .await
-                .map_err(|e| error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)))?,
+                .map_err(|_| error(ErrorCode::Downstream, "next hop connection failed"))?,
         );
         let hello = Request::Hello {
             version: PROTOCOL_VERSION,
@@ -1068,36 +1070,32 @@ impl Stage {
         let r: Response = conn
             .call(&hello, MAX_CONTROL_FRAME, CONTROL_TIMEOUT)
             .await
-            .map_err(|e| error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)))?;
+            .map_err(|_| error(ErrorCode::Downstream, "next hop hello failed"))?;
         match r {
             Response::HelloOk {
-                n_embd,
-                n_embd_inp,
-                ..
+                n_embd, n_embd_inp, ..
             } if n_embd == self.info.n_embd && n_embd_inp == self.info.n_embd_out => {}
             Response::HelloOk {
-                n_embd,
-                n_embd_inp,
-                ..
+                n_embd, n_embd_inp, ..
             } => {
                 return Err(error(
                     ErrorCode::Downstream,
                     format!(
-                        "next hop {}: takes rows of {n_embd_inp} (n_embd {n_embd}), this stage produces {}",
-                        nh.addr, self.info.n_embd_out
-                    ),
+                    "next hop takes rows of {n_embd_inp} (n_embd {n_embd}), this stage produces {}",
+                    self.info.n_embd_out
+                ),
                 ))
             }
-            Response::Error { code, message } => {
+            Response::Error { code, .. } => {
                 return Err(error(
                     ErrorCode::Downstream,
-                    format!("next hop {} refused hello ({code:?}): {message}", nh.addr),
+                    format!("next hop refused hello ({code:?})"),
                 ))
             }
             other => {
                 return Err(error(
                     ErrorCode::Downstream,
-                    format!("next hop {}: unexpected hello reply {other:?}", nh.addr),
+                    format!("next hop returned unexpected hello reply {}", other.kind()),
                 ))
             }
         }
@@ -1165,21 +1163,19 @@ impl Stage {
                 .await;
             match r {
                 Ok(Response::RouteOk { hops: h }) => hops = h,
-                Ok(Response::Error { code, message }) => {
+                Ok(Response::Error { code, .. }) => {
                     return error(
                         ErrorCode::Downstream,
-                        format!("next hop {} ({code:?}): {message}", nh.addr),
+                        format!("next hop refused setup ({code:?})"),
                     )
                 }
                 Ok(other) => {
                     return error(
                         ErrorCode::Downstream,
-                        format!("next hop {}: unexpected setup reply {other:?}", nh.addr),
+                        format!("next hop returned unexpected setup reply {}", other.kind()),
                     )
                 }
-                Err(e) => {
-                    return error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr))
-                }
+                Err(_) => return error(ErrorCode::Downstream, "next hop setup failed"),
             }
             next = Some((nh, conn));
         }
@@ -1196,7 +1192,7 @@ impl Stage {
                         _ => {
                             return error(
                                 ErrorCode::NoReturnPath,
-                                format!("no live connection from client {}", id.short()),
+                                "no live direct return connection",
                             )
                         }
                     }
@@ -1208,11 +1204,8 @@ impl Stage {
                         .await
                     {
                         Ok(c) => RouteConnection(c),
-                        Err(e) => {
-                            return error(
-                                ErrorCode::NoReturnPath,
-                                format!("relay {}: {e}", relay.addr),
-                            )
+                        Err(_) => {
+                            return error(ErrorCode::NoReturnPath, "return relay connection failed")
                         }
                     };
                     let r: Result<Response, NetError> = conn
@@ -1224,23 +1217,20 @@ impl Stage {
                         .await;
                     match r {
                         Ok(Response::Ack) => return_conn = Some(ReturnConnection::Relay(conn)),
-                        Ok(Response::Error { code, message }) => {
+                        Ok(Response::Error { code, .. }) => {
                             return error(
                                 ErrorCode::NoReturnPath,
-                                format!("relay {} ({code:?}): {message}", relay.addr),
+                                format!("return relay refused attachment ({code:?})"),
                             )
                         }
                         Ok(other) => {
                             return error(
                                 ErrorCode::NoReturnPath,
-                                format!("relay {}: unexpected reply {other:?}", relay.addr),
+                                format!("return relay sent unexpected reply {}", other.kind()),
                             )
                         }
-                        Err(e) => {
-                            return error(
-                                ErrorCode::NoReturnPath,
-                                format!("relay {}: {e}", relay.addr),
-                            )
+                        Err(_) => {
+                            return error(ErrorCode::NoReturnPath, "return relay attachment failed")
                         }
                     }
                 }
@@ -1308,7 +1298,7 @@ impl Stage {
                 compute_ms,
             });
             match &rs.next {
-                Some((nh, conn)) => {
+                Some((_, conn)) => {
                     let limit = forward_frame_limit(out.n_tokens, out.n_embd);
                     let r: Result<Response, NetError> = conn
                         .call(
@@ -1325,10 +1315,15 @@ impl Stage {
                         )
                         .await;
                     match r {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr))
+                        Ok(resp @ (Response::Ack | Response::ForwardOk { .. })) => resp,
+                        Ok(Response::Error { code, .. }) => {
+                            error(code, "downstream forward refused")
                         }
+                        Ok(other) => error(
+                            ErrorCode::Downstream,
+                            format!("unexpected forward reply {}", other.kind()),
+                        ),
+                        Err(_) => error(ErrorCode::Downstream, "next hop forward failed"),
                     }
                 }
                 None => match &rs.ret {
@@ -1353,9 +1348,7 @@ impl Stage {
                         match &rs.return_conn {
                             Some(c) => match c.send_uni(&frame).await {
                                 Ok(()) => Response::Ack,
-                                Err(e) => {
-                                    error(ErrorCode::NoReturnPath, format!("return path: {e}"))
-                                }
+                                Err(_) => error(ErrorCode::NoReturnPath, "return path send failed"),
                             },
                             None => error(ErrorCode::NoReturnPath, "no return connection"),
                         }
@@ -1392,22 +1385,22 @@ impl Stage {
 
     /// Forward a control request down the chain and wait for its `Ack`.
     async fn downstream_ack(&self, rs: &RouteState, req: &Request) -> Response {
-        let Some((nh, conn)) = &rs.next else {
+        let Some((_, conn)) = &rs.next else {
             return Response::Ack;
         };
         let r: Result<Response, NetError> =
             conn.call(req, MAX_CONTROL_FRAME, CONTROL_TIMEOUT).await;
         match r {
             Ok(Response::Ack) => Response::Ack,
-            Ok(Response::Error { code, message }) => error(
+            Ok(Response::Error { code, .. }) => error(
                 ErrorCode::Downstream,
-                format!("next hop {} ({code:?}): {message}", nh.addr),
+                format!("downstream control request refused ({code:?})"),
             ),
             Ok(other) => error(
                 ErrorCode::Downstream,
-                format!("next hop {}: unexpected reply {other:?}", nh.addr),
+                format!("unexpected downstream control reply {}", other.kind()),
             ),
-            Err(e) => error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)),
+            Err(_) => error(ErrorCode::Downstream, "downstream control request failed"),
         }
     }
 

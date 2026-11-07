@@ -119,9 +119,16 @@ nonce (the key is unique per ephemeral), output `ephemeral_pub || ciphertext`.
 
 A hop unseals its record, checks the layer range is the one it serves, connects to
 `next` (pinned to its id) if present, sends `RouteSetup { route, hop: inner }` and waits
-for `RouteOk`, then replies `RouteOk` upstream with the count incremented. A hop learns
-the address and id of its two neighbours and nothing else: not the client's address
-(unless it is hop 1 and no relay is used), not the route beyond its neighbours.
+for `RouteOk`, then replies `RouteOk` upstream with the count incremented. The sealed
+record identifies the immediate successor; only the last hop receives the return
+target's identity or relay token. Transport authentication exposes the predecessor's
+key, while Tor hides its IP. Direct transport exposes the directly connected peer's IP.
+Nodes also observe their model states, message sizes/timing, and forwarded layer/timing
+statistics. Sealing instructions does not make route inference or collusion impossible.
+
+Stage errors must not copy downstream addresses, return identities, or peer-provided
+error messages upstream. They report the operation and typed error code. Unexpected
+responses are diagnosed by type, without dumping their model states or other payloads.
 
 Hop 1 must have received `Hello` on the incoming connection. Later hops check the
 model fingerprint and the range from their sealed record instead; the hop-to-hop

@@ -395,3 +395,171 @@ async fn overflowing_downstream_hop_count_is_rejected_and_released() {
         Response::RouteOk { hops: 1 }
     ));
 }
+
+#[tokio::test]
+async fn downstream_setup_error_does_not_reveal_hidden_hop_or_peer_text() {
+    let f = Fixture::new(2, 4, 1);
+    let (_ep, client) = f.client().await;
+    let (peer, _conn, mut send, task) = pending(&f, &client).await;
+    reply(
+        &mut send,
+        &error(ErrorCode::BadRecord, "private-downstream-canary"),
+    )
+    .await
+    .unwrap();
+    let Response::Error { code, message } = task.await.unwrap() else {
+        panic!("expected error")
+    };
+    assert_eq!(code, ErrorCode::Downstream);
+    assert!(
+        !message.contains(&peer.local_addr().unwrap().to_string()),
+        "disclosed downstream address: {message}"
+    );
+    assert!(
+        !message.contains("private-downstream-canary"),
+        "reflected peer-controlled error text"
+    );
+}
+
+#[tokio::test]
+async fn unexpected_setup_response_does_not_reflect_its_payload() {
+    let f = Fixture::new(2, 4, 1);
+    let (_ep, client) = f.client().await;
+    let (_peer, _conn, mut send, task) = pending(&f, &client).await;
+    reply(
+        &mut send,
+        &Response::RelayListening {
+            addr: "private-response-canary".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let Response::Error { message, .. } = task.await.unwrap() else {
+        panic!("expected error")
+    };
+    assert!(
+        !message.contains("private-response-canary"),
+        "reflected an unexpected response payload: {message}"
+    );
+}
+
+#[tokio::test]
+async fn downstream_forward_error_does_not_reflect_peer_text() {
+    let mut f = Fixture::new(2, 4, 1);
+    let (_ep, client) = f.client().await;
+    let (_peer, conn, mut send, setup) = pending(&f, &client).await;
+    reply(&mut send, &Response::RouteOk { hops: 1 })
+        .await
+        .unwrap();
+    assert!(matches!(
+        setup.await.unwrap(),
+        Response::RouteOk { hops: 2 }
+    ));
+    let copy = client.clone();
+    let forward = tokio::spawn(async move {
+        call(
+            &copy,
+            Request::Forward {
+                route: 1,
+                session: 1,
+                seq: 1,
+                pos0: 0,
+                act: Activations::from_f32(&[0.0; 64], 1, 64, ActDtype::F32),
+                hops: vec![],
+            },
+        )
+        .await
+    });
+    let Some(Job::Forward {
+        act, reply: result, ..
+    }) = f._jobs.recv().await
+    else {
+        panic!("expected engine work")
+    };
+    result
+        .send(Reply::Forward {
+            act,
+            compute_ms: 1.0,
+        })
+        .unwrap();
+    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+    let request: Request = read_frame_max(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+    assert!(matches!(request, Request::Forward { .. }));
+    reply(
+        &mut send,
+        &error(ErrorCode::SessionLimit, "private-forward-canary"),
+    )
+    .await
+    .unwrap();
+    let Response::Error { code, message } = forward.await.unwrap() else {
+        panic!("expected error")
+    };
+    assert_eq!(code, ErrorCode::SessionLimit);
+    assert!(
+        !message.contains("private-forward-canary"),
+        "reflected a downstream forward error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn downstream_control_error_does_not_reflect_hidden_details() {
+    let f = Fixture::new(2, 4, 1);
+    let (_ep, client) = f.client().await;
+    let (peer, conn, mut send, setup) = pending(&f, &client).await;
+    reply(&mut send, &Response::RouteOk { hops: 1 })
+        .await
+        .unwrap();
+    assert!(matches!(
+        setup.await.unwrap(),
+        Response::RouteOk { hops: 2 }
+    ));
+    let copy = client.clone();
+    let closing = tokio::spawn(async move { call(&copy, Request::RouteClose { route: 1 }).await });
+    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+    let request: Request = read_frame_max(&mut recv, MAX_CONTROL_FRAME).await.unwrap();
+    assert!(matches!(request, Request::RouteClose { .. }));
+    reply(
+        &mut send,
+        &error(ErrorCode::BadRequest, "private-control-canary"),
+    )
+    .await
+    .unwrap();
+    let Response::Error { code, message } = closing.await.unwrap() else {
+        panic!("expected error")
+    };
+    assert_eq!(code, ErrorCode::Downstream);
+    assert!(!message.contains("private-control-canary"));
+    assert!(!message.contains(&peer.local_addr().unwrap().to_string()));
+}
+
+#[tokio::test]
+async fn absent_direct_return_does_not_reveal_the_last_hops_client_id() {
+    let f = Fixture::new(2, 4, 1);
+    let (_ep, client) = f.client().await;
+    let return_id = NodeKey::generate().id();
+    let hop = seal(
+        &f.stage.endpoint.node_id(),
+        &postcard::to_stdvec(&HopRecord {
+            model_fingerprint: "test-model".into(),
+            layer_begin: 2,
+            layer_end: 4,
+            next: None,
+            inner: vec![],
+            ret: ReturnMode::Direct {
+                client_id: return_id.0,
+            },
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let Response::Error { code, message } =
+        call(&client, Request::RouteSetup { route: 1, hop }).await
+    else {
+        panic!("expected error")
+    };
+    assert_eq!(code, ErrorCode::NoReturnPath);
+    assert!(
+        !message.contains(&return_id.short()),
+        "exposed a sealed return identity: {message}"
+    );
+}

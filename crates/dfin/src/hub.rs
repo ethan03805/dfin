@@ -436,7 +436,7 @@ impl Hub {
                 Ok(Response::Error { code, message }) => {
                     debug!(probe = %p.addr, ?code, "probe refused: {message}");
                 }
-                Ok(other) => warn!(probe = %p.addr, "unexpected probe reply {other:?}"),
+                Ok(other) => warn!(probe = %p.addr, reply = other.kind(), "unexpected probe reply"),
                 Err(e) => {
                     warn!(probe = %p.addr, "probe failed: {e}");
                     self.probe_conns.lock().await.remove(&pid);

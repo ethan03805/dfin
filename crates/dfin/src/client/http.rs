@@ -447,9 +447,8 @@ async fn run_generation(
     match rx.recv().await {
         Some(Event::Started { .. }) => {}
         Some(Event::Error(e)) => return e.into_response(),
-        Some(other) => {
-            return ApiError::internal(format!("unexpected first engine event {other:?}"))
-                .into_response();
+        Some(_) => {
+            return ApiError::internal("unexpected first engine event").into_response();
         }
         None => return ApiError::internal("engine dropped the request").into_response(),
     }

@@ -119,6 +119,8 @@ Relay lifetime tests also exercise duplicate tokens, stalled connections, cancel
 cargo test --release --locked -p dfin --test relay_privacy relay_expires_an_unattached_session -- --ignored
 ```
 
+Stage regressions cover pending-route limits, duplicate route numbers, independent clients using the same route number, failed/cancelled setup, and cleanup while engine work is pending. Routes own their next-hop connections, so cleanup cascades instead of leaving a shared connection cache behind. This adds a handshake per route; it does not hide a stage's stable public identity or interrupt a native inference call already executing.
+
 ## Relationship to Monero
 
 This milestone follows Monero's use of established anonymity networks and separation of identity-bearing activities. It reuses Tor's maintained SOCKS implementation rather than inventing onion routing. The inference protocol needs authenticated interactive streams; Monero's transaction propagation and ledger cryptography do not provide that transport or protect model activations.

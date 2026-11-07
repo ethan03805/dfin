@@ -43,6 +43,14 @@ Limits, enforced at the receiver: frame size by message type (`Forward` bounded 
 per connection, `n_seq_max` sessions per stage, one `Forward` in flight per session,
 10 s to read a control frame, 600 s for a `Forward` reply.
 
+Pending setup counts toward the route limit and reserves its route number. Each
+route owns a separate next-hop connection; pooling those connections would merge
+different clients' route namespaces. Failed/cancelled setup closes its downstream
+connections. A stage connection owns at most 32 request handlers and cancels/joins
+them before releasing its routes. `RouteClose` cancels outstanding route operations
+before queuing engine cleanup. Native inference already executing cannot be interrupted;
+cleanup follows it. Disconnects cascade through the route-owned connections.
+
 ## 3. Messages (dfin-proto version 2)
 
 ### Tor transport framing (default)

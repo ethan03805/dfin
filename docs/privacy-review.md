@@ -77,6 +77,16 @@ The design also incorrectly implied that client-side route choice prevents a hub
 
 **Scope:** a malicious hub can still bias or personalize an otherwise valid directory. This does not add independent directory agreement, Sybil resistance, or proof that a node's self-description is true.
 
+### P08 — Stage route ownership and cancellation were incomplete
+
+**Status:** fixed; all 95 regular Windows tests pass, including seven stage ownership regressions. Five new real-handler tests failed on the original stage: two clients choosing the same route number collided at the next stage; duplicate pending setup was accepted; pending setup bypassed the route cap; cancelled setup kept its downstream connection; and rejected setup retained its downstream connection in an unbounded cache. A sixth regression confirmed that `RouteClose` acknowledged cleanup while an earlier forward still awaited the engine.
+
+**Fix:** each route owns its downstream connection instead of sharing a global connection cache. Route numbers and capacity are reserved before any asynchronous setup. Failed or cancelled setup releases both connections and reservations. A connection owns at most 32 request handlers and cancels/joins them before teardown, preventing work from being installed after cleanup. Explicit route closure cancels operations and waits for their handlers to stop before queuing engine cleanup. Closing routes stay discoverable by disconnect cleanup until that work finishes. Downstream connection closure cascades cancellation without serial network waits. Relay returns are owned by their route; direct returns retain the caller's shared connection.
+
+**Additional check:** reject overflow in an untrusted downstream hop count and release the failed reservation.
+
+**Scope:** established next-hop connections now require a fresh handshake per route, trading some setup time for isolation and bounded ownership. Node identities remain stable public identities. Cancellation cannot interrupt a native CPU/GPU call already executing or recall states already delivered; cleanup follows already queued engine work. These are resource and lifecycle protections, not proof against all denial of service.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -112,5 +122,9 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P01–P06 revision `c1c09fc` | Real Tor 0.4.9.15, private nine-node network | All return modes passed; integration portion 56.65 seconds; children stopped |
 | P07 reproduction | Future-dated signed record in an authentic signed cache | Failed as expected: route selection accepted it |
 | P01–P07 | Complete Windows release workspace | 88 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| P01–P06 revision `c1c09fc` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42399468554) | Both jobs passed |
+| P08 reproduction | Duplicate/pending route admission, cross-client collision, cancelled/rejected setup | All five failed as expected on the original stage |
+| P08 close reproduction | Close a route while its engine reply is withheld | Failed as expected: outstanding operation survived acknowledged closure |
+| P01–P08 | Complete Windows release workspace | 95 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.

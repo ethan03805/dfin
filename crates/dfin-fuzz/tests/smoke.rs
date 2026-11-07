@@ -97,6 +97,15 @@ fn every_target_survives_seeds_mutations_and_noise() {
             };
             let mut m = vec![0u8; len];
             rng.fill_bytes(&mut m);
+            // Boundary bytes make long varints and extreme integers likelier; plain noise
+            // almost never produces two 32-bit values near their limit at once.
+            if rng.random_bool(0.5) {
+                for b in m.iter_mut() {
+                    if rng.random_bool(0.25) {
+                        *b = [0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff][rng.random_range(0..6)];
+                    }
+                }
+            }
             count(run(name, *target, "random bytes", &m));
         }
         // What libFuzzer left behind, if anything.
@@ -114,6 +123,17 @@ fn every_target_survives_seeds_mutations_and_noise() {
         );
         assert!(decoded > 0 && rejected > 0, "{name}: mutations should reach both outcomes");
     }
+}
+
+/// What libFuzzer found on its first run: the limit helper overflowed for widths a
+/// hostile peer can advertise. It saturates at the frame cap now.
+#[test]
+fn frame_limit_saturates_at_the_frame_cap() {
+    use dfin_proto::{forward_frame_limit, MAX_FRAME_BYTES};
+    assert_eq!(forward_frame_limit(u32::MAX, u32::MAX), MAX_FRAME_BYTES);
+    assert_eq!(forward_frame_limit(u32::MAX, 1), MAX_FRAME_BYTES);
+    assert_eq!(forward_frame_limit(0, 0), 65536);
+    assert_eq!(forward_frame_limit(2, 4), 32 + 65536);
 }
 
 /// The stage's cheap size check keys on the first body byte: no request but `Forward`

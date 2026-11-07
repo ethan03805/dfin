@@ -1,17 +1,22 @@
-# Decentralized Frontier Inference Network, Phase 0
+# dfin: Decentralized Frontier Inference Network
 
-Pipeline-parallel inference of large open models across several consumer machines,
-with the privacy-relevant pieces (token embedding, first layers, last layer, LM head)
-running on the user's own machine. Design: [docs/design-v0.2.md](docs/design-v0.2.md)
-(threat model, trust tiers, attested and open nodes, anonymity, money, phases), with the
-model physics and execution model in [docs/design-v0.1.md](docs/design-v0.1.md).
-Prior art and the current state of llama.cpp: [docs/prior-art-2026-11.md](docs/prior-art-2026-11.md).
+Pipeline-parallel inference of large open models across several machines, with the
+privacy-relevant pieces (token embedding, first layers, last layer, LM head) running on
+the user's own machine, over an encrypted chain in which no node learns who is asking or
+the whole route. The aim is a network of strangers' hardware that keeps serving frontier
+open-weight models if hosted endpoints for them disappear.
 
-Phase 0 is **one LAN pod**: a stage runtime that runs a contiguous layer range of a GGUF,
-a client daemon that runs the head and tail and exposes an OpenAI-compatible API, a
-local pod launcher and a benchmark. It is also the go or no-go gate from the design:
-if a LAN pod cannot hold 3 tokens per second on GLM-5.3 with a cold start under 30
-seconds, the WAN version must be rethought before continuing.
+**What exists and what does not: [STATUS.md](STATUS.md).** In short: one LAN pod works
+and has been measured on a real model across two machines; the encrypted chain (node
+keys, QUIC, relays, a signed directory, cloaked nodes, weight shards, region fencing,
+fuzzed decoders) is built and tested, with failover of a live session still to do; trust,
+money and scale have not started.
+
+Design: [docs/design-v0.2.md](docs/design-v0.2.md) (threat model, trust tiers, attested
+and open nodes, anonymity, money, phases), with the model physics in
+[docs/design-v0.1.md](docs/design-v0.1.md). The wire contract:
+[docs/phase1-protocol.md](docs/phase1-protocol.md). Every document is listed in
+[docs/README.md](docs/README.md).
 
 ## What is here
 
@@ -22,9 +27,11 @@ seconds, the WAN version must be rethought before continuing.
 | `crates/dfin-llama` | Safe wrapper: `Model` (full or partial), `Context`, tokenizer, chat templates |
 | `crates/dfin-proto` | Wire protocol: postcard frames, f32/f16 activations, routes, sealed hop records |
 | `crates/dfin-net` | Node identities, QUIC with certificates bound to node keys, sealed boxes |
-| `crates/dfin` | The `dfin` binary: `stage`, `client`, `relay`, `pod`, `bench` |
-| `tools/` | Synthetic test-model generators (random weights, valid structure) |
-| `scripts/` | Build llama.cpp, regenerate bindings |
+| `crates/dfin` | The `dfin` binary: `stage`, `client`, `relay`, `hub`, `probe`, `fetch`, `pod`, `bench` |
+| `crates/dfin-fuzz` | Fuzz targets for every wire decoder, run as ordinary tests everywhere and under libFuzzer through `fuzz/` |
+| `tools/` | Synthetic test-model generators (random weights, valid structure) and the shard tool |
+| `scripts/` | Build llama.cpp, regenerate bindings, benchmark and two-machine scripts (each listed in `STATUS.md`) |
+| `docs/` | Design, protocol, findings and logs; `docs/README.md` says what each is |
 
 ### How a request flows
 
@@ -292,7 +299,7 @@ prints monolithic versus in-process split versus local-pod-over-TCP decode speed
 `scripts/phase0-verify.sh` runs the whole workspace test suite, builds the release binary
 and benchmarks every tiny model three ways: monolithic, split in-process (head, middle,
 tail as separate pieces in one process) and as a local pod over TCP driven through the
-OpenAI API. Log: `docs/phase0-verify-2026-11-05.log`. Ryzen 5 7600X3D, CPU only, f16
+OpenAI API. Log: `docs/logs/phase0-verify-2026-11-05.log`. Ryzen 5 7600X3D, CPU only, f16
 activations, 32 prompt tokens, 64 generated, release build:
 
 | Tiny model (8 layers, n_embd 64) | Split | Monolithic ms/token | In-process split | Local pod over TCP | Output |
@@ -315,7 +322,7 @@ PC serving 21:46: 16.2 to 16.8 tok/s decode against 19.8 on one machine, identic
 prefill of 281 tokens in 1.6 s with the local stage locked in RAM. The gap is the WiFi round
 trip (23 ms per token on a link with a 3 ms ping floor); the protocol itself costs 0.4 ms per
 hop on loopback. Details in `docs/phase0-findings.md`, log in
-`docs/lan-pod-glm47flash-2026-11-06.log`.
+`docs/logs/lan-pod-glm47flash-2026-11-06.log`.
 
 ### Real model on one machine
 
@@ -323,42 +330,17 @@ hop on loopback. Details in `docs/phase0-findings.md`, log in
 plus a stock llama.cpp baseline and a live pod with chat requests;
 `scripts/real-model-contention.sh` checks how much co-locating several pieces on one CPU costs.
 Results for GLM-4.7-Flash (30B-A3B, Q4_K_M, 18.5 GB, experts in RAM and attention on the
-GPU) are in `docs/phase0-findings.md` and `docs/real-model-glm47flash-2026-11-05.log`.
+GPU) are in `docs/phase0-findings.md` and `docs/logs/real-model-glm47flash-2026-11-05.log`.
 Model files live under `models/` and are not part of the repository.
 
-## Phase 0 status
+## Status
 
-See the task list at the bottom of `docs/design-v0.1.md` section 16 for the exit
-criteria. Status of the pieces is tracked in this section as they land.
-
-- [x] Layer-range patch to libllama (loader, graph, KV cache), exact on tiny `llama`, `glm-dsa` and `kimi-k3` models, CPU and Vulkan
-- [x] Rust bindings and safe wrapper
-- [x] Wire protocol (postcard frames, f32/f16 activations)
-- [x] `dfin stage` server (TCP, session slots, automatic rollback on rewind)
-- [x] `dfin client` daemon: local head and tail, OpenAI API with streaming, prefix cache, sampler
-- [x] `dfin pod` and `dfin bench`
-- [x] Verified on tiny synthetic `glm-dsa` and `kimi-k3` models (MLA, indexer, MoE, KDA paths); see `docs/phase0-findings.md` for what each architecture needs at a stage boundary
-- [x] Phase 1 transport: Ed25519 node ids, QUIC with pinned keys, sealed route records, chain forwarding stage to stage, direct, reverse and relay return modes, `dfin relay`; see `docs/phase1-protocol.md`. GLM-4.7-Flash through the chain on one machine: 16.8 tok/s in both modes, identical text, 0.7 ms of chain overhead per token (`docs/phase1-findings.md`)
-- [x] Linux build, Docker image and CI (pull request 1)
-- [x] Signed directory: `dfin hub`, stage announcements with reachability checks, client-side route choice, cache, rerouting when a stage dies
-- [x] Cloaked stages: no inbound port, reachable through a relay-allocated port over the stage's own outbound tunnel, end-to-end QUIC, synthetic peer addresses
-- [x] Region fencing: `dfin probe` vantage points with allow lists, per-probe round trips in the signed directory, client `--region label:ms` fence that excludes cloaked nodes (`docs/phase1-protocol.md` section 14)
-- [x] Fuzzed decoders: libFuzzer targets for every wire type (`fuzz/`), the same targets as ordinary tests over mutated seeds and noise, generated-value tests for route choice and the hub's record check, a short fuzz run in CI
-- [x] Weight shards: per-layer split files with a hashed manifest, a loader that tolerates absent shards, stages serving the shards they hold, `--fetch` and `dfin fetch` from directory peers or HTTP seeds. GLM-4.7-Flash served from a 23-shard directory matches llama.cpp's single-file output at f32 activations; f16 activations flip near-tie tokens (`docs/phase1-findings.md` section 7)
-- [ ] MTP speculative decoding in the client tail
-- [x] Stage state wider than `n_embd`: `glm5-next` hyper-connection streams (4 x `n_embd`) and Kimi K3 attention-residual banks (growing with depth) cross stage boundaries as wider rows; three-piece pipelines of tiny models match the whole model (`crates/dfin-llama/tests/wide_state.rs`)
-- [ ] Tool-call parsing in the OpenAI layer (requests with `tools` are accepted, calls are not parsed)
-- [ ] Micro-batching across sessions on a stage
-- [x] Real model on one machine: GLM-4.7-Flash 30B-A3B (deepseek2 arch, MLA + MoE) split into 4 pieces, identical output, 19.5 tok/s in-process versus 19.9 monolithic; see `docs/phase0-findings.md`
-- [x] Real model across two machines (PC plus MacBook Air over WiFi): identical output, 16.8 tok/s against 19.8 single-machine, network-bound as predicted
-- [ ] The scale gate: GLM-5.3 IQ4_XS across 4 to 8 machines at 3 tok/s or better (moved to phase 3 in design v0.2; needs rented hardware and sharded loading)
-
-Design v0.2 phase 1 (the encrypted chain) is under way. Done: node identities, the QUIC
-transport, chain forwarding, relays, the signed directory, cloaked stages, weight shards,
-wide stage state, region fencing, fuzzed decoders. Still to do in phase 1: failover of a
-live session. Until the integrity
-checks of phase 2 exist, only run stages for clients you know, and only list stages on a
-hub you run.
+[STATUS.md](STATUS.md) is the single list of what is done, what is open, and what each
+open item needs, with the test or log that backs each finished piece. The short version:
+Phase 0 (one LAN pod) is complete; Phase 1 (the encrypted chain) is complete except
+failover of a live session; Phases 2 (trust and money) and 3 (scale) have not started.
+Until the integrity checks of phase 2 exist, only run stages for clients you know, and
+only list stages on a hub you run.
 
 ## License
 

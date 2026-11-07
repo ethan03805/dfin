@@ -420,8 +420,13 @@ pub const MAX_CLOCK_SKEW_SECS: u64 = 600;
 /// Bytes a `Forward` or `ForwardOk` frame may carry for `n_tokens * n_embd` values,
 /// with headroom for the envelope and hop stats.
 pub fn forward_frame_limit(n_tokens: u32, n_embd: u32) -> u32 {
-    let payload = (n_tokens as u64) * (n_embd as u64) * 4;
-    (payload + 65536).min(MAX_FRAME_BYTES as u64) as u32
+    // Saturating: a peer's advertised width can be anything, and the cap applies anyway.
+    let payload = (n_tokens as u64)
+        .saturating_mul(n_embd as u64)
+        .saturating_mul(4);
+    payload
+        .saturating_add(65536)
+        .min(MAX_FRAME_BYTES as u64) as u32
 }
 
 /// Write one length-prefixed postcard frame.

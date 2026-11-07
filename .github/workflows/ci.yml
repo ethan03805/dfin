@@ -109,12 +109,13 @@ jobs:
       # Linux job) replays those artifacts on later runs.
       - name: Fuzz every target for 20 seconds
         run: |
-          set -e
+          fail=0
           for t in $(cargo fuzz list); do
             echo "::group::$t"
-            cargo fuzz run "$t" -- -max_total_time=20 -max_len=8192 -timeout=10
+            cargo fuzz run "$t" -- -max_total_time=20 -max_len=8192 -timeout=10 || fail=1
             echo "::endgroup::"
           done
+          exit $fail
 
       - name: Keep anything found
         if: failure()

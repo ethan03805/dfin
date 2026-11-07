@@ -3,7 +3,7 @@
 //! several places publishes their measurements, and a client can require that every
 //! probe in a region reach a node within a bound, which puts the node's network
 //! interface inside a radius that light in fibre allows: about 100 km per millisecond
-//! of round trip. Protocol: `docs/phase1-protocol.md` section 14.
+//! of round trip. Protocol: `docs/phase1-protocol.md` section 12.
 
 use crate::config::parse_node_id;
 use anyhow::Context as _;

@@ -13,3 +13,4 @@ models/**/*.part
 models/*-partial-*/
 /*.key
 /*.cache
+/.claude/worktrees/

@@ -7,7 +7,7 @@
 //! layer range. It keeps no record of sessions. Protocol: `docs/phase1-protocol.md`
 //! section 6.
 //!
-//! It also hosts **cloaked nodes** (section 11): a node that opens no port of its own
+//! It also hosts **cloaked nodes** (section 9): a node that opens no port of its own
 //! sends `RelayListen`; the relay binds a public UDP port for it and forwards every
 //! datagram down the stream, tagged with a synthetic address in 100.64.0.0/10 that
 //! stands in for the real sender, so the node learns no addresses at all. Dialers

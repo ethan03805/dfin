@@ -46,7 +46,7 @@ Running notes for design v0.2 phase 1, the encrypted chain. Protocol contract:
 
 GLM-4.7-Flash Q4_K_M, split 1,24,46 (head 0:1, stages 1:24 and 24:46, tail 46:47),
 experts in RAM and attention on the GPU, 256-token prompt, 64 generated, f16 activations.
-Log: `phase1-chain-glm47flash-2026-11-06.log`.
+Log: `logs/phase1-chain-glm47flash-2026-11-06.log`.
 
 | Mode | Prefill | Decode | Output |
 |---|---|---|---|
@@ -79,7 +79,7 @@ node id and `RETURN=` or `RELAY=`.
 route choice from the verified list, a cache for hub outages, and rerouting: the
 end-to-end test kills the first stage of a two-stage route after a replacement for its
 layers has announced, and the client's next requests succeed over the replacement with
-identical output. Protocol section 10 has the details. On the tiny model the whole
+identical output. Protocol section 8 has the details. On the tiny model the whole
 sequence (hub up, two stages listed, requests, a third stage listed, the kill, the
 reroute) takes under 30 seconds.
 
@@ -118,8 +118,8 @@ files) alongside a stage for 1:24 and a client whose head and tail came from the
 set; it loaded in under 30 seconds with the weights locked, reported the same
 resident size as from the single file, and served its layers at the usual speed
 (decode-only chain round trip 50.7 ms for stage computes of 26 and 25 ms). Logs:
-`phase1-shards-glm47flash-2026-11-06.log` (f16 activations) and
-`phase1-shards-f32-glm47flash-2026-11-06.log` (f32).
+`logs/phase1-shards-glm47flash-2026-11-06.log` (f16 activations) and
+`logs/phase1-shards-f32-glm47flash-2026-11-06.log` (f32).
 
 Three checks say the shard set is byte-faithful: every metadata field compares equal
 between the single file and the first shard; sampled tensors of every quantization
@@ -193,7 +193,7 @@ people other than the probe operators.
 ## 10. Fuzzing (7 November 2026)
 
 Every decoder that takes bytes from a peer now has a fuzz target (`crates/dfin-fuzz`,
-protocol section 15), and the same targets run as ordinary tests over seeds, every
+protocol section 13), and the same targets run as ordinary tests over seeds, every
 truncation and bit flip of every seed, spliced tails and random noise: about a hundred
 thousand inputs per `cargo test`, in eight seconds once the curve arithmetic is
 compiled optimised even in debug builds (it was six minutes before that, almost all of
@@ -202,11 +202,17 @@ stable; running them needs nightly, which this machine does not have, so the fir
 fuzz runs are CI's: twenty seconds per target under the address sanitizer on each push,
 with anything found kept as an artifact that the ordinary tests replay.
 
-What the byte-level targets found: nothing. The decoders are postcard over bounded
-frames, and postcard rejects what it cannot read without allocating for claimed lengths
-beyond the bytes it has; the sealed-box and signature checks refuse short or wrong
-input before any slice; the tunnel packet reader checks its minimum length first. The
-one thing the first run caught was in the harness itself (a seed that did not decode).
+What the byte-level targets found. The smoke test found nothing. libFuzzer's first run
+in CI found a panic within a fifth of a second: `forward_frame_limit` multiplied the
+token count by the row width in 64 bits, which overflows for the values a hostile peer
+can advertise near the 32-bit limit; in a release build the product wrapped silently
+and the frame limit came out wrong. It saturates at the frame cap now. The lesson is in
+the numbers: a coverage-guided fuzzer with its dictionary of boundary values found in
+0.2 s what ten thousand random inputs per target did not, so the smoke test now salts
+its noise with boundary bytes, and the CI fuzz job is the one that counts. The decoders
+themselves held: postcard rejects what it cannot read without allocating for claimed
+lengths beyond the bytes it has; the sealed-box and signature checks refuse short or
+wrong input before any slice; the tunnel packet reader checks its minimum length first.
 
 What the generated-value tests found: one real gap in the hub's record check. With
 `issued_at` near the end of the unsigned 64-bit range the lifetime arithmetic

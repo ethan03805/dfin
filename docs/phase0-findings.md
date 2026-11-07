@@ -91,7 +91,7 @@ Consequences for the client:
 
 `cargo test --workspace`: 28 tests pass (protocol, wrapper split test, stage protocol test
 against a real stage process, two end-to-end tests through the client API with two stage
-processes and with head-to-tail only). The release benchmark (`docs/phase0-verify-2026-11-05.log`)
+processes and with head-to-tail only). The release benchmark (`docs/logs/phase0-verify-2026-11-05.log`)
 generates identical text through the pod and the monolithic model for all three tiny
 architectures. Per-hop protocol overhead on localhost is 0.07 to 0.25 ms at `n_embd` 64 in
 f16; at GLM-5.3's width (`n_embd` 6144, 12 KB per token per hop in f16) the serialisation
@@ -110,7 +110,7 @@ architecture (MLA attention, 47 layers, width 2048, one dense layer then 46 MoE 
 via Vulkan. Placement as the design prescribes for a standard node: attention, router and
 shared expert on the GPU, routed experts in RAM (`--cpu-tensors exps`). Split as the design
 prescribes for the client: head = layer 0 (the dense layer), tail = layer 46 plus the LM head,
-two stages of 23 and 22 layers. Log: `docs/real-model-glm47flash-2026-11-05.log`.
+two stages of 23 and 22 layers. Log: `docs/logs/real-model-glm47flash-2026-11-05.log`.
 
 | Mode | Prompt 256, generate 64 | Decode tok/s | Output |
 |---|---|---|---|
@@ -145,7 +145,7 @@ What the numbers say:
   llama.cpp's built-in engine; a two-turn conversation through `/v1/chat/completions`
   produced coherent answers and the second turn hit the prefix cache (22 tokens reused).
 
-**Co-location experiments** (`docs/real-model-glm47flash-contention-2026-11-05.log`): with
+**Co-location experiments** (`docs/logs/real-model-glm47flash-contention-2026-11-05.log`): with
 `--threads 3` per piece instead of the default 6, the four-process pod decodes at 53.6 ms per
 token against 50.8 in-process, so the per-hop cost drops from about 4 ms to about 1.4 ms;
 passive OpenMP waiting alone changed nothing. The extra cost is therefore the pieces fighting
@@ -175,7 +175,7 @@ from the GitHub repo; the only macOS fixes needed were executable bits on the sc
 rpath entry in `.cargo/config.toml` (cargo does not forward a build script's link arguments to
 dependent crates). The Mac's stage was ready in seconds and the PC found it by scanning the
 LAN for port 7001. Link: WiFi, ping best 3.2 ms, average 20 to 54 ms with spikes above
-100 ms. Log: `docs/lan-pod-glm47flash-2026-11-06.log`.
+100 ms. Log: `docs/logs/lan-pod-glm47flash-2026-11-06.log`.
 
 | Mode (GLM-4.7-Flash Q4_K_M, 256-token prompt, 64 generated) | ms per token | tok/s | Output |
 |---|---|---|---|
@@ -224,7 +224,7 @@ of the 27 ms round trip to the WiFi link. The stage now times the read as well.
 The first request through a freshly started stage was slow: 4.2 s for a 281-token prefill
 over the LAN pipeline, and 11 to 27 s for the same prompt through a single local stage
 holding 45 layers, against 1.5 s for the monolithic model. Experiments on the PC stage
-(`docs/lan-pod-glm47flash-2026-11-06.log` and the session notes):
+(`docs/logs/lan-pod-glm47flash-2026-11-06.log` and the session notes):
 
 | Stage setting (45 MoE layers, experts in RAM, attention on GPU) | Load | First prefill (283 tok) | Later prefills | Decode per token | Notes |
 |---|---|---|---|---|---|

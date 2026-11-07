@@ -51,10 +51,10 @@ Requests:
 | `RouteClose { route }` | previous hop or client | Tear the route down along the chain |
 | `Ping` | anyone | Round-trip measurement |
 | `RelayOpen { token, first_hop }`, `RelayAttach { token }` | client, last hop to relay | Section 6 |
-| `RelayListen` | cloaked node to relay | Allocate a public port for me; this stream becomes the tunnel (section 11) |
-| `Announce { record }` | node to hub | List me; `record` is a `SignedRecord` (section 10) |
+| `RelayListen` | cloaked node to relay | Allocate a public port for me; this stream becomes the tunnel (section 9) |
+| `Announce { record }` | node to hub | List me; `record` is a `SignedRecord` (section 8) |
 | `DirectoryGet` | anyone to hub | The current `SignedDirectory` |
-| `ShardGet { model_id, split, offset, len }` | fetcher to a node | Up to 4 MiB of a shard the node holds; replies `Shard { total, data }` (section 12) |
+| `ShardGet { model_id, split, offset, len }` | fetcher to a node | Up to 4 MiB of a shard the node holds; replies `Shard { total, data }` (section 10) |
 
 Replies: `HelloOk { layer_begin, layer_end, n_embd, n_ctx, n_seq_max, backend, node_id }`,
 `RouteOk { hops }` (number of hops that acknowledged), `Ack`, `ForwardOk { session, seq,
@@ -145,7 +145,7 @@ per session, as in Phase 0). When an incoming connection closes, every route it
 opened is torn down along the chain and every session freed. Stages never persist
 any of this.
 
-## 10. Directory
+## 8. Directory
 
 A **node record** is what a stage says about itself: node id, dialable addresses, model
 fingerprint and name, layer range, `n_layer`, `n_embd`, KV capacity per session, session
@@ -161,7 +161,7 @@ version, one to eight addresses, text lengths, a middle layer range inside the m
 lifetime of at most an hour, a time stamp within ten minutes of its clock), dials the
 first address pinned to the node id and pings it three times, and refuses the
 announcement if it does not answer (`Unreachable`). It keeps the best ping as
-`hub_rtt_ms`, one vantage point; section 14 adds more. Records are dropped when they
+`hub_rtt_ms`, one vantage point; section 12 adds more. Records are dropped when they
 expire. `DirectoryGet` returns a `Directory` (hub id, `issued_at`, entries sorted by node
 id, each a signed record plus the hub's observations) signed by the hub under the domain
 `dfin-directory-v1`. With `--http`, the same list is served as JSON for people.
@@ -181,7 +181,7 @@ What the directory does not yet do: more than one hub, mirroring by light nodes,
 fetching the directory through a relay or Tor, attestation evidence, and any
 reputation.
 
-## 11. Cloaked nodes
+## 9. Cloaked nodes
 
 A stage started with `--cloak host:port/<relay id>` and no `--listen` opens no port.
 It dials the relay, opens one bidirectional stream, and sends `RelayListen`. The relay
@@ -212,7 +212,7 @@ The relay refuses registrations beyond `--max-cloaked`, allocates from `--port-r
 when one is given, and needs a public host (`--public-host`, or a specific `--listen`
 address) to name the ports by.
 
-## 12. Shards
+## 10. Shards
 
 `tools/shard_gguf.py` writes a GGUF as split files llama.cpp loads as one model: the
 first holds all metadata and the small global tensors, the second the token embedding,
@@ -240,7 +240,7 @@ Not yet: swarm-style parallel chunks from several holders, resuming a partial fi
 the client fetching its own head and tail, and a signed manifest (the manifest is
 trusted as a file today; its hash is what a hub or a seed should publish).
 
-## 13. Stage state wider than one residual vector
+## 11. Stage state wider than one residual vector
 
 Two of the target architectures carry more than the residual stream between layers.
 GLM-5.3-Flash (`glm5-next`) keeps four parallel residual streams (manifold
@@ -267,7 +267,7 @@ before layer 93 is 13 vectors, so a late boundary moves thirteen times the bytes
 plain one, as the Phase 0 findings predicted. The directory record still names the
 model's `n_embd`; the per-boundary widths follow from the model and the layer range.
 
-## 14. Region fencing
+## 12. Region fencing
 
 The directory's `hub_rtt_ms` is one vantage point. Fencing needs several, so a hub can
 be given **probes**: `dfin probe --region <label> --allow <hub id>` is a small node that
@@ -304,7 +304,7 @@ directory already, and probe results are part of that trust. A hub operator who 
 to be checked publishes the probe ids, and a later version can let clients ask the
 probes themselves.
 
-## 15. Fuzzing
+## 13. Fuzzing
 
 Every decoder that reads bytes from a peer has a fuzz target in `crates/dfin-fuzz`: a
 function from arbitrary bytes to "decoded or not" that must never panic, and that, when
@@ -337,19 +337,21 @@ Not fuzzed here: QUIC and TLS (quinn and rustls fuzz their own decoders), and th
 model computation (llama.cpp's problem; a stage's activation input is bounded in shape
 before it reaches the model).
 
-## 8. Status, 6 November 2026
+## 14. Status, 7 November 2026
 
 Built and tested: identities, transport, sealed records, route setup, forwarding, all
 three return modes, `dfin relay`, the signed directory with `dfin hub` and client-side
-routing with rerouting when a stage dies (section 10), cloaked nodes (section 11), the
-limits in section 2 including fuzzing (section 15). Verified with the tiny model (unit, protocol and
-end-to-end tests in every mode, including a hub, a stage killed mid-run, and a cloaked
-stage behind a relay) and on GLM-4.7-Flash on one machine (`docs/phase1-findings.md`).
-Weight shards (section 12), wide stage state (section 13) and region fencing with
-`dfin probe` (section 14) are in too. Not yet done from the phase 1 list: replay-log
-failover of a live session.
+routing with rerouting when a stage dies (section 8), cloaked nodes (section 9), weight
+shards (section 10), wide stage state (section 11), region fencing with `dfin probe`
+(section 12), the limits in section 2 and fuzzed decoders (section 13). Verified with
+the tiny model (unit, protocol, fuzz and end-to-end tests in every mode, including a
+hub, a stage killed mid-run, a cloaked stage behind a relay, a stage fetching its shards
+from a peer, and two probes fencing a route) and on GLM-4.7-Flash on one machine
+(`docs/phase1-findings.md`). Not yet done from the phase 1 list: replay-log failover of
+a live session. The whole picture, done and open, is in `STATUS.md` at the repository
+root.
 
-## 9. What changed from Phase 0 and why
+## 15. What changed from Phase 0 and why
 
 - Stages dial each other. A route is a chain, not a star around the client.
 - Stages have identities and connections are authenticated, so a route to the wrong

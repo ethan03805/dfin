@@ -97,13 +97,23 @@ The design also incorrectly implied that client-side route choice prevents a hub
 
 ### P10 — Manifest shard paths could escape the model directory
 
-**Status:** fixed; all 103 regular Windows tests pass; the Unix symlink regression awaits Linux CI. A manifest could name `../private.gguf`, and `serve_shard` followed it outside the model directory. The regression returned a 17-byte dummy private file before the fix; no real identity or personal file was accessed. Filenames and sizes are not bound by the existing model-id calculation, so an unchanged model id alone did not prevent this.
+**Status:** fixed; Windows and Linux checks pass, including the Unix symlink regression. A manifest could name `../private.gguf`, and `serve_shard` followed it outside the model directory. The regression returned a 17-byte dummy private file before the fix; no real identity or personal file was accessed. Filenames and sizes are not bound by the existing model-id calculation, so an unchanged model id alone did not prevent this.
 
 **Fix:** require each shard and `first` to name a single portable GGUF file. Reject path separators, absolute/drive paths, alternate streams, control characters, Windows device names, and invalid suffixes. Require unique split numbers and filenames, a bound first shard, and canonical SHA-256 text. Apply filename validation again at serving/download boundaries, and exclude symbolic links and nonregular files when checking existing shards.
 
 **Scope:** the model directory must remain private to its operator and contain only files intended for sharing. This does not defend against a local process that can change the directory between checking and opening a file, or malicious native-model contents. Model ids continue to identify the shard hash list, not authenticate every manifest field. Temporary-download handling is the next review item.
 
 Reference: [Microsoft's filename and device-name rules](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file) apply on every platform so moving a manifest to Windows does not change its safety.
+
+### P11 — Downloads clobbered partial files and ignored declared size
+
+**Status:** fixed; all 108 regular Windows tests pass, including five download regressions. The original downloader reused `file.part`, overwriting another attempt's partial file. Peer and HTTP downloads also accepted more bytes than the declared shard size if the larger payload's hash matched. A corrected cancellation regression confirmed that abandoning a download left its partial file behind.
+
+**Fix:** each attempt exclusively creates a randomly named temporary file, held by an ownership guard that removes only that attempt's file on error or cancellation. File creation itself runs in a blocking job whose discarded result still owns cleanup. Peer connections close on cancellation. Refuse peer replies larger than their requested range and HTTP bodies larger than the manifest size before writing them. Check exact final size and SHA-256 before renaming into place; existing partial files are preserved. Unix temporary files are created with mode `0600`; Windows inherits the containing directory's access rules.
+
+**Scope:** this bounds a download by its declared size, not a total disk quota. Abrupt process termination or filesystem errors can still leave randomly named partial files; they are never installed as completed shards without size and hash validation. HTTP seeds remain disabled in strict Tor mode.
+
+Reference: Rust's [`create_new` semantics](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new) provide exclusive creation and refuse an existing symbolic link.
 
 ## Checks completed without a finding so far
 
@@ -152,5 +162,12 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P10 reproduction | Serve a manifest entry pointing outside the model folder | Failed as expected: returned the dummy private file |
 | P01–P08 revision `b2408e7` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42400847767) | Both jobs passed |
 | P01–P10 | Complete Windows release workspace | 103 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| P11 reproduction | Existing partial file, oversized peer response, oversized chunked HTTP body | All three failed as expected on the original downloader |
+| P11 cancellation reproduction | Cancel after the temporary file is created | Failed as expected: the file remained |
+| P11 targeted fixes | The four download regressions | 4 passed, 0 failed |
+| P01–P11 | Complete Windows release workspace, including short/bad-hash download cleanup | 108 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| P01–P10 revision `86b3a46` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42401459065) | Both jobs passed, including Unix permissions and shard symlink regressions |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.
+
+The first P11 cancellation fixture waited for buffered bytes to become visible on disk and timed out before exercising cancellation. It now waits for temporary-file creation, and the corrected test failed on the original code because cleanup was absent. Its cleanup assertion permits the file-creation worker to finish after cancellation.

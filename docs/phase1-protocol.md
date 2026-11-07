@@ -297,8 +297,13 @@ A stage loaded from a shard set answers `ShardGet` for any shard present on its 
 (no `Hello` needed). `dfin fetch` and `dfin stage --fetch` download missing shards:
 first from directory nodes that serve the same model id (those whose layer range
 contains the shard's layer are tried first, then any), then from seeds. A download
-goes to `file.part`, is hashed against the manifest, and is renamed into place; a
-mismatch is deleted and the next source tried. The fetcher keeps retrying until
+goes to an exclusively created `.dfin-download-<random>.part`, is checked for exact
+size and SHA-256, and is renamed into place; a mismatch is deleted and the next
+source tried. Oversized peer ranges and HTTP bodies are refused before writing.
+Cancellation closes the peer connection and removes that attempt's temporary file;
+existing partial files are preserved. Abrupt process termination or filesystem
+errors can leave random partial files, but they are not installed as valid shards.
+The fetcher keeps retrying until
 `--wait` elapses, so a node can start before its peers are listed.
 
 Not yet: swarm-style parallel chunks from several holders, resuming a partial file,

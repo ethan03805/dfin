@@ -3,6 +3,7 @@ name = "dfin-llama-sys"
 description = "Raw FFI bindings to the vendored (layer-range patched) libllama"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 links = "llama"
 build = "build.rs"

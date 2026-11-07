@@ -5,9 +5,9 @@
 //! on a `tokio::sync::mpsc` channel (`blocking_recv`) and events go back on a
 //! per-job channel (`blocking_send`).
 
-use super::sampling::{Sampler, SamplingParams};
 use super::directory::{self, DirectoryInfo};
 use super::route::{HopCounters, ReturnPolicy, Route, RouteCounters, RouteError};
+use super::sampling::{Sampler, SamplingParams};
 use super::text::{StopMatcher, Utf8Accumulator};
 use crate::config::{LayerRange, RegionFence, RouteConfig, StageEndpoint, StageEndpointToml};
 use anyhow::Context as _;
@@ -132,6 +132,7 @@ pub enum Event {
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
+    pub network: crate::network::Network,
     /// The GGUF to load (a single file or the first split of a shard set).
     pub model_path: PathBuf,
     /// Model identity for `Hello` and the directory: a shard set's model id, or the
@@ -179,6 +180,7 @@ pub struct RouteEntry {
 /// Facts fixed at startup, for `/status`.
 #[derive(Clone, Debug)]
 pub struct StaticInfo {
+    pub private_network: bool,
     pub model_path: PathBuf,
     pub n_layer: i32,
     pub n_embd: i32,
@@ -289,7 +291,7 @@ impl Resolver {
         exclude: &HashSet<NodeId>,
     ) -> Result<Vec<StageEndpoint>, String> {
         let now = crate::hub::unix_now();
-        let (dir, from_cache) = match directory::fetch(rt, endpoint, &self.hub) {
+        let (mut dir, from_cache) = match directory::fetch(rt, endpoint, &self.hub) {
             Ok((signed, dir)) => {
                 if let Some(c) = &self.cache {
                     directory::save_cache(c, &signed);
@@ -298,12 +300,19 @@ impl Resolver {
             }
             Err(e) => {
                 tracing::warn!("{e}; trying the cached directory");
-                match self.cache.as_ref().and_then(|c| directory::load_cache(c, &self.hub)) {
+                match self
+                    .cache
+                    .as_ref()
+                    .and_then(|c| directory::load_cache(c, &self.hub))
+                {
                     Some(dir) => (dir, true),
                     None => return Err(e),
                 }
             }
         };
+        if endpoint.is_private() {
+            directory::onion_only(&mut dir);
+        }
         let sel = directory::select_route(
             &dir,
             now,
@@ -321,7 +330,10 @@ impl Resolver {
             from_cache,
             nodes_listed: listed,
             nodes_usable: usable,
-            fence: self.fence.as_ref().map(|f| format!("{}:{}", f.region, f.max_rtt_ms)),
+            fence: self
+                .fence
+                .as_ref()
+                .map(|f| format!("{}:{}", f.region, f.max_rtt_ms)),
             nodes_fenced_out: fenced_out,
         };
         let route = sel.route.ok_or_else(|| {
@@ -384,7 +396,10 @@ pub async fn spawn(
     let (job_tx, job_rx) = mpsc::channel::<Job>(queue.max(1));
     let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<StaticInfo>>();
     // One ephemeral client key per daemon start; stages see this instead of an account.
-    let endpoint = Endpoint::client(NodeKey::generate()).context("creating QUIC endpoint")?;
+    let endpoint = cfg
+        .network
+        .client(NodeKey::generate())
+        .context("creating network endpoint")?;
     let rt = tokio::runtime::Handle::current();
     std::thread::Builder::new()
         .name("dfin-engine".into())
@@ -545,7 +560,12 @@ impl Engine {
         let head_out = head.n_embd_out();
         let tail_in = tail.n_embd_inp();
         if head_out != n_embd as usize || tail_in != n_embd as usize {
-            tracing::info!(head_out, tail_in, n_embd, "stage state is wider than n_embd");
+            tracing::info!(
+                head_out,
+                tail_in,
+                n_embd,
+                "stage state is wider than n_embd"
+            );
         }
         tracing::info!(
             n_ctx = head.n_ctx(),
@@ -597,6 +617,7 @@ impl Engine {
         let route_info = route_entries(cfg.head, tail_range, route.as_ref());
 
         let info = StaticInfo {
+            private_network: endpoint.is_private(),
             model_path: cfg.model_path.clone(),
             n_layer,
             n_embd,
@@ -653,9 +674,43 @@ impl Engine {
                     let _ = events.blocking_send(Event::Error(api));
                 }
             }
+            self.finish_private_request();
             self.publish_stats();
         }
         tracing::info!("job queue closed; engine thread exiting");
+    }
+
+    /// Privacy contexts are HTTP requests, not daemon lifetimes. Remote routes and
+    /// local prefix caches are released on success, error, and cancellation alike.
+    fn finish_private_request(&mut self) {
+        if !self.endpoint.is_private() {
+            return;
+        }
+        if let Some(route) = &mut self.route {
+            route.disconnect();
+        }
+        self.endpoint.close();
+        for idx in 0..self.sessions.len() {
+            self.reset_session(idx);
+        }
+    }
+
+    fn start_private_request(&mut self) -> Result<(), EngineErr> {
+        if !self.endpoint.is_private() {
+            return Ok(());
+        }
+        let fresh = self
+            .endpoint
+            .isolated_client()
+            .map_err(|e| EngineErr::Other(e.to_string()))?;
+        self.endpoint.close();
+        self.endpoint = fresh;
+        // A daemon-wide counter would link otherwise fresh identities across requests.
+        self.seq = 0;
+        if let Some(route) = &mut self.route {
+            route.replace_endpoint(self.endpoint.clone());
+        }
+        Ok(())
     }
 
     fn publish_stats(&self) {
@@ -878,6 +933,7 @@ impl Engine {
         if self.sessions.iter().all(|s| s.busy) {
             return reject(ApiError::overloaded("all sessions busy"));
         }
+        self.start_private_request()?;
         self.ensure_connected()?;
         let max_tokens = (job.params.max_tokens as usize).min(self.per_session_ctx - prompt.len());
 

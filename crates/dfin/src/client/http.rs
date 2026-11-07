@@ -33,14 +33,48 @@ pub struct Shared {
 pub type AppState = Arc<Shared>;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let private = state.info.private_network;
+    let router = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/status", get(status))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state)
+        .with_state(state);
+    if private {
+        router.layer(axum::middleware::from_fn(local_request_only))
+    } else {
+        router.layer(tower_http::cors::CorsLayer::permissive())
+    }
+}
+
+/// Loopback binding alone does not stop a hostile webpage or DNS rebinding.
+/// Native callers omit Origin. Browser callers must be same-origin on numeric loopback.
+async fn local_request_only(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !local_headers(req.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "strict mode API requires a local same-origin request",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn local_headers(headers: &axum::http::HeaderMap) -> bool {
+    let Some(host) = headers.get("host").and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    let Ok(addr) = host.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    if !addr.ip().is_loopback() {
+        return false;
+    }
+    match headers.get("origin") {
+        None => true,
+        Some(origin) => origin.to_str().is_ok_and(|o| o == format!("http://{host}")),
+    }
 }
 
 pub fn unix_now() -> u64 {
@@ -118,6 +152,14 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
     };
     Json(json!({
         "model": st.model_name,
+        "privacy": {
+            "network": if st.info.private_network { "tor" } else { "direct" },
+            "direct_fallback": false,
+            "request_identity_rotation": st.info.private_network,
+            "cross_request_prefix_cache": !st.info.private_network,
+            "content_confidential_from_nodes": false,
+            "attestation_verified": false,
+        },
         "model_path": st.info.model_path.display().to_string(),
         "n_layer": st.info.n_layer,
         "n_embd": st.info.n_embd,
@@ -175,7 +217,6 @@ struct StreamOptions {
 #[derive(Deserialize)]
 struct CommonFields {
     #[serde(default)]
-    #[allow(dead_code)]
     model: Option<String>,
     max_tokens: Option<u32>,
     max_completion_tokens: Option<u32>,
@@ -366,6 +407,15 @@ async fn run_generation(
     prompt: PromptInput,
     common: &CommonFields,
 ) -> Response {
+    if let Some(model) = &common.model {
+        if model != &st.model_name {
+            return ApiError::bad_request(format!(
+                "only model {:?} is served; attested or other trust tiers are not implemented",
+                st.model_name
+            ))
+            .into_response();
+        }
+    }
     let params = match gen_params(common) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -529,6 +579,32 @@ fn final_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_api_rejects_cross_origin_and_rebinding_hosts() {
+        let mut h = axum::http::HeaderMap::new();
+        assert!(!local_headers(&h));
+        h.insert("host", "127.0.0.1:8080".parse().unwrap());
+        assert!(local_headers(&h));
+        h.insert("origin", "http://127.0.0.1:8080".parse().unwrap());
+        assert!(local_headers(&h));
+        for origin in ["null", "https://evil.example", "http://127.0.0.1:8081"] {
+            h.insert("origin", origin.parse().unwrap());
+            assert!(!local_headers(&h));
+        }
+        h.remove("origin");
+        for host in [
+            "evil.example:8080",
+            "localhost:8080",
+            "0.0.0.0:8080",
+            "127.0.0.1.evil:8080",
+        ] {
+            h.insert("host", host.parse().unwrap());
+            assert!(!local_headers(&h));
+        }
+        h.insert("host", "[::1]:8080".parse().unwrap());
+        assert!(local_headers(&h));
+    }
 
     #[test]
     fn content_parts_concatenate_text() {

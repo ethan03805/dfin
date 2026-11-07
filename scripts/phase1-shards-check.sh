@@ -33,10 +33,10 @@ PYEOF
 echo "$(ls "$PART" | wc -l) files, $(du -sh "$PART" | cut -f1)"
 
 echo "### stage A 1:24 from the full shard set, stage B 24:46 from the partial directory"
-"$B" stage --model "$MAN" --layers 1:24 --listen 127.0.0.1:$PA_PORT --identity shards-a.key \
+"$B" --network direct stage --model "$MAN" --layers 1:24 --listen 127.0.0.1:$PA_PORT --identity shards-a.key \
     --n-gpu-layers -1 --cpu-tensors exps --mlock --n-ctx 8192 --n-seq-max 2 --act-dtype $ACT --log info > shards-a.log 2>&1 &
 PA=$!
-"$B" stage --model "$PART/$MANNAME" --layers 24:46 --listen 127.0.0.1:$PB_PORT --identity shards-b.key \
+"$B" --network direct stage --model "$PART/$MANNAME" --layers 24:46 --listen 127.0.0.1:$PB_PORT --identity shards-b.key \
     --n-gpu-layers -1 --cpu-tensors exps --mlock --n-ctx 8192 --n-seq-max 2 --act-dtype $ACT --log info > shards-b.log 2>&1 &
 PB=$!
 for i in $(seq 1 600); do grep -q "stage ready" shards-a.log 2>/dev/null && grep -q "stage ready" shards-b.log 2>/dev/null && break; sleep 1; done
@@ -47,7 +47,7 @@ echo "--- stage B's loader on the partial directory:"
 strip < shards-b.log | grep -E "absent|tensors present|resident|skipping it|Error" | cut -c1-160 | head -6
 
 echo "### client: head 0:1 and tail 46:end from the full shard set"
-"$B" client --model "$MAN" --head 0:1 --tail 46:end --stage "127.0.0.1:$PA_PORT/$IDA=1:24" --stage "127.0.0.1:$PB_PORT/$IDB=24:46" \
+"$B" --network direct client --model "$MAN" --head 0:1 --tail 46:end --stage "127.0.0.1:$PA_PORT/$IDA=1:24" --stage "127.0.0.1:$PB_PORT/$IDB=24:46" \
     --listen $API --n-gpu-layers -1 --cpu-tensors exps --max-sessions 2 --n-ctx 8192 --act-dtype $ACT --log info > shards-client.log 2>&1 &
 PC=$!
 for i in $(seq 1 300); do curl.exe -s "http://$API/health" >/dev/null 2>&1 && break; sleep 1; done

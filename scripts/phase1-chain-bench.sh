@@ -10,7 +10,7 @@ B=target/release/dfin.exe; [ -f "$B" ] || B=target/release/dfin
 strip() { sed 's/\x1b\[[0-9;]*m//g'; }
 for mode in direct reverse; do
     echo "### return mode: $mode"
-    "$B" bench --model "$MODEL" --split "$SPLIT" --prompt-tokens "$PROMPT" --gen-tokens "$GEN" \
+    "$B" --network direct bench --model "$MODEL" --split "$SPLIT" --prompt-tokens "$PROMPT" --gen-tokens "$GEN" \
         --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --return "$mode" --log warn 2>&1 \
         | strip | grep -E "^\| |^model:|^layer-range"
 done

@@ -11,15 +11,15 @@ B=target/release/dfin.exe; [ -f "$B" ] || B=target/release/dfin
 filter() { grep -E "^\| [123] "; }
 
 echo "### A. default threads, OMP_WAIT_POLICY=PASSIVE"
-OMP_WAIT_POLICY=PASSIVE "$B" bench --model "$MODEL" --split "$SPLIT" --gen-tokens 64 --prompt-tokens 256 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --log warn 2>&1 | filter
+OMP_WAIT_POLICY=PASSIVE "$B" --network direct bench --model "$MODEL" --split "$SPLIT" --gen-tokens 64 --prompt-tokens 256 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --log warn 2>&1 | filter
 echo "### B. --threads 3 per piece"
-"$B" bench --model "$MODEL" --split "$SPLIT" --gen-tokens 64 --prompt-tokens 256 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --threads 3 --log warn 2>&1 | filter
+"$B" --network direct bench --model "$MODEL" --split "$SPLIT" --gen-tokens 64 --prompt-tokens 256 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --threads 3 --log warn 2>&1 | filter
 echo "### C. --threads 3 and OMP_WAIT_POLICY=PASSIVE"
-OMP_WAIT_POLICY=PASSIVE "$B" bench --model "$MODEL" --split "$SPLIT" --gen-tokens 64 --prompt-tokens 256 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --threads 3 --log warn 2>&1 | filter
+OMP_WAIT_POLICY=PASSIVE "$B" --network direct bench --model "$MODEL" --split "$SPLIT" --gen-tokens 64 --prompt-tokens 256 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --threads 3 --log warn 2>&1 | filter
 
 echo "### D. memory per piece (GPU + experts in RAM)"
 PORT=8124
-"$B" pod --model "$MODEL" --split "$SPLIT" --listen 127.0.0.1:$PORT --base-port 7301 --n-ctx 8192 --n-seq-max 2 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --log info > pod-mem.log 2>&1 &
+"$B" --network direct pod --model "$MODEL" --split "$SPLIT" --listen 127.0.0.1:$PORT --base-port 7301 --n-ctx 8192 --n-seq-max 2 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --log info > pod-mem.log 2>&1 &
 PODPID=$!
 for i in $(seq 1 240); do curl.exe -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
 echo "pod ready after ${i}s"

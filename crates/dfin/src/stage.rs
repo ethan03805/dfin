@@ -18,17 +18,15 @@ use dfin_llama::{Context, ContextParams, FlashAttn, KvType, Model, ModelParams};
 use dfin_net::directory::sign_record;
 use dfin_net::transport::{reply, CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
 use dfin_net::tunnel::{pump, tunnel_socket};
+use dfin_net::RecvStream;
 use dfin_net::{unseal, Connection, Endpoint, NetError, NodeId, NodeKey};
 use dfin_proto::{
-    forward_frame_limit, read_frame_max, write_frame, ActDtype, Activations, ErrorCode,
-    HopRecord, HopStat, NextHop, NodeRecord, Request, Response, ReturnFrame, ReturnMode,
-    PROTOCOL_VERSION,
+    forward_frame_limit, read_frame_max, write_frame, ActDtype, Activations, ErrorCode, HopRecord,
+    HopStat, NextHop, NodeRecord, Request, Response, ReturnFrame, ReturnMode, PROTOCOL_VERSION,
 };
 use engine::{Engine, Job, Reply};
 use parking_lot::Mutex;
-use dfin_net::RecvStream;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -200,7 +198,36 @@ pub fn log_devices() {
     }
 }
 
-pub async fn run(args: StageArgs) -> anyhow::Result<()> {
+pub async fn run(args: StageArgs, network: crate::network::Network) -> anyhow::Result<()> {
+    if let Some(listen) = &args.listen {
+        network.listener(listen)?;
+    }
+    for hub in &args.hubs {
+        network.target(&hub.addr)?;
+    }
+    if network.private() {
+        anyhow::ensure!(
+            args.cloaks.is_empty(),
+            "UDP relay cloaking is unavailable in Tor mode; publish an onion service instead"
+        );
+        anyhow::ensure!(
+            args.region.is_empty(),
+            "region claims are disabled in strict anonymity mode"
+        );
+        anyhow::ensure!(
+            args.seeds.is_empty(),
+            "HTTP seeds are disabled in strict anonymity mode"
+        );
+        if !args.hubs.is_empty() {
+            network.target(
+                args.advertise
+                    .as_deref()
+                    .context("Tor announcements require --advertise <v3-onion>:<port>")?,
+            )?;
+        } else if let Some(advertise) = &args.advertise {
+            network.target(advertise)?;
+        }
+    }
     dfin_llama::init();
     if args.layers.begin == 0 || args.layers.end == -1 {
         bail!(
@@ -230,7 +257,9 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         if args.hubs.is_empty() && args.seeds.is_empty() && manifest.seeds.is_empty() {
             bail!("--fetch needs a --hub or a --seed to fetch from");
         }
-        let ep = Endpoint::client(key.clone()).context("creating fetch endpoint")?;
+        let ep = network
+            .client(NodeKey::generate())
+            .context("creating fetch endpoint")?;
         let n = crate::fetch::fetch_missing(
             &ep,
             manifest,
@@ -327,7 +356,11 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         n_ctx_seq,
         n_seq_max,
         n_batch: args.n_batch,
-        backend: backend_summary(args.n_gpu_layers),
+        backend: if network.private() {
+            String::new()
+        } else {
+            backend_summary(args.n_gpu_layers)
+        },
         node_id: key.id(),
     });
 
@@ -336,20 +369,18 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
 
     let listen_text = match (&args.listen, args.cloaks.is_empty()) {
         (Some(l), _) => Some(l.clone()),
-        (None, true) => Some("0.0.0.0:7001".to_string()),
+        (None, true) => Some("127.0.0.1:7001".to_string()),
         (None, false) => None,
     };
     let (endpoint, listening) = match &listen_text {
         Some(l) => {
-            let listen: SocketAddr = tokio::net::lookup_host(l)
+            let ep = network
+                .server(key, l)
                 .await
-                .with_context(|| format!("resolving {l}"))?
-                .next()
-                .with_context(|| format!("{l} resolved to nothing"))?;
-            let ep = Endpoint::server(key, listen).with_context(|| format!("listening on {listen}"))?;
+                .with_context(|| format!("listening on {l}"))?;
             (ep, true)
         }
-        None => (Endpoint::client(key).context("creating endpoint")?, false),
+        None => (network.client(key).context("creating endpoint")?, false),
     };
     let addr = endpoint.local_addr()?;
     if listening {
@@ -413,7 +444,7 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
             protocol: PROTOCOL_VERSION,
             region: args.region.clone(),
             attested: false,
-            cloaked: !args.cloaks.is_empty(),
+            cloaked: network.private() || !args.cloaks.is_empty(),
             issued_at: 0,
             ttl_secs: (args.announce_every.max(5) * 3).min(dfin_proto::MAX_RECORD_TTL_SECS as u64)
                 as u32,
@@ -459,9 +490,9 @@ async fn accept_loop(stage: Arc<Stage>, endpoint: Endpoint) {
         tokio::spawn(async move {
             let peer = conn.remote_address();
             let id = conn.peer_id();
-            debug!(%peer, peer_id = %id.short(), "connection opened");
+            debug!(?peer, peer_id = %id.short(), "connection opened");
             stage.serve_conn(conn).await;
-            debug!(%peer, peer_id = %id.short(), "connection closed");
+            debug!(?peer, peer_id = %id.short(), "connection closed");
         });
     }
 }
@@ -534,7 +565,9 @@ async fn announce_loop(
         let mut record = template.clone();
         record.issued_at = crate::hub::unix_now();
         record.addrs = advertise.iter().cloned().collect();
-        record.addrs.extend(stage.cloak_addrs.lock().iter().cloned());
+        record
+            .addrs
+            .extend(stage.cloak_addrs.lock().iter().cloned());
         if record.addrs.is_empty() {
             debug!("no address to announce yet");
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -568,7 +601,7 @@ async fn announce_loop(
                         record: signed.clone(),
                     },
                     MAX_CONTROL_FRAME,
-                    Duration::from_secs(20),
+                    Duration::from_secs(if endpoint.is_private() { 90 } else { 20 }),
                 )
                 .await;
             match r {
@@ -688,7 +721,10 @@ enum ReadErr {
 
 impl Stage {
     fn max_forward_frame(&self) -> u32 {
-        forward_frame_limit(self.info.n_batch, self.info.n_embd_inp.max(self.info.n_embd_out))
+        forward_frame_limit(
+            self.info.n_batch,
+            self.info.n_embd_inp.max(self.info.n_embd_out),
+        )
     }
 
     async fn serve_conn(self: &Arc<Self>, conn: Connection) {
@@ -739,7 +775,9 @@ impl Stage {
         };
         let (len, tag) = match tokio::time::timeout(CONTROL_TIMEOUT, head).await {
             Ok(Ok(x)) => x,
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(ReadErr::Eof),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(ReadErr::Eof)
+            }
             Ok(Err(e)) => return Err(ReadErr::Net(e.into())),
             Err(_) => return Err(ReadErr::Bad("timed out reading the request header".into())),
         };
@@ -761,7 +799,9 @@ impl Stage {
         }
         let mut body = vec![0u8; len as usize];
         body[0] = tag;
-        match tokio::time::timeout(budget, AsyncReadExt::read_exact(&mut recv, &mut body[1..])).await {
+        match tokio::time::timeout(budget, AsyncReadExt::read_exact(&mut recv, &mut body[1..]))
+            .await
+        {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(ReadErr::Net(e.into())),
             Err(_) => return Err(ReadErr::Bad("timed out reading the request body".into())),
@@ -840,10 +880,20 @@ impl Stage {
                 match self.run_job(job, rx).await {
                     Reply::Ok => {}
                     Reply::Error { code, message } => return error(code, message),
-                    Reply::Forward { .. } => return error(ErrorCode::Internal, "engine replied oddly"),
+                    Reply::Forward { .. } => {
+                        return error(ErrorCode::Internal, "engine replied oddly")
+                    }
                 }
-                self.downstream_ack(&rs, &Request::SeqRm { route, session, p0, p1 })
-                    .await
+                self.downstream_ack(
+                    &rs,
+                    &Request::SeqRm {
+                        route,
+                        session,
+                        p0,
+                        p1,
+                    },
+                )
+                .await
             }
             Request::SessionClose { route, session } => {
                 let Some(rs) = st.routes.lock().get(&route).cloned() else {
@@ -858,7 +908,9 @@ impl Stage {
                 match self.run_job(job, rx).await {
                     Reply::Ok => {}
                     Reply::Error { code, message } => return error(code, message),
-                    Reply::Forward { .. } => return error(ErrorCode::Internal, "engine replied oddly"),
+                    Reply::Forward { .. } => {
+                        return error(ErrorCode::Internal, "engine replied oddly")
+                    }
                 }
                 self.downstream_ack(&rs, &Request::SessionClose { route, session })
                     .await
@@ -874,9 +926,10 @@ impl Stage {
             | Request::RelayListen
             | Request::Announce { .. }
             | Request::DirectoryGet
-            | Request::Probe { .. } => {
-                error(ErrorCode::BadRequest, "this node is a stage, not a relay or hub")
-            }
+            | Request::Probe { .. } => error(
+                ErrorCode::BadRequest,
+                "this node is a stage, not a relay or hub",
+            ),
         }
     }
 
@@ -955,7 +1008,10 @@ impl Stage {
         {
             let routes = st.routes.lock();
             if routes.contains_key(&route) {
-                return error(ErrorCode::BadRequest, format!("route {route} already exists"));
+                return error(
+                    ErrorCode::BadRequest,
+                    format!("route {route} already exists"),
+                );
             }
             if routes.len() >= self.max_routes {
                 return error(
@@ -1158,10 +1214,7 @@ impl Stage {
                     .await;
                 match r {
                     Ok(resp) => resp,
-                    Err(e) => error(
-                        ErrorCode::Downstream,
-                        format!("next hop {}: {e}", nh.addr),
-                    ),
+                    Err(e) => error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)),
                 }
             }
             None => match &rs.ret {
@@ -1242,7 +1295,8 @@ impl Stage {
 
     async fn close_route(&self, rs: &RouteState, route: u64) -> Response {
         let _ = self.jobs.send(Job::CloseConn { conn: rs.handle }).await;
-        self.downstream_ack(rs, &Request::RouteClose { route }).await
+        self.downstream_ack(rs, &Request::RouteClose { route })
+            .await
     }
 
     async fn teardown(&self, st: &Arc<ConnState>) {

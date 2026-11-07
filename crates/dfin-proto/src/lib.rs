@@ -49,7 +49,9 @@ impl std::str::FromStr for ActDtype {
         match s.to_ascii_lowercase().as_str() {
             "f32" => Ok(ActDtype::F32),
             "f16" => Ok(ActDtype::F16),
-            other => Err(format!("unknown activation dtype {other:?} (expected f32 or f16)")),
+            other => Err(format!(
+                "unknown activation dtype {other:?} (expected f32 or f16)"
+            )),
         }
     }
 }
@@ -240,23 +242,38 @@ pub enum Request {
         p1: i32,
     },
     /// Free all state for a session along the route.
-    SessionClose { route: u64, session: u64 },
+    SessionClose {
+        route: u64,
+        session: u64,
+    },
     /// Tear the route down along the chain.
-    RouteClose { route: u64 },
+    RouteClose {
+        route: u64,
+    },
     Ping,
     /// Client to relay: pipe my streams to `first_hop` under `token`.
-    RelayOpen { token: [u8; 16], first_hop: NextHop },
+    RelayOpen {
+        token: [u8; 16],
+        first_hop: NextHop,
+    },
     /// Last hop to relay: pipe my one-way streams to the client holding `token`.
-    RelayAttach { token: [u8; 16] },
+    RelayAttach {
+        token: [u8; 16],
+    },
     /// Cloaked node to relay: bind a public port for me and tunnel its datagrams on this
     /// stream. The reply is `RelayListening`; the stream then carries packet frames.
     RelayListen,
     /// Node to hub: list me. The hub verifies the signature and dials the first address.
-    Announce { record: SignedRecord },
+    Announce {
+        record: SignedRecord,
+    },
     /// Anyone to hub: the current signed directory.
     DirectoryGet,
     /// Hub to probe: ping `addr` (pinned to `node_id`) and report the round trip.
-    Probe { addr: String, node_id: [u8; 32] },
+    Probe {
+        addr: String,
+        node_id: [u8; 32],
+    },
     /// Fetch `len` bytes at `offset` of shard `split` of the model with id `model_id`
     /// from a node that holds it. Replies `Shard`.
     ShardGet {
@@ -294,7 +311,9 @@ pub enum Response {
         node_id: [u8; 32],
     },
     /// The route is set up; `hops` nodes acknowledged.
-    RouteOk { hops: u32 },
+    RouteOk {
+        hops: u32,
+    },
     Ack,
     ForwardOk {
         session: u64,
@@ -304,17 +323,27 @@ pub enum Response {
     },
     Pong,
     /// The public `host:port` the relay forwards to the cloaked node.
-    RelayListening { addr: String },
+    RelayListening {
+        addr: String,
+    },
     /// A probe's answer: best-of-three round trip and the probe's region label.
-    Probed { rtt_ms: f32, region: String },
-    Directory { directory: SignedDirectory },
+    Probed {
+        rtt_ms: f32,
+        region: String,
+    },
+    Directory {
+        directory: SignedDirectory,
+    },
     /// A piece of a shard file; `total` is the file's full length.
     Shard {
         total: u64,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    Error { code: ErrorCode, message: String },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 /// A result delivered to a return target (direct or relay mode) on a one-way stream.
@@ -353,8 +382,9 @@ pub struct NodeRecord {
     pub region: String,
     /// Hardware attestation; always false until phase 2.
     pub attested: bool,
-    /// The addresses belong to relays; the node itself accepts no inbound connections
-    /// and cannot be placed by timing.
+    /// Addresses are onion services or relay tunnels, not the node's direct listener.
+    /// Geographic probes are not meaningful for these addresses. This flag is not
+    /// proof of anonymity or resistance to traffic correlation.
     pub cloaked: bool,
     /// Unix seconds when the record was made, and how long it is valid.
     pub issued_at: u64,
@@ -429,9 +459,7 @@ pub fn forward_frame_limit(n_tokens: u32, n_embd: u32) -> u32 {
     let payload = (n_tokens as u64)
         .saturating_mul(n_embd as u64)
         .saturating_mul(4);
-    payload
-        .saturating_add(65536)
-        .min(MAX_FRAME_BYTES as u64) as u32
+    payload.saturating_add(65536).min(MAX_FRAME_BYTES as u64) as u32
 }
 
 /// Write one length-prefixed postcard frame.
@@ -440,9 +468,13 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let body = postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let body =
+        postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if body.len() > MAX_FRAME_BYTES as usize {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let len = (body.len() as u32).to_le_bytes();
     w.write_all(&len).await?;
@@ -541,7 +573,11 @@ mod tests {
         let back: Request = read_frame(&mut cur).await.unwrap();
         match back {
             Request::Forward {
-                session, seq, pos0, act, ..
+                session,
+                seq,
+                pos0,
+                act,
+                ..
             } => {
                 assert_eq!((session, seq, pos0), (7, 3, 10));
                 assert_eq!(act.n_tokens, 2);

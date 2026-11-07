@@ -11,6 +11,13 @@ Last updated 7 November 2026. Phase 0 (one LAN pod) is complete. Phase 1 (the
 encrypted chain) is complete except for failover of a live session. Phases 2 (trust and
 money) and 3 (scale) have not started.
 
+Strict Tor anonymity is now the default: onion-only destinations, pinned TLS identities,
+separate discovery/request keys, and no direct fallback. The Windows workspace suite
+passes 71 tests; a separate real Tor integration test also passes on a private
+nine-node Tor network. This does not yet
+provide content confidentiality, verified computation, or anonymous payment credits.
+See [setup and limits](docs/anonymity.md) and [the work log](docs/anonymity-work-log.md).
+
 ## Done
 
 | What | Where | How it was checked |

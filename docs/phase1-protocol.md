@@ -4,6 +4,11 @@ Status: being built, 6 November 2026. This is the contract between `dfin-net`,
 `dfin-proto` version 2, `dfin stage`, `dfin relay` and the client daemon. Design
 background is in [design-v0.2.md](design-v0.2.md) sections 8 and 13.
 
+**7 November update:** Tor is now the default transport; see
+[strict anonymity](anonymity.md) for its setup and security boundaries. Messages and
+sealed route records below are unchanged. QUIC, UDP relay cloaking, HTTP seeds, and
+region fencing below apply only to explicit `--network direct` mode.
+
 ## 1. Identities
 
 Every node and every client connection has an Ed25519 key.
@@ -11,7 +16,8 @@ Every node and every client connection has an Ed25519 key.
 - A **node key** is long-lived and lives in a file (`--identity path`, created on first
   run, 32 random bytes as hex). Its public key is the **node id**, written as 64 hex
   characters. Reputation and directory records attach to it.
-- A **client key** is ephemeral: one per client process start (later: per session).
+- A **client key** is ephemeral: one per HTTP generation request in Tor mode, with
+  separate keys for directory lookups; one per process start in direct mode.
   It identifies a connection to a stage so that a result can be returned to it, and
   it is what a stage sees instead of an account.
 - The same Ed25519 key, converted to X25519, receives sealed route instructions

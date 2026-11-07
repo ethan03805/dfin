@@ -23,10 +23,10 @@ use dfin_proto::{read_frame_max, ErrorCode, Request, Response};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use tokio::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 /// A client session that nobody attached to within this long is forgotten.
@@ -35,7 +35,7 @@ const UNATTACHED_TTL: Duration = Duration::from_secs(120);
 #[derive(Args, Debug)]
 pub struct RelayArgs {
     /// Address to listen on (UDP, QUIC).
-    #[arg(long, default_value = "0.0.0.0:7000")]
+    #[arg(long, default_value = "127.0.0.1:7000")]
     pub listen: String,
     /// Node key file (64 hex characters). Created if missing.
     #[arg(long, default_value = "dfin-relay.key")]
@@ -85,24 +85,25 @@ struct Relay {
     max_cloaked: usize,
 }
 
-pub async fn run(args: RelayArgs) -> anyhow::Result<()> {
+pub async fn run(args: RelayArgs, network: crate::network::Network) -> anyhow::Result<()> {
+    network.listener(&args.listen)?;
+    anyhow::ensure!(
+        !network.private() || (args.public_host.is_none() && args.port_range.is_none()),
+        "UDP relay cloaking options are unavailable in Tor mode"
+    );
     let key = NodeKey::load_or_create(&args.identity)
         .with_context(|| format!("node key {}", args.identity.display()))?;
-    let listen: SocketAddr = tokio::net::lookup_host(&args.listen)
-        .await
-        .with_context(|| format!("resolving {}", args.listen))?
-        .next()
-        .with_context(|| format!("{} resolved to nothing", args.listen))?;
-    let endpoint =
-        Endpoint::server(key, listen).with_context(|| format!("listening on {listen}"))?;
+    let endpoint = network.server(key, &args.listen).await?;
+    let listen = endpoint.local_addr()?;
     info!(
         "relay ready on {} node {}",
         endpoint.local_addr()?,
         endpoint.node_id()
     );
-    let public_host = args.public_host.clone().or_else(|| {
-        (!listen.ip().is_unspecified()).then(|| listen.ip().to_string())
-    });
+    let public_host = args
+        .public_host
+        .clone()
+        .or_else(|| (!listen.ip().is_unspecified()).then(|| listen.ip().to_string()));
     if public_host.is_none() {
         warn!("no --public-host and --listen is unspecified: cloaked nodes will be refused");
     }
@@ -198,16 +199,35 @@ impl Relay {
                 });
                 self.sessions.lock().insert(token, session);
                 reply(&mut send, &Response::Ack).await?;
-                debug!(peer = %conn.remote_address(), hop = %first_hop.addr, "client session opened");
+                debug!(peer = ?conn.remote_address(), hop = %first_hop.addr, "client session opened");
                 let r = self.pipe_client(&conn, &hop).await;
                 self.sessions.lock().remove(&token);
                 hop.close("client gone");
                 r
             }
             Request::RelayListen => {
+                if self.endpoint.is_private() {
+                    reply(
+                        &mut send,
+                        &error(
+                            ErrorCode::BadRequest,
+                            "UDP cloaking is disabled in Tor mode",
+                        ),
+                    )
+                    .await?;
+                    linger(&conn).await;
+                    return Ok(());
+                }
                 let node = conn.peer_id();
                 let Some(host) = self.public_host.clone() else {
-                    reply(&mut send, &error(ErrorCode::BadRequest, "this relay hosts no cloaked nodes (no public host)")).await?;
+                    reply(
+                        &mut send,
+                        &error(
+                            ErrorCode::BadRequest,
+                            "this relay hosts no cloaked nodes (no public host)",
+                        ),
+                    )
+                    .await?;
                     linger(&conn).await;
                     return Ok(());
                 };
@@ -216,14 +236,22 @@ impl Relay {
                     !cloaked.contains_key(&node) && cloaked.len() >= self.max_cloaked
                 };
                 if full {
-                    reply(&mut send, &error(ErrorCode::SessionLimit, "relay hosts no more cloaked nodes")).await?;
+                    reply(
+                        &mut send,
+                        &error(ErrorCode::SessionLimit, "relay hosts no more cloaked nodes"),
+                    )
+                    .await?;
                     linger(&conn).await;
                     return Ok(());
                 }
                 let sock = match bind_in_range(self.listen_ip, self.port_range).await {
                     Ok(s) => s,
                     Err(e) => {
-                        reply(&mut send, &error(ErrorCode::Internal, format!("no port free: {e}"))).await?;
+                        reply(
+                            &mut send,
+                            &error(ErrorCode::Internal, format!("no port free: {e}")),
+                        )
+                        .await?;
                         linger(&conn).await;
                         return Ok(());
                     }
@@ -232,8 +260,14 @@ impl Relay {
                 let public = format!("{host}:{port}");
                 self.cloaked.lock().insert(node, public.clone());
                 // Written without finishing: this stream now carries the tunnel.
-                dfin_proto::write_frame(&mut send, &Response::RelayListening { addr: public.clone() }).await?;
-                info!(node = %node.short(), peer = %conn.remote_address(), public = %public, "cloaked node listening");
+                dfin_proto::write_frame(
+                    &mut send,
+                    &Response::RelayListening {
+                        addr: public.clone(),
+                    },
+                )
+                .await?;
+                info!(node = %node.short(), peer = ?conn.remote_address(), public = %public, "cloaked node listening");
                 let r = forward_udp(sock, send, recv).await;
                 self.cloaked.lock().remove(&node);
                 debug!(node = %node.short(), "cloaked node gone: {r:?}");
@@ -241,18 +275,25 @@ impl Relay {
             }
             Request::RelayAttach { token } => {
                 let Some(session) = self.sessions.lock().get(&token).cloned() else {
-                    reply(&mut send, &error(ErrorCode::UnknownRoute, "unknown relay token")).await?;
+                    reply(
+                        &mut send,
+                        &error(ErrorCode::UnknownRoute, "unknown relay token"),
+                    )
+                    .await?;
                     linger(&conn).await;
                     return Ok(());
                 };
                 reply(&mut send, &Response::Ack).await?;
-                debug!(peer = %conn.remote_address(), "last hop attached");
+                debug!(peer = ?conn.remote_address(), "last hop attached");
                 self.pipe_returns(&conn, &session.client).await
             }
             _ => {
                 reply(
                     &mut send,
-                    &error(ErrorCode::BadRequest, "relay expects RelayOpen or RelayAttach"),
+                    &error(
+                        ErrorCode::BadRequest,
+                        "relay expects RelayOpen or RelayAttach",
+                    ),
                 )
                 .await?;
                 linger(&conn).await;
@@ -308,7 +349,8 @@ impl Relay {
     fn expire(&self) {
         let now = Instant::now();
         self.sessions.lock().retain(|_, s| {
-            !(s.client.is_closed() || now.duration_since(s.opened) > UNATTACHED_TTL && s.first_hop.is_closed())
+            !(s.client.is_closed()
+                || now.duration_since(s.opened) > UNATTACHED_TTL && s.first_hop.is_closed())
         });
     }
 }
@@ -370,7 +412,11 @@ impl SynthMap {
 
 /// Shuttle datagrams between a public UDP socket and a cloaked node's tunnel stream
 /// until either side fails.
-async fn forward_udp(sock: UdpSocket, mut send: SendStream, mut recv: RecvStream) -> std::io::Result<()> {
+async fn forward_udp(
+    sock: UdpSocket,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> std::io::Result<()> {
     let sock = Arc::new(sock);
     let map = Arc::new(Mutex::new(SynthMap::default()));
     let up = {
@@ -427,5 +473,5 @@ async fn pipe(mut from: RecvStream, mut to: SendStream) {
     if let Err(e) = tokio::io::copy(&mut from, &mut to).await {
         debug!("pipe ended: {e}");
     }
-    let _ = to.finish();
+    let _ = tokio::io::AsyncWriteExt::shutdown(&mut to).await;
 }

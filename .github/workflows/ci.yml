@@ -75,6 +75,25 @@ jobs:
       - name: cargo test --release --workspace
         run: cargo test --release --workspace --locked
 
+      - name: Install Tor for isolated integration testing
+        run: |
+          sudo systemctl mask tor.service tor@default.service
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends tor
+
+      - name: Inference through a private Tor network
+        run: python scripts/test-tor-local.py --tor /usr/bin/tor --work-dir "$RUNNER_TEMP/dfin-tor-test"
+
+      - name: Keep private Tor test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-tor-test-logs
+          path: |
+            ${{ runner.temp }}/dfin-tor-test/**/*.log
+            ${{ runner.temp }}/dfin-tor-test/tor-version.txt
+          if-no-files-found: ignore
+
       - name: The release binary runs on its own (rpath $ORIGIN)
         run: |
           cargo build --release --locked -p dfin

@@ -45,6 +45,13 @@ pub async fn fetch_async(
     hub: &NextHop,
 ) -> Result<(SignedDirectory, Directory), String> {
     let hub_id = NodeId(hub.node_id);
+    // A hub must not learn the client identity used for inference or shard fetching.
+    let isolated = if endpoint.is_private() {
+        Some(endpoint.isolated_client().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let endpoint = isolated.as_ref().unwrap_or(endpoint);
     let conn = endpoint
         .connect(&hub.addr, hub_id)
         .await
@@ -78,6 +85,22 @@ pub fn save_cache(path: &Path, signed: &SignedDirectory) {
             tracing::warn!("cannot write directory cache {}: {e}", path.display());
         }
     }
+}
+
+/// Filter even signed/cache-sourced records: a signature does not make a direct target private.
+pub fn onion_only(dir: &mut Directory) {
+    dir.entries.retain(|entry| {
+        verify_record(&entry.record).is_ok_and(|r| {
+            r.cloaked
+                && !r.attested
+                && r.region.is_empty()
+                && r.backend.is_empty()
+                && !r.addrs.is_empty()
+                && r.addrs
+                    .iter()
+                    .all(|a| dfin_net::privacy::onion_target(a).is_ok())
+        })
+    });
 }
 
 /// A verified, unexpired record that serves the right model.
@@ -202,9 +225,7 @@ pub fn select_route(
                 };
                 let better = match best.get(&r.layer_end) {
                     None => true,
-                    Some(b) => {
-                        (next.hops.len(), next.rtt_sum) < (b.hops.len(), b.rtt_sum)
-                    }
+                    Some(b) => (next.hops.len(), next.rtt_sum) < (b.hops.len(), b.rtt_sum),
                 };
                 if better {
                     best.insert(r.layer_end, next);
@@ -294,7 +315,13 @@ mod tests {
         e
     }
 
-    fn sel(d: &Directory, begin: i32, end: i32, exclude: &HashSet<NodeId>, fence: Option<&RegionFence>) -> Option<Vec<StageEndpoint>> {
+    fn sel(
+        d: &Directory,
+        begin: i32,
+        end: i32,
+        exclude: &HashSet<NodeId>,
+        fence: Option<&RegionFence>,
+    ) -> Option<Vec<StageEndpoint>> {
         select_route(d, 1010, "fp", 64, begin, end, exclude, fence).route
     }
 
@@ -304,6 +331,27 @@ mod tests {
             issued_at: 1000,
             entries,
         }
+    }
+
+    #[test]
+    fn private_selection_rejects_signed_direct_and_mixed_records() {
+        let key = NodeKey::generate();
+        let direct = entry(&key, 2, 6, 1.0, "fp");
+        let mut record = verify_record(&direct.record).unwrap();
+        record.addrs = vec![format!("{}.onion:7001", "a".repeat(56))];
+        record.cloaked = true;
+        record.backend.clear();
+        let mut onion = direct.clone();
+        onion.record = sign_record(&key, &record).unwrap();
+        record.addrs.push("127.0.0.1:7001".into());
+        let mut mixed = direct.clone();
+        mixed.record = sign_record(&key, &record).unwrap();
+        let mut directory = dir(vec![direct, onion, mixed]);
+        onion_only(&mut directory);
+        assert_eq!(directory.entries.len(), 1);
+        assert!(sel(&directory, 2, 6, &HashSet::new(), None).unwrap()[0]
+            .addr
+            .ends_with(".onion:7001"));
     }
 
     #[test]
@@ -336,7 +384,11 @@ mod tests {
         assert_eq!((s.listed, s.usable, s.fenced_out), (6, 4, 0));
         let route = s.route.unwrap();
         assert_eq!(route.len(), 1);
-        assert_eq!(route[0].node_id, c.id(), "one hop beats two, lower rtt beats higher");
+        assert_eq!(
+            route[0].node_id,
+            c.id(),
+            "one hop beats two, lower rtt beats higher"
+        );
 
         let exclude: HashSet<NodeId> = [c.id()].into_iter().collect();
         assert_eq!(sel(&d_, 2, 6, &exclude, None).unwrap()[0].node_id, d.id());
@@ -368,13 +420,19 @@ mod tests {
         )
         .unwrap();
         let d_ = dir(vec![
-            probed(entry(&near, 2, 6, 5.0, "fp"), &[("us", 20.0), ("us", 35.0), ("eu", 90.0)]),
+            probed(
+                entry(&near, 2, 6, 5.0, "fp"),
+                &[("us", 20.0), ("us", 35.0), ("eu", 90.0)],
+            ),
             probed(entry(&far, 2, 6, 1.0, "fp"), &[("us", 10.0), ("us", 70.0)]),
             entry(&unknown, 2, 6, 0.5, "fp"),
             probed(cl, &[("us", 1.0)]),
         ]);
         // No fence: the lowest hub round trip wins (the cloaked one).
-        assert_eq!(sel(&d_, 2, 6, &HashSet::new(), None).unwrap()[0].node_id, cloaked.id());
+        assert_eq!(
+            sel(&d_, 2, 6, &HashSet::new(), None).unwrap()[0].node_id,
+            cloaked.id()
+        );
         // us:50 admits only the near node: far fails its second probe, unknown has none,
         // cloaked is never inside a fence.
         let fence: RegionFence = "us:50".parse().unwrap();
@@ -385,7 +443,10 @@ mod tests {
         assert_eq!(s.fenced_out, 3);
         // us:80 admits far as well, and it has the lower hub round trip.
         let fence: RegionFence = "us:80".parse().unwrap();
-        assert_eq!(sel(&d_, 2, 6, &HashSet::new(), Some(&fence)).unwrap()[0].node_id, far.id());
+        assert_eq!(
+            sel(&d_, 2, 6, &HashSet::new(), Some(&fence)).unwrap()[0].node_id,
+            far.id()
+        );
         // eu:50 admits nobody.
         let fence: RegionFence = "eu:50".parse().unwrap();
         assert!(sel(&d_, 2, 6, &HashSet::new(), Some(&fence)).is_none());
@@ -469,12 +530,18 @@ mod tests {
             assert_eq!(s.listed, d_.entries.len());
             assert!(s.fenced_out <= s.usable && s.usable <= s.listed);
             let Some(route) = s.route else { continue };
-            assert!(begin == end || !route.is_empty(), "round {round}: empty route");
+            assert!(
+                begin == end || !route.is_empty(),
+                "round {round}: empty route"
+            );
             let mut cur = begin;
             for hop in &route {
                 assert_eq!(hop.layers.begin, cur, "round {round}: gap in the chain");
                 assert!(hop.layers.end > hop.layers.begin, "round {round}");
-                assert!(!hop.addr.is_empty(), "round {round}: hop without an address");
+                assert!(
+                    !hop.addr.is_empty(),
+                    "round {round}: hop without an address"
+                );
                 if let Some(f) = &fence {
                     assert!(!hop.cloaked, "round {round}: cloaked hop inside a fence");
                     assert_eq!(hop.fenced.as_deref(), Some(f.region.as_str()));

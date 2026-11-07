@@ -22,7 +22,6 @@ use dfin_proto::{
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,7 +30,7 @@ use tracing::{debug, info, warn};
 #[derive(Args, Debug)]
 pub struct HubArgs {
     /// Address to listen on (UDP, QUIC).
-    #[arg(long, default_value = "0.0.0.0:7100")]
+    #[arg(long, default_value = "127.0.0.1:7100")]
     pub listen: String,
     /// Node key file (64 hex characters). Created if missing. Clients pin its public key.
     #[arg(long, default_value = "dfin-hub.key")]
@@ -80,16 +79,18 @@ pub struct Hub {
     probe_conns: tokio::sync::Mutex<HashMap<NodeId, Connection>>,
 }
 
-pub async fn run(args: HubArgs) -> anyhow::Result<()> {
+pub async fn run(args: HubArgs, network: crate::network::Network) -> anyhow::Result<()> {
+    network.listener(&args.listen)?;
+    if let Some(http) = &args.http {
+        network.listener(http)?;
+    }
+    anyhow::ensure!(
+        !network.private() || (args.probes.is_empty() && args.region.is_none()),
+        "geographic probes and region claims are disabled in strict anonymity mode"
+    );
     let key = NodeKey::load_or_create(&args.identity)
         .with_context(|| format!("node key {}", args.identity.display()))?;
-    let listen: SocketAddr = tokio::net::lookup_host(&args.listen)
-        .await
-        .with_context(|| format!("resolving {}", args.listen))?
-        .next()
-        .with_context(|| format!("{} resolved to nothing", args.listen))?;
-    let endpoint =
-        Endpoint::server(key, listen).with_context(|| format!("listening on {listen}"))?;
+    let endpoint = network.server(key, &args.listen).await?;
     info!(
         "hub ready on {} node {}",
         endpoint.local_addr()?,
@@ -99,7 +100,11 @@ pub async fn run(args: HubArgs) -> anyhow::Result<()> {
         endpoint: endpoint.clone(),
         entries: Mutex::new(HashMap::new()),
         max_records: args.max_records.max(1),
-        probe_timeout: Duration::from_secs(args.probe_timeout.max(1)),
+        probe_timeout: Duration::from_secs(args.probe_timeout.max(if network.private() {
+            60
+        } else {
+            1
+        })),
         probes: args.probes.clone(),
         region: args.region.clone(),
         probe_conns: tokio::sync::Mutex::new(HashMap::new()),
@@ -116,7 +121,10 @@ pub async fn run(args: HubArgs) -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(http)
             .await
             .with_context(|| format!("binding {http}"))?;
-        info!("directory as JSON at http://{}/directory", listener.local_addr()?);
+        info!(
+            "directory as JSON at http://{}/directory",
+            listener.local_addr()?
+        );
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
                 warn!("http: {e}");
@@ -243,7 +251,10 @@ impl Hub {
         if record.protocol != PROTOCOL_VERSION {
             return Err(error(
                 ErrorCode::VersionMismatch,
-                format!("record speaks protocol {}, hub {}", record.protocol, PROTOCOL_VERSION),
+                format!(
+                    "record speaks protocol {}, hub {}",
+                    record.protocol, PROTOCOL_VERSION
+                ),
             ));
         }
         if record.addrs.is_empty() || record.addrs.len() > 8 {
@@ -268,7 +279,11 @@ impl Hub {
         if record.ttl_secs == 0 || record.ttl_secs > MAX_RECORD_TTL_SECS {
             return Err(error(ErrorCode::BadTimestamp, "ttl out of range"));
         }
-        if record.issued_at.checked_add(record.ttl_secs as u64).is_none() {
+        if record
+            .issued_at
+            .checked_add(record.ttl_secs as u64)
+            .is_none()
+        {
             // `expires_at` saturates; a record that never expires is not listed.
             return Err(error(ErrorCode::BadTimestamp, "record lifetime overflows"));
         }
@@ -289,6 +304,18 @@ impl Hub {
         let now = unix_now();
         if let Err(e) = Self::check(&record, now) {
             return e;
+        }
+        if self.endpoint.is_private()
+            && (!record.cloaked
+                || record.attested
+                || !record.region.is_empty()
+                || !record.backend.is_empty()
+                || record
+                    .addrs
+                    .iter()
+                    .any(|a| dfin_net::privacy::onion_target(a).is_err()))
+        {
+            return error(ErrorCode::BadRequest, "Tor directory requires onion-only cloaked records without region, hardware, or unverified attestation claims");
         }
         let id = NodeId(record.node_id);
         self.sweep();
@@ -492,7 +519,9 @@ mod tests {
             let mut p = |rng: &mut StdRng| rng.random_bool(0.25);
             if p(&mut rng) {
                 let n = [0usize, 1, 2, 8, 9, 40][rng.random_range(0..6)];
-                record.addrs = (0..n).map(|_| "a".repeat(lens[rng.random_range(0..lens.len())])).collect();
+                record.addrs = (0..n)
+                    .map(|_| "a".repeat(lens[rng.random_range(0..lens.len())]))
+                    .collect();
             }
             if p(&mut rng) {
                 record.model_fingerprint = "f".repeat(lens[rng.random_range(0..lens.len())]);
@@ -545,6 +574,9 @@ mod tests {
                 assert_eq!(record.protocol, PROTOCOL_VERSION);
             }
         }
-        assert!(accepted > 0, "the generator never produced an acceptable record");
+        assert!(
+            accepted > 0,
+            "the generator never produced an acceptable record"
+        );
     }
 }

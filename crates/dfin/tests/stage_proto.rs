@@ -62,7 +62,7 @@ fn spawn_stage(path: &Path, name: &str, range: (i32, i32), n_seq_max: u32) -> St
     ));
     key.save(&key_path).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_dfin"))
-        .args(["--log", "warn", "stage", "--model"])
+        .args(["--network", "direct", "--log", "warn", "stage", "--model"])
         .arg(path)
         .args(["--layers", &format!("{}:{}", range.0, range.1)])
         .args(["--listen", &addr.to_string()])
@@ -116,7 +116,12 @@ async fn wait_for_stage(ep: &Endpoint, st: &mut StageProc) {
     }
 }
 
-async fn hello(ep: &Endpoint, st: &StageProc, fingerprint: &str, range: (i32, i32)) -> (Connection, Response) {
+async fn hello(
+    ep: &Endpoint,
+    st: &StageProc,
+    fingerprint: &str,
+    range: (i32, i32),
+) -> (Connection, Response) {
     let conn = ep.connect(&st.addr.to_string(), st.id).await.unwrap();
     let r = call(
         &conn,
@@ -132,7 +137,11 @@ async fn hello(ep: &Endpoint, st: &StageProc, fingerprint: &str, range: (i32, i3
 }
 
 /// Build the sealed records for `hops` (addr, id, range), last hop returning as `ret`.
-fn sealed_route(fingerprint: &str, hops: &[(SocketAddr, NodeId, (i32, i32))], ret: ReturnMode) -> Vec<u8> {
+fn sealed_route(
+    fingerprint: &str,
+    hops: &[(SocketAddr, NodeId, (i32, i32))],
+    ret: ReturnMode,
+) -> Vec<u8> {
     let mut inner = Vec::new();
     for i in (0..hops.len()).rev() {
         let last = i + 1 == hops.len();
@@ -144,7 +153,11 @@ fn sealed_route(fingerprint: &str, hops: &[(SocketAddr, NodeId, (i32, i32))], re
                 addr: hops[i + 1].0.to_string(),
                 node_id: *hops[i + 1].1.as_bytes(),
             }),
-            ret: if last { ret.clone() } else { ReturnMode::Reverse },
+            ret: if last {
+                ret.clone()
+            } else {
+                ReturnMode::Reverse
+            },
             inner,
         };
         inner = seal(&hops[i].1, &postcard::to_stdvec(&rec).unwrap()).unwrap();
@@ -268,7 +281,7 @@ fn ready() -> Option<PathBuf> {
 #[tokio::test]
 async fn stage_matches_full_model() {
     let Some(path) = ready() else { return };
-    let ep = Endpoint::client(NodeKey::generate()).unwrap();
+    let ep = Endpoint::direct_client(NodeKey::generate()).unwrap();
     let mut st = spawn_stage(&path, "single", MID, 2);
     wait_for_stage(&ep, &mut st).await;
 
@@ -308,7 +321,8 @@ async fn stage_matches_full_model() {
 
     // Head locally.
     let mut head = cpu_piece(&path, 0, MID.0, true);
-    head.decode_tokens(&r.tokens, 0, 0, OutputMode::All).unwrap();
+    head.decode_tokens(&r.tokens, 0, 0, OutputMode::All)
+        .unwrap();
     let h = head.embeddings().to_vec();
     assert_eq!(h.len(), n * n_embd);
 
@@ -316,7 +330,13 @@ async fn stage_matches_full_model() {
     let session = 42u64;
     let resp = call(
         &s,
-        &forward(route, session, 1, 0, Activations::from_f32(&h, n, n_embd, ActDtype::F32)),
+        &forward(
+            route,
+            session,
+            1,
+            0,
+            Activations::from_f32(&h, n, n_embd, ActDtype::F32),
+        ),
     )
     .await;
     let (rs, rseq, act, hops) = forward_ok(resp);
@@ -411,7 +431,10 @@ async fn stage_matches_full_model() {
     let (s2, resp) = hello(&ep, &st, &fp, MID).await;
     assert!(matches!(resp, Response::HelloOk { .. }));
     let sealed = sealed_route(&fp, &[(st.addr, st.id, MID)], ReturnMode::Reverse);
-    assert!(matches!(setup(&s2, 12, sealed).await, Response::RouteOk { hops: 1 }));
+    assert!(matches!(
+        setup(&s2, 12, sealed).await,
+        Response::RouteOk { hops: 1 }
+    ));
     let mut freed = false;
     for _ in 0..50 {
         let resp = call(&s2, &forward(12, 7, 1, 0, one.clone())).await;
@@ -448,7 +471,10 @@ async fn stage_matches_full_model() {
             client_id: *ep.node_id().as_bytes(),
         },
     );
-    assert!(matches!(setup(&s2, 16, sealed).await, Response::RouteOk { hops: 1 }));
+    assert!(matches!(
+        setup(&s2, 16, sealed).await,
+        Response::RouteOk { hops: 1 }
+    ));
     let sealed = sealed_route(
         &fp,
         &[(st.addr, st.id, MID)],
@@ -488,7 +514,7 @@ async fn stage_matches_full_model() {
 #[tokio::test]
 async fn two_stage_chain_both_return_modes() {
     let Some(path) = ready() else { return };
-    let ep = Endpoint::client(NodeKey::generate()).unwrap();
+    let ep = Endpoint::direct_client(NodeKey::generate()).unwrap();
     let a_range = (MID.0, 5);
     let b_range = (5, MID.1);
     let mut a = spawn_stage(&path, "chain-a", a_range, 2);
@@ -505,7 +531,8 @@ async fn two_stage_chain_both_return_modes() {
         other => panic!("{other:?}"),
     };
     let mut head = cpu_piece(&path, 0, MID.0, true);
-    head.decode_tokens(&r.tokens, 0, 0, OutputMode::All).unwrap();
+    head.decode_tokens(&r.tokens, 0, 0, OutputMode::All)
+        .unwrap();
     let h = head.embeddings().to_vec();
     let hops = [(a.addr, a.id, a_range), (b.addr, b.id, b_range)];
 
@@ -517,7 +544,13 @@ async fn two_stage_chain_both_return_modes() {
     }
     let resp = call(
         &ca,
-        &forward(1, 5, 1, 0, Activations::from_f32(&h, n, n_embd, ActDtype::F32)),
+        &forward(
+            1,
+            5,
+            1,
+            0,
+            Activations::from_f32(&h, n, n_embd, ActDtype::F32),
+        ),
     )
     .await;
     let (_, _, act, stats) = forward_ok(resp);
@@ -553,11 +586,23 @@ async fn two_stage_chain_both_return_modes() {
     }
     let ack = call(
         &ca,
-        &forward(2, 6, 1, 0, Activations::from_f32(&h, n, n_embd, ActDtype::F32)),
+        &forward(
+            2,
+            6,
+            1,
+            0,
+            Activations::from_f32(&h, n, n_embd, ActDtype::F32),
+        ),
     )
     .await;
-    assert!(matches!(ack, Response::Ack), "direct forward reply: {ack:?}");
-    let mut uni = tokio::time::timeout(LONG, cb.accept_uni()).await.unwrap().unwrap();
+    assert!(
+        matches!(ack, Response::Ack),
+        "direct forward reply: {ack:?}"
+    );
+    let mut uni = tokio::time::timeout(LONG, cb.accept_uni())
+        .await
+        .unwrap()
+        .unwrap();
     let frame: ReturnFrame = read_frame_max(&mut uni, BIG).await.unwrap();
     assert_eq!((frame.route, frame.session, frame.seq), (2, 6, 1));
     let (_, _, act, stats) = forward_ok(frame.body);
@@ -567,7 +612,18 @@ async fn two_stage_chain_both_return_modes() {
     // Closing the route along the chain.
     let resp = call(&ca, &Request::RouteClose { route: 2 }).await;
     assert!(matches!(resp, Response::Ack), "RouteClose: {resp:?}");
-    match call(&ca, &forward(2, 6, 2, 0, Activations::from_f32(&h[..n_embd], 1, n_embd, ActDtype::F32))).await {
+    match call(
+        &ca,
+        &forward(
+            2,
+            6,
+            2,
+            0,
+            Activations::from_f32(&h[..n_embd], 1, n_embd, ActDtype::F32),
+        ),
+    )
+    .await
+    {
         Response::Error { code, .. } => assert_eq!(code, ErrorCode::UnknownRoute),
         other => panic!("expected UnknownRoute after RouteClose, got {other:?}"),
     }

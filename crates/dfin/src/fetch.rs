@@ -38,7 +38,14 @@ pub struct FetchArgs {
     pub wait: u64,
 }
 
-pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
+pub async fn run(args: FetchArgs, network: crate::network::Network) -> anyhow::Result<()> {
+    if let Some(hub) = &args.hub {
+        network.target(&hub.addr)?;
+    }
+    anyhow::ensure!(
+        !network.private() || args.seeds.is_empty(),
+        "HTTP seeds are disabled in strict anonymity mode; use onion peers or offline files"
+    );
     let manifest = Manifest::load(&args.manifest)?;
     let dir = args
         .out
@@ -47,7 +54,7 @@ pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
     let (begin, end) = args.layers.map(|r| (r.begin, r.end)).unwrap_or((0, -1));
-    let endpoint = Endpoint::client(NodeKey::generate())?;
+    let endpoint = network.client(NodeKey::generate())?;
     let n = fetch_missing(
         &endpoint,
         &manifest,
@@ -101,11 +108,31 @@ pub async fn fetch_missing(
         needed.len(),
         dir.display()
     );
-    let mut all_seeds: Vec<String> = manifest.seeds.clone();
-    all_seeds.extend(seeds.iter().cloned());
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()?;
+    let (all_seeds, http) = if endpoint.is_private() {
+        anyhow::ensure!(
+            seeds.is_empty(),
+            "HTTP seeds are disabled in strict anonymity mode"
+        );
+        anyhow::ensure!(
+            hub.is_some(),
+            "strict shard fetching requires an onion hub; manifest HTTP seeds are disabled"
+        );
+        if !manifest.seeds.is_empty() {
+            info!("ignoring manifest HTTP seeds in strict anonymity mode");
+        }
+        (Vec::new(), None)
+    } else {
+        let mut all_seeds = manifest.seeds.clone();
+        all_seeds.extend(seeds.iter().cloned());
+        (
+            all_seeds,
+            Some(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(600))
+                    .build()?,
+            ),
+        )
+    };
     let deadline = Instant::now() + wait;
     let mut fetched = 0usize;
     loop {
@@ -121,7 +148,17 @@ pub async fn fetch_missing(
         };
         let mut still = Vec::new();
         for split in missing {
-            if fetch_one(endpoint, &http, manifest, dir, &split, &peers, &all_seeds).await {
+            if fetch_one(
+                endpoint,
+                http.as_ref(),
+                manifest,
+                dir,
+                &split,
+                &peers,
+                &all_seeds,
+            )
+            .await
+            {
                 fetched += 1;
             } else {
                 still.push(split);
@@ -178,7 +215,7 @@ fn peers_for(dir: &dfin_proto::Directory, model_id: &str) -> Vec<Peer> {
 /// Try the peers that should hold `split` first, then every other peer, then the seeds.
 async fn fetch_one(
     endpoint: &Endpoint,
-    http: &reqwest::Client,
+    http: Option<&reqwest::Client>,
     manifest: &Manifest,
     dir: &Path,
     split: &Split,
@@ -205,6 +242,9 @@ async fn fetch_one(
         }
     }
     for seed in seeds {
+        let Some(http) = http else {
+            return false;
+        };
         match from_seed(http, dir, split, seed).await {
             Ok(()) => {
                 info!(shard = %split.file, from = %seed, "fetched from a seed");

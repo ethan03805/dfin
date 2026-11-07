@@ -3,6 +3,7 @@ name = "dfin"
 description = "Pipeline-parallel inference node: stage server, client daemon with OpenAI-compatible API, local pod launcher and benchmarks"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

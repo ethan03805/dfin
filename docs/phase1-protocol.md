@@ -284,6 +284,15 @@ shards of its layers, and the output shard if it holds the last layer. The llama
 patch lets the loader skip split files that are absent when a layer range is set; a
 tensor the range needs whose shard is absent is a clear error.
 
+A manifest's `first` must name split zero. Shard names must be distinct portable
+GGUF filenames of at most 200 UTF-8 bytes, with no directories, drive prefixes,
+alternate streams, control characters, or Windows device names. Split numbers are
+unique and hashes use 64 lowercase hexadecimal digits. Existing shards must be
+regular files rather than symbolic links. Keep the model directory private to its
+operator and keep private data outside it; the checks do not protect against a
+local writer racing file operations. The model id authenticates the hash list,
+not every manifest field.
+
 A stage loaded from a shard set answers `ShardGet` for any shard present on its disk
 (no `Hello` needed). `dfin fetch` and `dfin stage --fetch` download missing shards:
 first from directory nodes that serve the same model id (those whose layer range

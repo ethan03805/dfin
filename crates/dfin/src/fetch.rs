@@ -4,7 +4,7 @@
 
 use crate::client::directory;
 use crate::config::{parse_node_addr, LayerRange};
-use crate::shards::{have_split, sha256_file, Manifest, Split};
+use crate::shards::{have_split, sha256_file, shard_path, Manifest, Split};
 use anyhow::{bail, Context as _};
 use clap::Args;
 use dfin_net::directory::{validate_record, verify_record};
@@ -253,6 +253,7 @@ async fn fetch_one(
 
 /// Download to `<file>.part`, check the hash, then rename into place.
 async fn finish(dir: &Path, split: &Split, part: &Path) -> anyhow::Result<()> {
+    let destination = shard_path(dir, &split.file)?;
     let got = tokio::task::spawn_blocking({
         let part = part.to_path_buf();
         move || sha256_file(&part)
@@ -262,7 +263,7 @@ async fn finish(dir: &Path, split: &Split, part: &Path) -> anyhow::Result<()> {
         let _ = tokio::fs::remove_file(part).await;
         bail!("hash mismatch for {}: got {got}", split.file);
     }
-    tokio::fs::rename(part, dir.join(&split.file)).await?;
+    tokio::fs::rename(part, destination).await?;
     Ok(())
 }
 
@@ -273,6 +274,7 @@ async fn from_peer(
     split: &Split,
     peer: &Peer,
 ) -> anyhow::Result<()> {
+    shard_path(dir, &split.file)?;
     let conn = endpoint.connect(&peer.addr, peer.id).await?;
     let part = dir.join(format!("{}.part", split.file));
     let mut file = tokio::fs::File::create(&part).await?;
@@ -327,6 +329,7 @@ async fn from_seed(
     split: &Split,
     seed: &str,
 ) -> anyhow::Result<()> {
+    shard_path(dir, &split.file)?;
     let url = format!("{}/{}", seed.trim_end_matches('/'), split.file);
     let mut resp = http.get(&url).send().await?.error_for_status()?;
     let part = dir.join(format!("{}.part", split.file));
@@ -387,6 +390,54 @@ mod tests {
     use super::*;
     use dfin_net::{directory::sign_record, NodeKey};
     use dfin_proto::{ActDtype, Directory, DirectoryEntry, NodeRecord, PROTOCOL_VERSION};
+
+    #[tokio::test]
+    async fn manifest_cannot_expose_a_file_outside_the_model_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "dfin-shard-boundary-{:016x}",
+            rand::random::<u64>()
+        ));
+        let dir = root.join("model");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only a test canary is read; this never touches a real identity or secret.
+        let canary = b"private test data";
+        std::fs::write(root.join("private.gguf"), canary).unwrap();
+        let mut manifest = Manifest {
+            format: crate::shards::FORMAT.into(),
+            model_name: "test".into(),
+            arch: "llama".into(),
+            n_layer: 2,
+            first: "../private.gguf".into(),
+            splits: vec![Split {
+                no: 0,
+                file: "../private.gguf".into(),
+                size: canary.len() as u64,
+                sha256: "0".repeat(64),
+                kind: "meta".into(),
+                layer: None,
+                tensors: vec![],
+            }],
+            seeds: vec![],
+            model_id: String::new(),
+        };
+        manifest.model_id = manifest.compute_id();
+        let path = dir.join("test.manifest.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let loaded = Manifest::load(&path);
+        let served = serve_shard(&manifest, &dir, &manifest.model_id, 0, 0, 64).await;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(root.join("private.gguf")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        assert!(
+            served.is_err(),
+            "served a file outside the model directory: {served:?}"
+        );
+        assert!(
+            loaded.is_err(),
+            "accepted a manifest with an escaping file path"
+        );
+    }
 
     #[test]
     fn shard_discovery_rejects_signed_records_with_unbounded_lifetimes() {

@@ -95,6 +95,16 @@ The design also incorrectly implied that client-side route choice prevents a hub
 
 **Scope:** these bounds prevent the demonstrated accounting and cleanup failures. They do not stop Sybil identities from competing for capacity or guarantee service during an attack. Configured geographic probe connections remain shared in explicit direct mode; geographic probes are disabled in strict Tor mode.
 
+### P10 — Manifest shard paths could escape the model directory
+
+**Status:** fixed; all 103 regular Windows tests pass; the Unix symlink regression awaits Linux CI. A manifest could name `../private.gguf`, and `serve_shard` followed it outside the model directory. The regression returned a 17-byte dummy private file before the fix; no real identity or personal file was accessed. Filenames and sizes are not bound by the existing model-id calculation, so an unchanged model id alone did not prevent this.
+
+**Fix:** require each shard and `first` to name a single portable GGUF file. Reject path separators, absolute/drive paths, alternate streams, control characters, Windows device names, and invalid suffixes. Require unique split numbers and filenames, a bound first shard, and canonical SHA-256 text. Apply filename validation again at serving/download boundaries, and exclude symbolic links and nonregular files when checking existing shards.
+
+**Scope:** the model directory must remain private to its operator and contain only files intended for sharing. This does not defend against a local process that can change the directory between checking and opening a file, or malicious native-model contents. Model ids continue to identify the shard hash list, not authenticate every manifest field. Temporary-download handling is the next review item.
+
+Reference: [Microsoft's filename and device-name rules](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file) apply on every platform so moving a manifest to Windows does not change its safety.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -139,5 +149,8 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P09 reproduction | Concurrent capacity, duplicate pending announcement, disconnected caller | All three failed as expected on the original hub |
 | P09 targeted fixes | The same three hostile-announcement tests | 3 passed, 0 failed |
 | P01–P09 | Complete Windows release workspace | 100 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| P10 reproduction | Serve a manifest entry pointing outside the model folder | Failed as expected: returned the dummy private file |
+| P01–P08 revision `b2408e7` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42400847767) | Both jobs passed |
+| P01–P10 | Complete Windows release workspace | 103 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.

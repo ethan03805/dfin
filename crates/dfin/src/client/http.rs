@@ -131,6 +131,7 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
             "request_identity_rotation": st.info.private_network,
             "cross_request_prefix_cache": !st.info.private_network,
             "content_confidential_from_nodes": false,
+            "relay_can_read_model_states": st.info.return_mode == "relay" && !stage_entries.is_empty(),
             "attestation_verified": false,
         },
         "model_path": st.info.model_path.display().to_string(),

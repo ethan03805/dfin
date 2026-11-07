@@ -2,6 +2,8 @@
 
 **Design v0.1, 5 November 2026 (section 15 and 17 runtime notes updated the same day after the prior-art check)**
 
+**Historical design, not an implementation guarantee.** The 7 November privacy review corrected its ciphertext-only relay assumption: the current dfin application relay terminates transport encryption and can inspect model states. Tor is now the default; payments and trust protections described in later designs are still planned. Consult [the current guide](anonymity.md), [status](../STATUS.md), and [review findings](privacy-review.md) before relying on a privacy claim here.
+
 A network that runs frontier-scale open-weight models (GLM-5.3 and Kimi K3 as the stated goals) across hardware owned by many people, exposes the result as an OpenAI-compatible API that agent frameworks such as OpenCode and Hermes can point at, and pays for itself through compute credits rather than money. Trust is hybrid: an open public swarm for capacity, plus pods of vouched-for peers for sensitive work. Coordination is federated. The design treats confidentiality and anonymity as first-class requirements and is explicit about where they can and cannot be guaranteed on consumer hardware.
 
 ---

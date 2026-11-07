@@ -17,6 +17,8 @@ Once the local HTTP server observes a caller disconnecting, it closes that reque
 
 The client still runs the embedding and output head locally. A chain can use direct returns, reverse returns, or a dfin relay. Here, **direct return** means a return stream over an existing Tor connection; it does not enable direct IP networking. A dfin relay is optional and is not a replacement for Tor.
 
+The default does not use a dfin relay. When `--relay` is selected, that relay terminates its transport connections and can inspect model states in both directions. Sealed route instructions stay encrypted to the stages; model states are not end-to-end encrypted across the dfin relay. The client warns at startup and reports `relay_can_read_model_states` in `/status`. Tor routing and direct/reverse returns do not require this additional observer. This application relay differs from the legacy UDP cloaking tunnel, which forwards intact encrypted QUIC packets.
+
 ## Setup
 
 Install and verify a maintained Tor distribution from the [Tor Project](https://www.torproject.org/download/tor/). Run a dedicated local Tor daemon. dfin does not download, start, or configure Tor automatically.
@@ -110,6 +112,12 @@ python scripts/test-tor-local.py --tor /path/to/tor --tor-gencert /path/to/tor-g
 ```
 
 Prerequisites: verified Tor binaries, the patched inference backend, the generated tiny model, Rust 1.92+, and Python 3.9+. A private Tor network validates compatibility, not real-world anonymity, WAN performance, frontier-model scale, or hostile-network resilience. See [the work log](anonymity-work-log.md) for actual results and outstanding checks.
+
+Relay lifetime tests also exercise duplicate tokens, stalled connections, cancellation, return-path ownership, and first-stream deadlines. The real two-minute expiration test is separate from the fast suite and runs explicitly in CI:
+
+```bash
+cargo test --release --locked -p dfin --test relay_privacy relay_expires_an_unattached_session -- --ignored
+```
 
 ## Relationship to Monero
 

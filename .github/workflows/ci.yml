@@ -75,6 +75,10 @@ jobs:
       - name: cargo test --release --workspace
         run: cargo test --release --workspace --locked
 
+      # The expiration check is separate so ordinary development tests stay fast.
+      - name: Relay session expiration
+        run: cargo test --release --locked -p dfin --test relay_privacy relay_expires_an_unattached_session -- --ignored
+
       - name: Install Tor for isolated integration testing
         run: |
           sudo systemctl mask tor.service tor@default.service

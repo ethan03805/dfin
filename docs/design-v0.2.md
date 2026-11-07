@@ -2,6 +2,8 @@
 
 **Design v0.2, 6 November 2026.** Supersedes v0.1 (5 November 2026) on goals, threat model, participants, trust, anonymity, money and phasing. The model physics (v0.1 sections 2 and 3), execution model (6), failure handling (7), routing (8), weight distribution (13) and API (14) stand as written there except where this document says otherwise; they are summarised in section 13 here rather than repeated. Phase 0 measurements that inform this revision are in [phase0-findings.md](phase0-findings.md).
 
+**Implementation boundary, updated 7 November:** this document describes the intended system, including unimplemented protections. [STATUS.md](../STATUS.md) records what exists. Tor is now the strict default, using a trusted external daemon with no direct fallback. Stages receive potentially revealing model states. The optional dfin application relay can inspect those states too; end-to-end activation encryption across it is not implemented. Attestation, verified computation, anonymous credits, and payments remain future work. See [current setup and limits](anonymity.md) and the [adversarial review](privacy-review.md).
+
 A network that runs frontier-scale open-weight models, Chinese-lab models first (GLM-5.3, then Kimi K3), on machines owned by many unrelated people, and exposes them through an OpenAI-compatible endpoint. It exists so that these models stay reachable from outside the labs' own endpoints and outside any single cloud, however unpopular hosting them becomes. Users are anonymous to the machines that serve them. Nodes either provably cannot read what they serve (attested tier) or are told to the user as nodes that could (open tier). Operators are paid, in Monero, in proportion to the work that runs through their machines.
 
 ---
@@ -39,7 +41,7 @@ A network that runs frontier-scale open-weight models, Chinese-lab models first 
 - Hosted-API latency. Section 13 gives the measured and projected numbers.
 - Cryptographic confidentiality on open consumer nodes. Section 6 explains why it is not available and what the open tier does instead.
 - Location guarantees for anonymous participants. Section 9.
-- Resistance to a global passive adversary. Tor mode is offered for users who need more; it is not the default.
+- Guaranteed resistance to a global passive adversary. Tor is the default, but timing and volume correlation remain threats.
 - Vision input, fine-tuning, training.
 
 **Constraints** are those of v0.1 section 1 (consumer latency, upload bandwidth, memory bandwidth, model licences), plus what Phase 0 measured: the protocol itself costs about 0.4 ms per hop; a home WiFi link costs 15 to 25 ms per token; a stage must lock its weights at load or its first request takes ten to thirty seconds.
@@ -53,8 +55,8 @@ A network that runs frontier-scale open-weight models, Chinese-lab models first 
 | **Deplatformer**: a cloud, a payment processor, a model host, a code host, a registrar, an app store | The service gone | Refuse hosting and payments, delist weights, take down repositories and domains, pressure identifiable operators | No cloud dependency. Nodes on many small providers and in homes. Weights seeded peer to peer under signed manifests. Software mirrored, reproducibly built, signed by several keys, discoverable without DNS (seed lists in the binary, onion addresses). Directories and mints federated. The XMR rail cannot be refused. Cloaked nodes for operators who want to be unfindable |
 | **Open node**, curious or malicious | Prompts, identities, steered outputs, pay without work | Invert the activations it receives (section 6.1), return wrong or steered activations, return garbage, claim work it did not do | Client holds embedding, first layers, last layer and output head, so no node sees text or logits. Relays or Tor keep addresses away. Chaff sessions. Sampled redundancy and shadow admission catch tampering. Payment per token on delivery. Bonds. The user is told in plain words what an open node can do |
 | **Attested node operator** with physical access | The same, through the enclave | Memory-bus interposer attacks have broken SGX and SEV-SNP on DDR4 and reportedly reach DDR5 and TDX; vendors call physical attacks out of scope | Attestation still proves the code. Residual physical risk is disclosed. Platforms whose attestation carries cloud-provider evidence rank above self-hosted enclaves. Redundancy sampling continues at a low rate |
-| **Relay operator** | Client addresses | See a client IP, a session token, ciphertext, the address of the first or last stage | The client chooses its relay. Tor mode puts Tor between client and relay. Relays hold no content keys and keep no logs |
-| **Hub or mint operator** (the project, at first) | Everything a central party could want | Censor nodes from the directory, steal reserves, link a purchase to a buyer | Clients build routes themselves, so the hub cannot steer. Several hubs and mints. Full-reserve mint with Monero reserve proofs. Blind signatures unlink purchase from use. Everything open source and reproducible |
+| **Relay operator** | Client addresses and content | A dfin application relay sees session tokens, neighbouring node addresses, and model-state frames; direct network mode also exposes the client IP | Tor hides the client IP from the relay. The default uses no dfin relay. End-to-end activation encryption across an application relay is future work; sealed route records alone do not provide it |
+| **Hub or mint operator** (the project, at first) | Everything a central party could want | Bias or personalize a directory, censor nodes, steal reserves, link a purchase to a buyer | Clients choose routes, but a hub can influence the available choices. Independent directories and consistent views are future work. Full-reserve mints and blind credits are also future work, not present guarantees |
 | **Network observer** (ISP, backbone) | Who talks to whom | Timing correlation | Every link encrypted. Tor mode for users who need it. Not defended against globally |
 | **Malicious client** | Free service, denial of service, probing nodes | Flood a stage, not pay, send malformed frames | Prepaid per token. Session and frame limits. Rate limits per connection. Parsers fuzzed |
 | **Sybil operator** | Many fake nodes to grab routes, harvest activations, farm credits | Register thousands of keys | Shadow admission with verified work. Bonds. Reputation that takes time to earn. Routes prefer long-lived keys. Chaff makes harvested sessions ambiguous |
@@ -175,7 +177,7 @@ Every client and node is an Ed25519 key. Clients derive a fresh per-session key 
 
 ### 8.2 The chain
 
-The client builds the route from the directory, then sets it up the way Tor builds a circuit: it negotiates a key with the first stage through the relay, then through that encrypted hop negotiates with the second, and so on. Each stage learns the address and key of its two neighbours and nothing else. The last stage returns output to the client's relay under a session token, never to the client's address. Activations are encrypted per link; they must be in the clear inside each stage, which is why confidentiality is a tier property (section 5), while the route itself is hidden from every stage.
+The client builds the route from the directory. The current implementation seals each hop's instructions to that node's key and authenticates transport connections. It does not implement a telescoping client-to-stage encrypted tunnel through the application relay. A stage sees its route instructions, model states, and traffic metadata. Activations are encrypted on the network but visible inside stages and any dfin application relay carrying their frames. Returns can follow the chain, an existing client connection, or an optional relay. Content confidentiality is a future trust-tier property (section 5), not a current consequence of route sealing.
 
 Per-token cost of the chain against Phase 0's measurements: one link crossing per stage plus the two relay legs, instead of a client round trip per stage. A route of eight US datacenter stages spends roughly 150 to 250 ms per token on the network before speculative decoding, which is what the physics budget assumed.
 
@@ -183,11 +185,12 @@ Per-token cost of the chain against Phase 0's measurements: one link crossing pe
 
 | Mode | Path | Who sees the client's address | Added per token |
 |---|---|---|---|
-| **Relay** (default) | Client to a relay it chooses, relay to first stage; last stage to the same or another relay, relay to client | The relay only | Tens of milliseconds |
-| **Tor** (strict) | Client over Tor to the relay | Nobody; the relay sees a Tor exit or rendezvous point | About half a second with a directly reachable relay; one to two seconds with a relay that is an onion service |
-| **Gateway** | Client over Tor or directly to a gateway that runs the head and tail | The gateway, unless Tor is used; the gateway also sees plaintext | Tor's cost applies only to the first token and streaming, not to the per-token loop, because the loop runs at the gateway |
+| **Tor** (default) | Client and stages connect through onion services; no dfin relay required | No dfin peer receives the client's IP; Tor and local-network observers have their own visibility | WAN performance has not been measured |
+| **Tor with a dfin relay** (optional) | Client over Tor to an application relay, then onion stages | No dfin peer receives the client's IP; the dfin relay can inspect model states | Additional connections and relay processing; not measured over WAN |
+| **Direct** (explicit development option) | QUIC to stages or a dfin relay | The directly contacted peers | LAN measurements exist; no anonymity claim |
+| **Gateway** (planned) | Client to a service running the head and tail | Gateway sees the client IP unless Tor is used; gateway sees plaintext content | Not implemented or measured |
 
-Tor's cost per token is the reason it is the strict mode and not the default. Speculative decoding (MTP plus a client draft model, v0.1 section 6.5) multiplies tokens per loop and is therefore worth more in Tor mode than anywhere else. The Tor client is the Rust implementation, arti, with the C daemon as a fallback where arti's onion-service support is not yet enough.
+Anonymity takes priority over latency, so Tor is the default and failures never select direct networking. The implementation uses a separately configured trusted Tor daemon and the Tor project's maintained SOCKS protocol library. Embedding Tor is future work. Speculative decoding remains a possible way to reduce network round trips; it is not implemented here.
 
 ### 8.4 Cloaked nodes
 
@@ -199,7 +202,7 @@ Credits are blind-signed. The mint sees that an XMR deposit arrived and issues t
 
 ### 8.6 Directory, logs, residuals
 
-Directory fetches go through a relay or Tor so the hub does not learn client addresses. Relays and nodes keep no session records. A hub that was also a relay that was also a first stage would see IP, pseudonym and hidden states together; the directory flags operators running several roles and the router never uses one operator in two roles on one route. Timing correlation by a well-placed observer is not defended against outside Tor mode.
+Directory fetches use Tor and separate temporary identities. A hub can still personalize the node set it returns, and colluding peers can correlate route choice and timing. The current directory cannot verify which identities belong to the same operator. Session state is kept in memory, but diagnostic logs and directory caches may persist locally; the protocol cannot prevent an operator from recording received states. Tor does not guarantee resistance to broad traffic correlation. Independent directory views, operator-diversity evidence, and a stronger logging policy need further work.
 
 ---
 

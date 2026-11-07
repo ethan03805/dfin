@@ -12,11 +12,15 @@ encrypted chain) is complete except for failover of a live session. Phases 2 (tr
 money) and 3 (scale) have not started.
 
 Strict Tor anonymity is now the default: onion-only destinations, pinned TLS identities,
-separate discovery/request keys, and no direct fallback. Linux CI passes all 73 regular
-tests and the wire-decoder fuzz runs. A separate real Tor integration test passes on
-Windows and Linux using a private nine-node Tor network. This does not yet
+separate discovery/request keys, and no direct fallback. The initial milestone passed
+73 regular tests, wire-decoder fuzzing, and real Tor integration on Windows and Linux
+using a private nine-node Tor network. An ongoing adversarial review has since added
+cancellation, identity, HTTP admission, and relay lifetime regressions; see the
+[review and current test results](docs/privacy-review.md). This does not yet
 provide content confidentiality, verified computation, or anonymous payment credits.
 See [setup and limits](docs/anonymity.md) and [the work log](docs/anonymity-work-log.md).
+The optional application relay can read model states; ordinary Tor routes do not
+require that additional observer. Relay content confidentiality remains unimplemented.
 
 ## Done
 

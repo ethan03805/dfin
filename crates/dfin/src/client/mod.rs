@@ -222,6 +222,9 @@ pub async fn run(args: ClientArgs, network: crate::network::Network) -> anyhow::
     };
     let stats = Arc::new(Mutex::new(engine::Stats::default()));
     let (jobs, info) = engine::spawn(cfg, stats.clone(), args.queue).await?;
+    if info.return_mode == "relay" && info.route.iter().any(|r| r.kind == "stage") {
+        tracing::warn!("the selected dfin relay can inspect model states; Tor hides network addresses, not those states from the relay");
+    }
     tracing::info!(
         model = %model_name,
         route = %info.route.iter().map(|r| r.layers.clone()).collect::<Vec<_>>().join(" -> "),

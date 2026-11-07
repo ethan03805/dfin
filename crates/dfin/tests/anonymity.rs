@@ -450,6 +450,10 @@ async fn run_scenario(real_tor: bool) {
         assert_eq!(status["privacy"]["request_identity_rotation"], true);
         assert_eq!(status["prefix_cache"]["tokens_reused"], 0);
         assert_eq!(status["privacy"]["content_confidential_from_nodes"], false);
+        assert_eq!(
+            status["privacy"]["relay_can_read_model_states"],
+            mode == "relay"
+        );
         // Let cleanup finish before terminating, to exercise the post-request path.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = procs.children[child].kill();

@@ -41,7 +41,7 @@ Tests run in the isolated checkout with generated tiny CPU models and loopback-o
 
 ### P03 — Key creation could overwrite identities and exposed a Unix permission window
 
-**Status:** fixed; Windows key tests pass, Unix-specific check pending CI. Saving a key truncated an existing path, followed symlinks, wrote the secret using default creation permissions, and only then attempted a Unix permission change whose errors were ignored. Concurrent first starts could replace one another's identity; on Unix, default permissions could briefly expose a new secret to other local users.
+**Status:** fixed; Windows and Linux checks pass, including Unix permissions and symlinks. Saving a key truncated an existing path, followed symlinks, wrote the secret using default creation permissions, and only then attempted a Unix permission change whose errors were ignored. Concurrent first starts could replace one another's identity; on Unix, default permissions could briefly expose a new secret to other local users.
 
 **Reproduction:** a generated replacement key successfully overwrote an existing identity, failing the new no-overwrite test. The Unix exposure window is established by the write-before-permission-change code order; no cross-user secret capture was attempted.
 
@@ -52,6 +52,22 @@ Tests run in the isolated checkout with generated tiny CPU models and loopback-o
 **Status:** fixed; all eight application privacy tests pass. The client's API rejected foreign origins and non-loopback Host headers, but a hub started with `--http` did not. Its inspection endpoint exposes the hub's stable node identity and directory. A request with an attacker-controlled Host received HTTP 200 in the regression test.
 
 **Fix:** moved the existing local-origin policy into the shared network module and applied it to both strict-mode HTTP listeners. Native numeric-loopback callers and same-origin browser requests still work. Tests cover both `/health` and `/directory`, foreign/null origins, host lookalikes, and normal local access. Direct-mode behavior is unchanged. The test verifies HTTP admission; a browser exploit was not attempted.
+
+### P05 — Relay reservations and return paths could outlive their owners
+
+**Status:** fixed; five fast relay regressions, eight existing end-to-end tests, and the real two-minute expiration check pass. Three real-process adversarial tests failed on the original relay: a duplicate token replaced an existing session; an outbound TLS connection stalled before insertion bypassed the session limit; and an idle return attachment stayed alive after its original client disconnected.
+
+**Fix:** reserve tokens and capacity atomically before dialing, refuse duplicates, and tie cleanup to a reservation guard. Cancel pending dials when their caller disappears. Permit one return attachment per session, close it when the client disappears, and invalidate the client session when its return path disappears. Bound and own stream-copy tasks so they are cancelled together. Include waiting for the first stream in the first-frame deadline and enforce the documented unattached-session deadline. CI runs the slow expiration check explicitly, keeping ordinary development tests fast.
+
+**Scope:** this closes concrete lifetime and resource-accounting failures; it is not Sybil resistance or a general denial-of-service guarantee. Knowing a relay token remains possession of a return-path capability. Tokens must stay secret and be generated afresh.
+
+### P06 — Historical relay documentation overstates content privacy
+
+**Status:** documentation corrected; client status disclosure tested in all return modes. The relay terminates its client TLS connection and opens a separate TLS connection to the first stage. It copies serialized application frames between them. Sealed route records hide their inner route instructions, but activation frames are not end-to-end encrypted across the dfin relay. Historical protocol text claiming the relay never sees plaintext was inaccurate.
+
+**Change:** corrected the protocol, historical findings, and design boundaries. The client warns when using an application relay and reports `relay_can_read_model_states` in `/status`; normal Tor direct/reverse returns do not require this observer. This is a disclosure correction, not a claim that relay content confidentiality has been implemented. A future fix for that property should reuse an established authenticated end-to-end tunnel, rather than invent a new cryptographic envelope. Legacy UDP cloaking is different and preserves its inner QUIC encryption.
+
+The design also incorrectly implied that client-side route choice prevents a hub from steering. A hub can personalize the directory it returns; the corrected design states this limitation and separates independent-directory work from present guarantees.
 
 ## Checks completed without a finding so far
 
@@ -80,3 +96,8 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P01–P03 | Real Tor 0.4.9.15, private nine-node network | Passed all return modes; Rust integration portion 50.69 seconds; test processes stopped |
 | P04 reproduction | Attacker-controlled Host at the strict hub HTTP API | Failed as expected: received 200 instead of 403 |
 | P04 fix | All application privacy regressions, including normal inference | 8 passed, 0 failed; real Tor separately opt-in |
+| P05 reproduction | Duplicate token, pending-dial capacity, idle return attachment | All three failed as expected against the original relay |
+| P01–P04 revision `73e9f9b` | [Linux CI, real Tor, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42398169018) | Both jobs passed, including the Unix key-file test |
+| P05 fix | Five fast relay tests plus eight existing end-to-end tests | 13 passed, 0 failed |
+| P05 expiration | Real two-minute unattached-session deadline | Passed in 120.54 seconds; both client and first-hop connections closed |
+| P01–P06 | Complete Windows release workspace | 86 passed, 0 failed; no fixture skips; real Tor and the slow expiration check separately opt-in |

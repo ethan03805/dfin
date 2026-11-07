@@ -131,7 +131,7 @@ the return mode in its record:
 |---|---|---|---|
 | `Reverse` | Replies `ForwardOk` on the stream it was asked on | Waits for the downstream reply and relays it | Hop 1 only (or nobody with a relay) |
 | `Direct { client_id }` | Opens a unidirectional stream on its connection from `client_id` and writes `ForwardOk` | Replies `Ack` at once, without waiting | Hop 1 and hop N |
-| `Relay { addr, node_id, token }` | Connects to the relay, attaches with `token`, writes `ForwardOk` on a unidirectional stream | Replies `Ack` at once | Nobody: the relay sees the client's address and ciphertext only |
+| `Relay { addr, node_id, token }` | Connects to the relay, attaches with `token`, writes `ForwardOk` on a unidirectional stream | Replies `Ack` at once | No stage sees the client's IP. The relay sees it in direct mode; Tor hides it. The relay can inspect model states |
 
 In `Direct` mode the client has connected to the last hop (with `Hello`) before
 route setup, and the last hop finds that connection by the client's key.
@@ -147,13 +147,17 @@ Errors at hop k in `Direct` or `Relay` mode travel to the return target as an
 
 ## 6. Relay
 
-`dfin relay` is a QUIC listener with a node key that pipes streams between a client
-and a first hop, and between a last hop and the client, keyed by a 16-byte token the
-client chose. It never sees plaintext: the client's streams to hop 1 carry sealed
-route records and per-link ciphertext terminates at the relay, so the relay sees
-frames but every record is sealed to a node key it does not hold, and activations
-are sent only by hops, which the relay only sees in the return direction as opaque
-bytes. The relay keeps no record of sessions.
+`dfin relay` uses the selected authenticated transport (Tor/TLS by default, explicit
+direct QUIC otherwise). It pipes streams between a client and a first hop, and
+between a last hop and the client, keyed by a client-chosen 16-byte token.
+
+**Content boundary:** transport encryption terminates at the relay. It can inspect
+`Hello`, `Forward`, and return frames, including model states in both directions.
+Only the sealed route records remain encrypted to their stage keys. The application
+relay is an additional observer of potentially revealing states; it does not provide
+end-to-end content confidentiality. This corrects the earlier ciphertext-only claim.
+The UDP cloaking tunnel in section 9 is different: its inner QUIC encryption ends
+at the stage. Relay sessions are kept in memory, not persisted.
 
 Client side: `RelayOpen { token, first_hop: (addr, node_id) }` on the first stream;
 afterwards every stream the client opens is piped to a new stream on the relay's
@@ -162,9 +166,17 @@ unidirectional stream it opens is piped to a unidirectional stream on the client
 connection.
 
 Relay is the third return mode, chosen by naming a relay (`--relay host:port/<node id>`).
-Without one the client defaults to `Direct`, and `--return reverse` hides its address
-from all but the first stage. A relay session that nobody attaches to is forgotten after
-two minutes; a relay answers `Ping` so launchers can probe it.
+Without one the client defaults to `Direct` returns over the selected transport.
+Tor hides the client's IP from all dfin peers in every return mode. In explicit direct
+network mode, `--return reverse` exposes the client's IP to the first stage.
+
+A relay reserves a unique token and a session slot before dialing. Pending dials count
+towards `--max-sessions`; duplicate tokens and extra return attachments are refused.
+Cancelling a caller cancels its dial and stream copies. Losing either the client or
+its return path tears down the session. Sessions with no return attachment expire
+after two minutes, even if their first-hop connection remains open. The first stream
+and frame must arrive within ten seconds. Stream-copy tasks are bounded to 128 for
+request/reply directions and 64 for results. A relay answers `Ping` for readiness checks.
 
 ## 7. What a stage keeps
 
@@ -207,7 +219,7 @@ exists it retries the old one. `/status` shows the route in use, where the direc
 came from, how many nodes it listed and how many were usable.
 
 What the directory does not yet do: more than one hub, mirroring by light nodes,
-fetching the directory through a relay or Tor, attestation evidence, and any
+fetching through an application relay, attestation evidence, and any
 reputation.
 
 ## 9. Cloaked nodes

@@ -3,8 +3,9 @@
 //! Nodes announce a signed record of what they serve; the hub verifies the signature,
 //! dials the announced address to check it answers, and lists the record until it
 //! expires. Anyone can fetch the list, signed by the hub. The hub never assigns
-//! routes: clients build their own from the list, so a hub cannot steer a user onto
-//! chosen nodes. Protocol: `docs/phase1-protocol.md` section 8.
+//! routes: clients build their own from the list. A hub can still bias or personalize
+//! that list, so independent route choice is not protection against a malicious hub.
+//! Protocol: `docs/phase1-protocol.md` section 8.
 
 use crate::config::parse_node_addr;
 use anyhow::Context as _;

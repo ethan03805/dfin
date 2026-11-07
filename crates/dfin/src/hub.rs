@@ -22,11 +22,14 @@ use dfin_proto::{
 };
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
+
+#[cfg(test)]
+mod privacy_tests;
 
 #[derive(Args, Debug)]
 pub struct HubArgs {
@@ -69,9 +72,34 @@ struct Entry {
     probes: Vec<ProbeRtt>,
 }
 
+#[derive(Default)]
+struct DirectoryState {
+    entries: HashMap<NodeId, Entry>,
+    pending: HashSet<NodeId>,
+}
+
+struct AnnouncementLease<'a> {
+    hub: &'a Hub,
+    id: NodeId,
+}
+
+impl Drop for AnnouncementLease<'_> {
+    fn drop(&mut self) {
+        self.hub.state.lock().pending.remove(&self.id);
+    }
+}
+
+struct ProbeConnection(Connection);
+
+impl Drop for ProbeConnection {
+    fn drop(&mut self) {
+        self.0.close("probe ended");
+    }
+}
+
 pub struct Hub {
     endpoint: Endpoint,
-    entries: Mutex<HashMap<NodeId, Entry>>,
+    state: Mutex<DirectoryState>,
     max_records: usize,
     probe_timeout: Duration,
     probes: Vec<NextHop>,
@@ -99,7 +127,7 @@ pub async fn run(args: HubArgs, network: crate::network::Network) -> anyhow::Res
     );
     let hub = Arc::new(Hub {
         endpoint: endpoint.clone(),
-        entries: Mutex::new(HashMap::new()),
+        state: Mutex::new(DirectoryState::default()),
         max_records: args.max_records.max(1),
         probe_timeout: Duration::from_secs(args.probe_timeout.max(if network.private() {
             60
@@ -175,8 +203,9 @@ async fn http_directory(State(hub): State<Arc<Hub>>) -> Json<Value> {
     hub.sweep();
     let now = unix_now();
     let mut rows: Vec<Value> = hub
-        .entries
+        .state
         .lock()
+        .entries
         .values()
         .map(|e| {
             let r = &e.record;
@@ -211,13 +240,19 @@ async fn http_directory(State(hub): State<Arc<Hub>>) -> Json<Value> {
 
 impl Hub {
     async fn serve(self: &Arc<Self>, conn: Connection) {
+        let mut requests = tokio::task::JoinSet::new();
         loop {
-            let (mut send, mut recv) = match conn.accept_bi().await {
+            let accepted = tokio::select! {
+                _ = conn.closed() => break,
+                _ = requests.join_next(), if !requests.is_empty() => continue,
+                r = conn.accept_bi(), if requests.len() < 32 => r,
+            };
+            let (mut send, mut recv) = match accepted {
                 Ok(x) => x,
-                Err(_) => return,
+                Err(_) => break,
             };
             let hub = self.clone();
-            tokio::spawn(async move {
+            requests.spawn(async move {
                 let req: Request = match tokio::time::timeout(
                     CONTROL_TIMEOUT,
                     read_frame_max(&mut recv, MAX_CONTROL_FRAME),
@@ -245,12 +280,15 @@ impl Hub {
                 }
             });
         }
+        conn.close("hub connection ended");
+        requests.shutdown().await;
     }
 
     fn sweep(&self) {
         let now = unix_now();
-        self.entries
+        self.state
             .lock()
+            .entries
             .retain(|_, e| e.record.expires_at() > now);
     }
 
@@ -289,11 +327,26 @@ impl Hub {
         let id = NodeId(record.node_id);
         self.sweep();
         {
-            let entries = self.entries.lock();
-            if !entries.contains_key(&id) && entries.len() >= self.max_records {
+            let mut state = self.state.lock();
+            if state.pending.contains(&id) {
+                return error(ErrorCode::BadRequest, "announcement already in progress");
+            }
+            // A large directory must not imply unbounded concurrent outbound work.
+            if state.pending.len() >= 32 {
+                return error(ErrorCode::RateLimited, "hub announcement probes are busy");
+            }
+            let reserved = state.entries.len()
+                + state
+                    .pending
+                    .iter()
+                    .filter(|id| !state.entries.contains_key(id))
+                    .count();
+            if !state.entries.contains_key(&id) && reserved >= self.max_records {
                 return error(ErrorCode::RouteLimit, "directory is full");
             }
+            state.pending.insert(id);
         }
+        let _lease = AnnouncementLease { hub: self, id };
         // The address must answer, with the key the record names.
         let rtt = match self.probe(&record.addrs[0], id).await {
             Some(ms) => ms,
@@ -317,6 +370,10 @@ impl Hub {
             }
             probes.extend(self.ask_probes(&record.addrs[0], id).await);
         }
+        // A slow probe may have consumed the remaining lifetime.
+        if let Err((code, message)) = validate_record(&record, unix_now()) {
+            return error(code, message);
+        }
         info!(
             node = %id.short(),
             addr = %record.addrs[0],
@@ -326,7 +383,7 @@ impl Hub {
             probes = probes.len(),
             "announce"
         );
-        self.entries.lock().insert(
+        self.state.lock().entries.insert(
             id,
             Entry {
                 record,
@@ -393,6 +450,7 @@ impl Hub {
     async fn probe(&self, addr: &str, id: NodeId) -> Option<f32> {
         let fut = async {
             let conn = self.endpoint.connect(addr, id).await.ok()?;
+            let _connection = ProbeConnection(conn.clone());
             let mut best = f32::INFINITY;
             for _ in 0..3 {
                 let t = Instant::now();
@@ -417,8 +475,9 @@ impl Hub {
         self.sweep();
         let now = unix_now();
         let mut entries: Vec<(NodeId, DirectoryEntry)> = self
-            .entries
+            .state
             .lock()
+            .entries
             .iter()
             .map(|(id, e)| {
                 (

@@ -87,6 +87,14 @@ The design also incorrectly implied that client-side route choice prevents a hub
 
 **Scope:** established next-hop connections now require a fresh handshake per route, trading some setup time for isolation and bounded ownership. Node identities remain stable public identities. Cancellation cannot interrupt a native CPU/GPU call already executing or recall states already delivered; cleanup follows already queued engine work. These are resource and lifecycle protections, not proof against all denial of service.
 
+### P09 — Hub announcements bypassed capacity and survived cancellation
+
+**Status:** fixed; all 100 regular Windows tests pass, including five hub regressions. Three adversarial tests failed on the original hub: concurrent successful probes stored two records despite a configured limit of one; a duplicate pending announcement launched another probe; and an announcement probe kept running after its caller disconnected.
+
+**Fix:** reserve a record slot and node identity before probing. Count pending new records together with existing entries, allow refreshes at capacity, and cap all simultaneous announcement probes at 32. Reservation guards release capacity after failure or cancellation. Each connection owns at most 32 handlers and cancels/joins them on disconnect. Probe connections close on every exit path, and records are revalidated after probing in case their lifetime elapsed.
+
+**Scope:** these bounds prevent the demonstrated accounting and cleanup failures. They do not stop Sybil identities from competing for capacity or guarantee service during an attack. Configured geographic probe connections remain shared in explicit direct mode; geographic probes are disabled in strict Tor mode.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -126,5 +134,10 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P08 reproduction | Duplicate/pending route admission, cross-client collision, cancelled/rejected setup | All five failed as expected on the original stage |
 | P08 close reproduction | Close a route while its engine reply is withheld | Failed as expected: outstanding operation survived acknowledged closure |
 | P01–P08 | Complete Windows release workspace | 95 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
+| P01–P07 revision `f18ce66` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42400189246) | Both jobs passed |
+| P01–P08 revision `b2408e7` | Real Tor 0.4.9.15, private nine-node network | All return modes passed; integration portion 59.65 seconds; children stopped |
+| P09 reproduction | Concurrent capacity, duplicate pending announcement, disconnected caller | All three failed as expected on the original hub |
+| P09 targeted fixes | The same three hostile-announcement tests | 3 passed, 0 failed |
+| P01–P09 | Complete Windows release workspace | 100 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.

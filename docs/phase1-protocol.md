@@ -215,10 +215,17 @@ expire. `DirectoryGet` returns a `Directory` (hub id, `issued_at`, entries sorte
 id, each a signed record plus the hub's observations) signed by the hub under the domain
 `dfin-directory-v1`. With `--http`, the same list is served as JSON for people.
 
+Announcements reserve the node identity and directory capacity before probing;
+duplicate pending announcements are refused. Refreshes of listed nodes remain possible
+at capacity. There are at most 32 simultaneous announcement probes across the hub and
+32 request handlers per connection. Disconnecting cancels pending probes and releases
+their reservations. Probe connections close on failure as well as success, and record
+lifetimes are checked again before insertion.
+
 The hub never assigns routes. A **client** given `--hub host:port/<node id>` and no
 `--stage` fetches the directory, verifies the hub's signature against the pinned id and
 every record's signature against the node id inside it, drops records for other models,
-other protocol versions or that have expired, and chooses a chain that tiles the layers
+other protocol versions or that fail the shared bounds/lifetime checks, and chooses a chain that tiles the layers
 between its head and tail exactly: fewest hops, then the lowest sum of hub-measured
 round trips, then chance. It writes the verified directory to `--directory-cache` and
 reads it back when the hub is unreachable. When the route drops, the client fetches the

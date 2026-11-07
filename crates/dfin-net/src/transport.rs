@@ -77,6 +77,11 @@ impl Endpoint {
         }
     }
     pub async fn connect(&self, addr: &str, expect: NodeId) -> Result<Connection, NetError> {
+        // Protocol fields can construct NodeId directly, bypassing text parsing.
+        // Refuse impossible pins before DNS, SOCKS, TLS, or a UDP packet.
+        expect
+            .verifying_key()
+            .map_err(|_| NetError::Other("invalid destination node identity".into()))?;
         match &self.0 {
             EndpointKind::Direct(e) => e
                 .connect(addr, expect)
@@ -287,5 +292,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn weak_raw_destination_id_never_sends_a_direct_packet() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Endpoint::direct_client(NodeKey::generate()).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.connect(&socket.local_addr().unwrap().to_string(), NodeId([0; 32])),
+        )
+        .await;
+        assert!(matches!(result, Ok(Err(NetError::Other(_)))));
+        let mut packet = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), socket.recv_from(&mut packet))
+                .await
+                .is_err()
+        );
     }
 }

@@ -1,6 +1,6 @@
 mod support;
 use dfin_net::transport::{reply, CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
-use dfin_net::{Endpoint, NodeKey};
+use dfin_net::{Endpoint, NodeId, NodeKey};
 use dfin_proto::read_frame_max;
 use std::{collections::HashMap, time::Duration};
 use support::{onion, Proxy};
@@ -152,4 +152,21 @@ async fn forbidden_addresses_never_even_contact_the_proxy() {
         .connect(&onion('a'), NodeKey::generate().id())
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn weak_raw_destination_id_never_contacts_the_proxy() {
+    let proxy = Proxy::start(HashMap::new()).await;
+    let endpoint = Endpoint::tor_client(NodeKey::generate(), proxy.addr).unwrap();
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    for id in [NodeId(identity), NodeId([0; 32])] {
+        assert!(id.verifying_key().is_err());
+        assert!(endpoint.connect(&onion('a'), id).await.is_err());
+    }
+    assert_eq!(
+        proxy.connections.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "invalid protocol-supplied identities must be rejected before dialing"
+    );
 }

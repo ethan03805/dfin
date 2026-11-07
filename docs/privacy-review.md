@@ -115,6 +115,12 @@ Reference: [Microsoft's filename and device-name rules](https://learn.microsoft.
 
 Reference: Rust's [`create_new` semantics](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new) provide exclusive creation and refuse an existing symbolic link.
 
+### P12 — Raw destination identities were validated after dialing
+
+**Status:** fixed; all 22 Windows network and transport tests pass. Binary protocol fields construct `NodeId` directly, bypassing its text parser. Two weak destination keys reached the SOCKS proxy before TLS would reject them; the regression observed two proxy contacts where zero were expected.
+
+**Fix:** validate the expected destination key at the shared transport entry point before direct resolution/packets or SOCKS activity. Tests cover both Tor and explicit direct transport. This is early rejection of impossible identity pins, not a TLS authentication bypass or evidence of an IP leak; the existing handshake would still refuse the peer.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -167,6 +173,8 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P11 targeted fixes | The four download regressions | 4 passed, 0 failed |
 | P01–P11 | Complete Windows release workspace, including short/bad-hash download cleanup | 108 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
 | P01–P10 revision `86b3a46` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42401459065) | Both jobs passed, including Unix permissions and shard symlink regressions |
+| P12 reproduction | Weak raw destination identities with a valid onion target | Failed as expected: two proxy contacts before rejection |
+| P12 fix | Network unit and transport tests, including no direct packet / no proxy contact | 22 passed, 0 failed |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.
 

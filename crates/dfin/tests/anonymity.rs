@@ -614,3 +614,285 @@ async fn failing_requests_rotate_every_explicit_client_identifier() {
     server.close();
     task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_prefill_closes_route_and_discards_cancelled_queue() {
+    run_cancellation_case(CancelAt::Prefill).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_route_setup_closes_connection_and_discards_cancelled_queue() {
+    run_cancellation_case(CancelAt::RouteSetup).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_discovery_closes_isolated_connection_without_retrying_cached_route() {
+    run_cancellation_case(CancelAt::Directory).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancelAt {
+    Prefill,
+    RouteSetup,
+    Directory,
+}
+
+async fn run_cancellation_case(cancel_at: CancelAt) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::io::AsyncWriteExt;
+
+    let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-llama-f32.gguf");
+    if !dfin_llama::has_layer_range() || !model.is_file() {
+        eprintln!("SKIP: patched llama and tiny fixture required");
+        return;
+    }
+    let key = NodeKey::generate();
+    let id = key.id();
+    let server = Endpoint::tor_server(key.clone(), local(), "127.0.0.1:9050".parse().unwrap())
+        .await
+        .unwrap();
+    let target = support::onion('a');
+    let proxy = support::Proxy::start(HashMap::from([(
+        target.clone(),
+        server.local_addr().unwrap(),
+    )]))
+    .await;
+    let setups = Arc::new(AtomicUsize::new(0));
+    let forwards = Arc::new(AtomicUsize::new(0));
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let record = dfin_proto::NodeRecord {
+        node_id: *id.as_bytes(),
+        addrs: vec![target.clone()],
+        model_fingerprint: dfin_proto::model_fingerprint(&model).unwrap(),
+        model_name: "tiny".into(),
+        layer_begin: 2,
+        layer_end: 6,
+        n_layer: 8,
+        n_embd: 64,
+        n_ctx_seq: 512,
+        n_seq_max: 2,
+        act_dtype: dfin_proto::ActDtype::F16,
+        backend: String::new(),
+        protocol: dfin_proto::PROTOCOL_VERSION,
+        region: String::new(),
+        attested: false,
+        cloaked: true,
+        issued_at: now,
+        ttl_secs: 180,
+    };
+    let signed = dfin_net::directory::sign_directory(
+        &key,
+        &dfin_proto::Directory {
+            hub_id: *id.as_bytes(),
+            issued_at: now,
+            entries: vec![dfin_proto::DirectoryEntry {
+                record: dfin_net::directory::sign_record(&key, &record).unwrap(),
+                hub_rtt_ms: 1.0,
+                seen_at: now,
+                probes: vec![],
+            }],
+        },
+    )
+    .unwrap();
+    let (tx, mut observed) = tokio::sync::mpsc::channel(8);
+    let accepting = server.clone();
+    let setups_seen = setups.clone();
+    let lookups_seen = lookups.clone();
+    let task = tokio::spawn(async move {
+        while let Some(Ok(conn)) = accepting.accept().await {
+            let tx = tx.clone();
+            let setups = setups_seen.clone();
+            let forwards = forwards.clone();
+            let lookups = lookups_seen.clone();
+            let signed = signed.clone();
+            tokio::spawn(async move {
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    let Ok(req) =
+                        dfin_proto::read_frame_max::<_, Request>(&mut recv, 4 << 20).await
+                    else {
+                        break;
+                    };
+                    let response = match req {
+                        Request::DirectoryGet => {
+                            if lookups.fetch_add(1, Ordering::SeqCst) == 1 {
+                                tx.send(conn.clone()).await.unwrap();
+                                conn.closed().await;
+                                break;
+                            }
+                            Response::Directory {
+                                directory: signed.clone(),
+                            }
+                        }
+                        Request::Hello { .. } => Response::HelloOk {
+                            layer_begin: 2,
+                            layer_end: 6,
+                            n_embd: 64,
+                            n_embd_inp: 64,
+                            n_embd_out: 64,
+                            n_ctx: 512,
+                            n_seq_max: 2,
+                            backend: String::new(),
+                            node_id: *id.as_bytes(),
+                        },
+                        Request::Ping => Response::Pong,
+                        Request::RouteSetup { .. } => {
+                            let n = setups.fetch_add(1, Ordering::SeqCst);
+                            if cancel_at == CancelAt::RouteSetup && n == 1 {
+                                tx.send(conn.clone()).await.unwrap();
+                                conn.closed().await;
+                                break;
+                            }
+                            Response::RouteOk { hops: 1 }
+                        }
+                        Request::Forward { .. } => {
+                            tx.send(conn.clone()).await.unwrap();
+                            if cancel_at == CancelAt::Prefill
+                                && forwards.fetch_add(1, Ordering::SeqCst) == 0
+                            {
+                                // An adversary withholds the first reply. Cancellation
+                                // must close the transport without waiting for it.
+                                conn.closed().await;
+                                break;
+                            }
+                            Response::Error {
+                                code: dfin_proto::ErrorCode::Decode,
+                                message: "test failure".into(),
+                            }
+                        }
+                        _ => Response::Ack,
+                    };
+                    if dfin_net::transport::reply(&mut send, &response)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let mut procs = Processes::new();
+    let api = local();
+    let base = format!("http://{api}");
+    let (source_flag, source_value) = if cancel_at == CancelAt::Directory {
+        ("--hub", format!("{target}/{id}"))
+    } else {
+        ("--stage", format!("{target}/{id}=2:6"))
+    };
+    procs.spawn(
+        "cancel-client",
+        proxy.addr,
+        &[
+            "client",
+            "--model",
+            &model.display().to_string(),
+            "--head",
+            "0:2",
+            "--tail",
+            "6:end",
+            source_flag,
+            &source_value,
+            "--return",
+            "reverse",
+            "--listen",
+            &api.to_string(),
+            "--n-gpu-layers",
+            "0",
+            "--n-ctx",
+            "512",
+            "--prefill-chunk",
+            "2",
+            "--max-sessions",
+            "1",
+        ],
+    );
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    wait_health(&http, &base, &mut procs).await;
+    assert_eq!(setups.load(Ordering::SeqCst), 1, "startup route");
+    let body = json!({"prompt": "a long prompt requiring several chunks", "max_tokens": 1, "stream": true}).to_string();
+    let request = format!("POST /v1/completions HTTP/1.1\r\nHost: {api}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    let mut active = tokio::net::TcpStream::connect(api).await.unwrap();
+    active.write_all(request.as_bytes()).await.unwrap();
+    let stalled = tokio::time::timeout(Duration::from_secs(5), observed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let first_id = stalled.peer_id();
+    let setups_before_cancel = if cancel_at == CancelAt::Directory {
+        1
+    } else {
+        2
+    };
+    assert_eq!(setups.load(Ordering::SeqCst), setups_before_cancel);
+
+    // Queue another request and cancel it while the engine is held by the first.
+    let mut queued = tokio::net::TcpStream::connect(api).await.unwrap();
+    queued.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(queued);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(2), stalled.closed())
+        .await
+        .expect("cancelled caller left its remote route alive");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status: Value = http
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["sessions"]["busy"] == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled job kept the engine busy"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let response = http
+        .post(format!("{base}/v1/completions"))
+        .json(&json!({"prompt": "next request", "max_tokens": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 500);
+    let next = tokio::time::timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first_id, next.peer_id(), "cancelled identity was reused");
+    assert_eq!(
+        setups.load(Ordering::SeqCst),
+        setups_before_cancel + 1,
+        "cancelled queued work still contacted the stage"
+    );
+    if cancel_at == CancelAt::Directory {
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            3,
+            "cancelled queued work still queried the hub"
+        );
+    }
+    assert!(
+        observed.try_recv().is_err(),
+        "cancelled prompt continued forwarding"
+    );
+    server.close();
+    task.abort();
+}

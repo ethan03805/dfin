@@ -52,6 +52,16 @@ pub struct Job {
     pub events: mpsc::Sender<Event>,
 }
 
+impl Job {
+    fn check_cancelled(&self) -> Result<(), EngineErr> {
+        if self.events.is_closed() {
+            Err(EngineErr::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FinishReason {
@@ -289,9 +299,23 @@ impl Resolver {
         rt: &tokio::runtime::Handle,
         endpoint: &Endpoint,
         exclude: &HashSet<NodeId>,
+        caller: Option<&mpsc::Sender<Event>>,
     ) -> Result<Vec<StageEndpoint>, String> {
         let now = crate::hub::unix_now();
-        let (mut dir, from_cache) = match directory::fetch(rt, endpoint, &self.hub) {
+        let fetched = match caller {
+            Some(events) => rt.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = events.closed() => Err("request cancelled".into()),
+                    result = directory::fetch_async(endpoint, &self.hub) => result,
+                }
+            }),
+            None => directory::fetch(rt, endpoint, &self.hub),
+        };
+        if caller.is_some_and(|events| events.is_closed()) {
+            return Err("request cancelled".into());
+        }
+        let (mut dir, from_cache) = match fetched {
             Ok((signed, dir)) => {
                 if let Some(c) = &self.cache {
                     directory::save_cache(c, &signed);
@@ -471,7 +495,7 @@ impl Engine {
                 info: DirectoryInfo::default(),
             };
             let stages = res
-                .resolve(&rt, &endpoint, &HashSet::new())
+                .resolve(&rt, &endpoint, &HashSet::new(), None)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             (stages, Some(res))
         } else {
@@ -599,7 +623,7 @@ impl Engine {
                 tail_in as u32,
                 prefill_chunk as u32,
             );
-            connect_with_backoff(&mut route, Duration::from_secs(60))
+            connect_with_backoff(&mut route, Duration::from_secs(60), &rt, None)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             Some(route)
         };
@@ -666,10 +690,15 @@ impl Engine {
 
     fn run(mut self, mut jobs: mpsc::Receiver<Job>) {
         while let Some(job) = jobs.blocking_recv() {
+            // A queued request may have lost its caller before the engine gets it.
+            // Do not tokenize it or create any observable network activity.
+            if job.events.is_closed() {
+                continue;
+            }
             let events = job.events.clone();
             self.stats.lock().requests += 1;
             if let Err(e) = self.process(job) {
-                if let Some(api) = e.into_api() {
+                if let Some(api) = e.into_api().filter(|_| !events.is_closed()) {
                     tracing::warn!(status = api.status, "request failed: {}", api.message);
                     let _ = events.blocking_send(Event::Error(api));
                 }
@@ -730,7 +759,10 @@ impl Engine {
     /// Rebuild the route if it dropped. With a hub, ask the directory again and prefer a
     /// chain that avoids the nodes of the broken route. The stages' session state is then
     /// unknown, so every cached session is dropped.
-    fn ensure_connected(&mut self) -> Result<(), EngineErr> {
+    fn ensure_connected(&mut self, events: &mpsc::Sender<Event>) -> Result<(), EngineErr> {
+        if events.is_closed() {
+            return Err(EngineErr::Cancelled);
+        }
         let Some(route) = &mut self.route else {
             return Ok(());
         };
@@ -741,7 +773,7 @@ impl Engine {
         let rebuilds = route.counters.rebuilds + 1;
         if let Some(res) = &mut self.resolver {
             let exclude: HashSet<NodeId> = route.hops.iter().map(|h| h.node_id).collect();
-            match res.resolve(&self.rt, &self.endpoint, &exclude) {
+            match res.resolve(&self.rt, &self.endpoint, &exclude, Some(events)) {
                 Ok(stages) if stages != route.hops => {
                     let mut fresh = Route::new(
                         stages,
@@ -754,22 +786,30 @@ impl Engine {
                         self.tail_in as u32,
                         self.prefill_chunk as u32,
                     );
-                    connect_with_backoff(&mut fresh, Duration::from_secs(5))?;
+                    connect_with_backoff(
+                        &mut fresh,
+                        Duration::from_secs(5),
+                        &self.rt,
+                        Some(events),
+                    )?;
                     fresh.counters.rebuilds = rebuilds;
                     *route = fresh;
                 }
                 Ok(_) => {
-                    connect_with_backoff(route, Duration::from_secs(5))?;
+                    connect_with_backoff(route, Duration::from_secs(5), &self.rt, Some(events))?;
                     route.counters.rebuilds = rebuilds;
                 }
                 Err(e) => {
+                    if events.is_closed() {
+                        return Err(EngineErr::Cancelled);
+                    }
                     tracing::warn!("{e}; retrying the previous route");
-                    connect_with_backoff(route, Duration::from_secs(5))?;
+                    connect_with_backoff(route, Duration::from_secs(5), &self.rt, Some(events))?;
                     route.counters.rebuilds = rebuilds;
                 }
             }
         } else {
-            connect_with_backoff(route, Duration::from_secs(5))?;
+            connect_with_backoff(route, Duration::from_secs(5), &self.rt, Some(events))?;
             route.counters.rebuilds = rebuilds;
         }
         {
@@ -909,6 +949,7 @@ impl Engine {
     }
 
     fn process(&mut self, job: Job) -> Result<(), EngineErr> {
+        job.check_cancelled()?;
         let prompt = match self.tokenize(&job.prompt) {
             Ok(t) => t,
             Err(e) => {
@@ -933,8 +974,21 @@ impl Engine {
         if self.sessions.iter().all(|s| s.busy) {
             return reject(ApiError::overloaded("all sessions busy"));
         }
+        job.check_cancelled()?;
         self.start_private_request()?;
-        self.ensure_connected()?;
+        // A private endpoint belongs to this request alone. Closing it interrupts
+        // SOCKS, TLS, setup, and a stalled forward immediately when the HTTP caller
+        // disappears. Abort the watcher on completion so it cannot outlive the job.
+        let _cancel_route = self.endpoint.is_private().then(|| {
+            let endpoint = self.endpoint.clone();
+            let events = job.events.clone();
+            tokio_util::task::AbortOnDropHandle::new(self.rt.spawn(async move {
+                events.closed().await;
+                endpoint.close();
+            }))
+        });
+        self.ensure_connected(&job.events)?;
+        job.check_cancelled()?;
         let max_tokens = (job.params.max_tokens as usize).min(self.per_session_ctx - prompt.len());
 
         let Some((idx, common)) = self.acquire_session(&prompt)? else {
@@ -984,6 +1038,7 @@ impl Engine {
         let mut logits = None;
         let t_prefill = Instant::now();
         for (ci, chunk) in suffix.chunks(self.prefill_chunk).enumerate() {
+            job.check_cancelled()?;
             let last = ci + 1 == n_chunks;
             let out = self.forward(id, slot, pos as i32, chunk, last)?;
             self.sessions[idx].tokens.extend_from_slice(chunk);
@@ -1020,6 +1075,7 @@ impl Engine {
         let mut stopped_by_string = false;
 
         while completion < max_tokens {
+            job.check_cancelled()?;
             let t_step = Instant::now();
             let tok = sampler.sample(&logits) as Token;
             if vocab.is_eog(tok) {
@@ -1206,10 +1262,18 @@ fn route_entries(head: LayerRange, tail: LayerRange, route: Option<&Route>) -> V
 
 /// Set the route up, retrying transport failures with exponential backoff until
 /// `budget` elapses. Protocol-level rejections (wrong model, wrong layers) are not retried.
-fn connect_with_backoff(route: &mut Route, budget: Duration) -> Result<(), RouteError> {
+fn connect_with_backoff(
+    route: &mut Route,
+    budget: Duration,
+    rt: &tokio::runtime::Handle,
+    caller: Option<&mpsc::Sender<Event>>,
+) -> Result<(), RouteError> {
     let deadline = Instant::now() + budget;
     let mut delay = Duration::from_millis(250);
     loop {
+        if caller.is_some_and(|events| events.is_closed()) {
+            return Err(dfin_net::NetError::Closed("request cancelled".into()).into());
+        }
         match route.connect() {
             Ok(()) => return Ok(()),
             Err(e @ RouteError::Protocol(_)) => return Err(e),
@@ -1219,7 +1283,16 @@ fn connect_with_backoff(route: &mut Route, budget: Duration) -> Result<(), Route
                     return Err(e);
                 }
                 tracing::debug!("{e}; retrying in {delay:?}");
-                std::thread::sleep(delay);
+                rt.block_on(async {
+                    if let Some(events) = caller {
+                        tokio::select! {
+                            _ = events.closed() => {},
+                            _ = tokio::time::sleep(delay) => {},
+                        }
+                    } else {
+                        tokio::time::sleep(delay).await;
+                    }
+                });
                 delay = (delay * 2).min(Duration::from_secs(4));
             }
         }

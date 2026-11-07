@@ -13,6 +13,8 @@ This is a network privacy prototype, not a claim that inference on strangers' ha
 5. yamux carries dfin's request and return streams over the authenticated TCP connection. Existing frame limits and sealed hop records still apply.
 6. On success, failure, or cancellation, the client closes the request's routes and clears its prefix cache. The next request starts with another key, new connections, random session/route IDs, and a restarted forward sequence counter.
 
+Once the local HTTP server observes a caller disconnecting, it closes that request's Tor connections, including stalled setup and inference. Directory lookup and retry waits stop, and cancelled queued requests do not contact peers. Cancellation is checked between prompt chunks and decode steps; an active native inference call finishes before that check. Data already sent to a node cannot be recalled. See the [adversarial review](privacy-review.md) for reproductions and test evidence.
+
 The client still runs the embedding and output head locally. A chain can use direct returns, reverse returns, or a dfin relay. Here, **direct return** means a return stream over an existing Tor connection; it does not enable direct IP networking. A dfin relay is optional and is not a replacement for Tor.
 
 ## Setup

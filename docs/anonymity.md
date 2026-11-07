@@ -40,6 +40,8 @@ HiddenServicePort 7001 127.0.0.1:7001
 
 On Windows, use an absolute private directory in Tor's supported Windows path syntax. Tor writes the service's hostname in that directory. Protect its keys and the dfin node-key file. Never use single-hop/non-anonymous onion-service settings for deployment.
 
+dfin creates new node-key files without replacing an existing path. Unix files are owner-only from creation; on Windows, restrict access to the containing directory because its access rules are inherited. Keep existing keys across restarts. Concurrent creation uses the winner's key or fails closed if its write is incomplete, allowing a later retry.
+
 Start a stage using an existing local model:
 
 ```bash

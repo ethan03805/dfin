@@ -57,4 +57,6 @@ This records meaningful changes, decisions, checks, and remaining work. It is no
 
 ## Recommended next milestone
 
+The user authorized this continuation on 7 November 2026. Current findings, fixes, and test results are recorded in [the ongoing adversarial privacy review](privacy-review.md).
+
 Perform a focused adversarial review of this transport and request-isolation boundary, then test recovery and latency over geographically separated onion services. Before implementing payments, specify exactly what the credit issuer and compute nodes can correlate, how metering is verified, and how payouts are calculated. Reuse Monero wallet software for XMR operations; assess an established blind-credit protocol separately. Network anonymity, content confidentiality, integrity, and payment unlinkability need distinct evidence.

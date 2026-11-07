@@ -31,6 +31,22 @@ Tests run in the isolated checkout with generated tiny CPU models and loopback-o
 
 **Limit:** already transmitted states cannot be recalled. An active native inference call is not forcibly interrupted; cancellation is checked before the next chunk/step. Prompt cessation depends on the local HTTP server observing the caller's disconnect.
 
+### P02 — Weak node keys accepted signed records without a secret
+
+**Status:** fixed; all 18 network tests pass. Node IDs accepted low-order Ed25519 points, and directory verification used the library's ordinary verification method. A constructed identity-point key and constant signature passed record verification without any signing secret. Two regression tests failed on the old code: key admission and forged-record rejection.
+
+**Fix:** reject weak keys centrally when converting a node ID to a verifying key, and use the existing library's strict signature verification for records and directories. Normal generated node keys are unchanged. This uses [ed25519-dalek's documented weak-key checks](https://docs.rs/ed25519-dalek/2.2.0/ed25519_dalek/struct.VerifyingKey.html#method.is_weak).
+
+**Scope:** the reproduction forged a record for the attacker's deliberately weak identity. It did not forge a normal existing node's signature or bypass a pinned legitimate TLS key. Rejecting such identities restores the signature-ownership boundary; it does not solve Sybil attacks.
+
+### P03 — Key creation could overwrite identities and exposed a Unix permission window
+
+**Status:** fixed; Windows key tests pass, Unix-specific check pending CI. Saving a key truncated an existing path, followed symlinks, wrote the secret using default creation permissions, and only then attempted a Unix permission change whose errors were ignored. Concurrent first starts could replace one another's identity; on Unix, default permissions could briefly expose a new secret to other local users.
+
+**Reproduction:** a generated replacement key successfully overwrote an existing identity, failing the new no-overwrite test. The Unix exposure window is established by the write-before-permission-change code order; no cross-user secret capture was attempted.
+
+**Fix:** use exclusive file creation and Unix mode `0600` before writing any bytes, then flush the file. Existing paths are refused by the save operation. If another process wins creation, startup loads that identity; an incomplete or unreadable file fails closed for a later retry. Added collision and Unix symlink/permissions regressions. Windows access control still comes from the containing directory, which must be private.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -47,3 +63,12 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P01 reproduction | Hostile stage withholds a forward; caller disconnects | Failed as expected: remote route still open after two seconds |
 | P01 fix | Six application privacy tests and eight existing end-to-end tests | 14 passed; real Tor test separately opt-in |
 | P01 expanded cancellation coverage | Prefill, setup, and discovery cancellation | 3 passed, 0 failed; no fixture skips |
+| P01 published revision `1677bfc` | [Linux CI, private Tor, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42397113376) | Both jobs passed |
+| P02 reproduction | Weak identity and forged-record regressions | Both failed as expected on the original implementation |
+| P02 fix | All network unit and transport integration tests | 18 passed, 0 failed |
+| P01 + P02 | Complete Windows release workspace | 78 passed, 0 failed; real Tor separately opt-in |
+| P03 reproduction | Attempt to overwrite an existing identity | Failed as expected on the original implementation |
+| P03 fix | Windows network unit and transport tests | 19 passed before adding concurrent-creator coverage; Unix-specific test awaits Linux CI |
+| P03 concurrent creation | Eight simultaneous writers; one persisted identity | Passed, alongside all six Windows identity tests |
+| P01–P03 | Complete Windows release workspace | 80 passed, 0 failed; no fixture skips |
+| P01–P03 | Real Tor 0.4.9.15, private nine-node network | Passed all return modes; Rust integration portion 50.69 seconds; test processes stopped |

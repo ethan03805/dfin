@@ -6,7 +6,7 @@
 
 use crate::identity::{NodeId, NodeKey};
 use dfin_proto::{Directory, NodeRecord, SignedDirectory, SignedRecord};
-use ed25519_dalek::{Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Signer};
 
 const RECORD_DOMAIN: &[u8] = b"dfin-node-record-v1\0";
 const DIRECTORY_DOMAIN: &[u8] = b"dfin-directory-v1\0";
@@ -75,7 +75,7 @@ pub fn verify_directory(signed: &SignedDirectory, hub: &NodeId) -> Result<Direct
 fn verify(id: &NodeId, domain: &[u8], body: &[u8], sig: &[u8]) -> Result<(), SignError> {
     let vk = id.verifying_key().map_err(|_| SignError::BadSigner)?;
     let sig = Signature::from_slice(sig).map_err(|_| SignError::Signature)?;
-    vk.verify(&message(domain, body), &sig)
+    vk.verify_strict(&message(domain, body), &sig)
         .map_err(|_| SignError::Signature)
 }
 
@@ -146,5 +146,35 @@ mod tests {
             signature: rec.signature,
         };
         assert!(verify_directory(&posed, &hub.id()).is_err());
+    }
+
+    #[test]
+    fn weak_identity_cannot_forge_records_or_directories_without_a_secret() {
+        // The Edwards identity has order one. With A=R=identity and S=0,
+        // ordinary Ed25519 verification accepts any message without a secret.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut signature = vec![0u8; 64];
+        signature[0] = 1;
+        let mut r = record(&NodeKey::generate());
+        r.node_id = identity;
+        let forged_record = SignedRecord {
+            body: postcard::to_stdvec(&r).unwrap(),
+            signature: signature.clone(),
+        };
+        assert!(
+            verify_record(&forged_record).is_err(),
+            "accepted a record without a signing secret"
+        );
+        let dir = Directory {
+            hub_id: identity,
+            issued_at: r.issued_at,
+            entries: vec![],
+        };
+        let forged_directory = SignedDirectory {
+            body: postcard::to_stdvec(&dir).unwrap(),
+            signature,
+        };
+        assert!(verify_directory(&forged_directory, &NodeId(identity)).is_err());
     }
 }

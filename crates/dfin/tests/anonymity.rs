@@ -29,6 +29,7 @@ impl Processes {
     fn spawn(&mut self, name: &str, proxy: SocketAddr, args: &[&str]) -> usize {
         let log = std::fs::File::create(self.dir.join(format!("{name}.log"))).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_dfin"))
+            .current_dir(&self.dir)
             .args(["--tor-proxy", &proxy.to_string()])
             .args(args)
             .stdin(Stdio::null())

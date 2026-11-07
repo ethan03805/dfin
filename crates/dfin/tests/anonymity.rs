@@ -83,6 +83,82 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| s.to_string()).collect()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_hub_http_rejects_rebinding_and_foreign_origins() {
+    let mut procs = Processes::new();
+    let api = local();
+    let base = format!("http://{api}");
+    // No proxy connection is needed to serve the local inspection API.
+    procs.spawn(
+        "http-hub",
+        "127.0.0.1:9050".parse().unwrap(),
+        &[
+            "hub",
+            "--listen",
+            &local().to_string(),
+            "--http",
+            &api.to_string(),
+        ],
+    );
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    wait_health(&http, &base, &mut procs).await;
+    let directory: Value = http
+        .get(format!("{base}/directory"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(directory["hub"].as_str().unwrap().len(), 64);
+    for route in ["health", "directory"] {
+        for host in [
+            "attacker.example:7101",
+            "localhost:7101",
+            "127.0.0.1.attacker.example:7101",
+        ] {
+            let response = http
+                .get(format!("{base}/{route}"))
+                .header("Host", host)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                403,
+                "rebinding Host was accepted: {host}"
+            );
+        }
+        for origin in [
+            "null".to_string(),
+            "https://attacker.example".into(),
+            format!("http://127.0.0.1:{}", api.port().saturating_sub(1)),
+        ] {
+            let response = http
+                .get(format!("{base}/{route}"))
+                .header("Origin", &origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                403,
+                "foreign Origin was accepted: {origin}"
+            );
+        }
+        let same_origin = http
+            .get(format!("{base}/{route}"))
+            .header("Origin", &base)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(same_origin.status(), 200);
+    }
+}
+
 async fn wait_health(http: &reqwest::Client, base: &str, procs: &mut Processes) {
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {

@@ -47,6 +47,12 @@ Tests run in the isolated checkout with generated tiny CPU models and loopback-o
 
 **Fix:** use exclusive file creation and Unix mode `0600` before writing any bytes, then flush the file. Existing paths are refused by the save operation. If another process wins creation, startup loads that identity; an incomplete or unreadable file fails closed for a later retry. Added collision and Unix symlink/permissions regressions. Windows access control still comes from the containing directory, which must be private.
 
+### P04 — Optional hub HTTP API lacked the client's rebinding protection
+
+**Status:** fixed; all eight application privacy tests pass. The client's API rejected foreign origins and non-loopback Host headers, but a hub started with `--http` did not. Its inspection endpoint exposes the hub's stable node identity and directory. A request with an attacker-controlled Host received HTTP 200 in the regression test.
+
+**Fix:** moved the existing local-origin policy into the shared network module and applied it to both strict-mode HTTP listeners. Native numeric-loopback callers and same-origin browser requests still work. Tests cover both `/health` and `/directory`, foreign/null origins, host lookalikes, and normal local access. Direct-mode behavior is unchanged. The test verifies HTTP admission; a browser exploit was not attempted.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -72,3 +78,5 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | P03 concurrent creation | Eight simultaneous writers; one persisted identity | Passed, alongside all six Windows identity tests |
 | P01–P03 | Complete Windows release workspace | 80 passed, 0 failed; no fixture skips |
 | P01–P03 | Real Tor 0.4.9.15, private nine-node network | Passed all return modes; Rust integration portion 50.69 seconds; test processes stopped |
+| P04 reproduction | Attacker-controlled Host at the strict hub HTTP API | Failed as expected: received 200 instead of 403 |
+| P04 fix | All application privacy regressions, including normal inference | 8 passed, 0 failed; real Tor separately opt-in |

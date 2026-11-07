@@ -73,7 +73,7 @@ A hub works the same way: forward its onion service to `127.0.0.1:7100`, run `df
 | Model downloads | Onion peers or offline files; manifest HTTP seeds ignored; explicit HTTP seeds rejected |
 | Region claims and geographic probes | Disabled |
 | Legacy UDP relay cloaking | Disabled, including remote requests to allocate a UDP port |
-| Local HTTP API | Rejects foreign browser origins and non-loopback Host headers; no permissive CORS |
+| Client and optional hub HTTP APIs | Reject foreign browser origins and non-loopback Host headers; no permissive CORS |
 | Unsupported model/trust-tier request | Rejected; never silently treated as an available model |
 | Diagnostics | `/status` reports Tor/direct mode, identity rotation, cache policy, and absent content/attestation guarantees |
 

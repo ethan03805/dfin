@@ -118,6 +118,13 @@ pub async fn run(args: HubArgs, network: crate::network::Network) -> anyhow::Res
             .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
             .route("/directory", get(http_directory))
             .with_state(hub.clone());
+        let app = if network.private() {
+            app.layer(axum::middleware::from_fn(
+                crate::network::local_request_only,
+            ))
+        } else {
+            app
+        };
         let listener = tokio::net::TcpListener::bind(http)
             .await
             .with_context(|| format!("binding {http}"))?;

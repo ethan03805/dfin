@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 
 #[derive(Args, Debug)]
 pub struct HubArgs {
-    /// Address to listen on (UDP, QUIC).
+    /// Local listener (TCP in Tor mode, UDP in direct mode).
     #[arg(long, default_value = "127.0.0.1:7100")]
     pub listen: String,
     /// Node key file (64 hex characters). Created if missing. Clients pin its public key.

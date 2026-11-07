@@ -34,7 +34,7 @@ const UNATTACHED_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Args, Debug)]
 pub struct RelayArgs {
-    /// Address to listen on (UDP, QUIC).
+    /// Local listener (TCP in Tor mode, UDP in direct mode).
     #[arg(long, default_value = "127.0.0.1:7000")]
     pub listen: String,
     /// Node key file (64 hex characters). Created if missing.

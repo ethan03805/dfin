@@ -7,7 +7,7 @@
 //! * [`engine`]: the dedicated engine thread (llama contexts, stage connections,
 //!   sessions with prefix caching, the generation loop).
 //! * [`http`]: axum handlers that submit jobs to the engine and relay its events.
-//! * [`route`]: the chain of stages, set up and driven over the QUIC transport.
+//! * [`route`]: the chain of stages over Tor/TLS or explicit direct QUIC.
 //! * [`sampling`], [`text`]: sampler, UTF-8 accumulation and stop strings.
 
 pub mod directory;

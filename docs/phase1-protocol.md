@@ -45,6 +45,29 @@ per connection, `n_seq_max` sessions per stage, one `Forward` in flight per sess
 
 ## 3. Messages (dfin-proto version 2)
 
+### Tor transport framing (default)
+
+The default transport uses TLS 1.3 over a SOCKS5 connection to a v3 onion service,
+with mutual node-key authentication and ALPN `dfin/1-tor-yamux`. There is no QUIC/UDP
+encapsulation. TLS resumption is disabled in the dialer. Tor SOCKS username/password
+authentication is required and every connection gets a fresh random isolation username.
+
+Inside TLS, yamux multiplexes streams. The opener writes one transport byte before
+the application payload: `0` for a request/reply stream, `1` for an unsolicited result.
+The receiver closes the unused write direction of a result stream. Other marker values
+close the connection. Application frames then use the unchanged length/postcard format.
+Both sides finish their write direction after a frame; reads remain possible until the
+other side finishes. A relay can copy these application streams without changing frames.
+
+Each connection allows at most 64 concurrent yamux streams and a 64 MiB receive window.
+Incoming stream queues and concurrent marker readers each have a limit of 32. Marker
+reads and inbound TLS handshakes have 10-second deadlines; an outbound SOCKS/TLS attempt
+has a 60-second deadline. A listener permits 32 concurrent accepted connections. These
+are resource bounds, not guarantees against denial of service. Tor/direct endpoints
+cannot negotiate a fallback transport.
+
+### Application messages
+
 Requests:
 
 | Message | From | Meaning |

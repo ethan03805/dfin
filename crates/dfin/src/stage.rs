@@ -1,5 +1,5 @@
 //! `dfin stage`: serve one contiguous middle layer range `[a, b)` of a GGUF as one hop
-//! of a route chain, over the authenticated QUIC transport.
+//! of a route chain, over authenticated Tor/TLS or explicit direct QUIC.
 //!
 //! Protocol: `docs/phase1-protocol.md`. The first stream on a connection must carry
 //! `Hello`. A `RouteSetup` opens this node's sealed record, dials the next hop if there
@@ -80,11 +80,11 @@ pub struct StageArgs {
     /// embedding or the LM head (those run on the client).
     #[arg(long)]
     pub layers: LayerRange,
-    /// Address to listen on (UDP, QUIC). Defaults to `0.0.0.0:7001`, or to no public
-    /// listener at all when `--cloak` is given.
+    /// Local listener (TCP in Tor mode, UDP in direct mode). Defaults to
+    /// `127.0.0.1:7001`, or no listener with direct-mode `--cloak`.
     #[arg(long)]
     pub listen: Option<String>,
-    /// Be reachable only through this relay (`host:port/<node id>`): the stage dials
+    /// Direct mode only: be reachable through this relay (`host:port/<node id>`). The stage dials
     /// the relay, which allocates a public port and tunnels its traffic here. No port
     /// is opened on this machine and no dialer's address is ever seen. Repeatable.
     #[arg(long = "cloak", value_parser = parse_node_addr)]

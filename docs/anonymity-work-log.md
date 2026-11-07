@@ -38,7 +38,7 @@ This records meaningful changes, decisions, checks, and remaining work. It is no
 - The current Chutney launcher did not run natively on Windows (it assumes POSIX `SIGKILL`). Added a portable test harness following its private-network topology and settings. Fixed a Windows Tor log-path parsing issue during the first harness attempt.
 - **Real Tor test passed:** nine local Tor processes, four onion services, directory discovery, two inference stages, all three return modes, repeated requests, and the local API restrictions. The Rust integration portion completed in 54.06 seconds. This is compatibility evidence, not an anonymity or WAN-performance measurement.
 - The harness disabled exits and public fallback directories, used only local authorities and loopback listeners, and stopped every Tor process it started. Existing dfin processes and the original checkout were not targeted.
-- Added the real Tor test to Linux CI. Its package installation masks Tor's normal service so only the isolated test network starts. CI results are recorded below when available.
+- Added the real Tor test to Linux CI. Its package installation masks Tor's normal service so only the isolated test network starts.
 
 ## Design boundaries
 
@@ -47,6 +47,14 @@ This records meaningful changes, decisions, checks, and remaining work. It is no
 - All inference checks in this milestone used the generated tiny model on CPU. The existing real-model and LAN findings were reviewed, not remeasured here.
 - See [anonymity.md](anonymity.md) for setup, maintenance boundaries, and limitations. Outstanding research includes malicious-node integrity, activation inversion, traffic correlation, Sybil/DoS resistance, WAN performance, and unlinkable XMR-backed credits.
 
-## Delivery checks still in progress
+## Delivery and Linux verification
 
-Finish the final diff review, publish the review branch, and verify Linux CI including the private Tor test. This log will record the resulting commit and pull request.
+- Published implementation commit `4f6b3c6de6c823c8f68ad60f25d66058c7501675` on `codex/strict-anonymity`, in [pull request #2](https://github.com/ethan03805/dfin/pull/2). The previous agent's fixes are already on main; this security milestone is delivered for review on its own branch.
+- [CI run 42355552654](https://github.com/ethan03805/dfin/actions/runs/42355552654) passed both jobs: Linux CPU and wire-decoder fuzzing. Linux ran **73 regular tests**, the standalone release-binary check, and the separate **real Tor integration test**. The latter used Tor 0.4.9.11 and completed its Rust test portion in 26.22 seconds. No test failed.
+- The final documentation pass corrected command help for TCP versus UDP listeners, documented the Tor stream framing and resource bounds, and updated the status page. This pass does not change networking behavior. The PR checks record validation of subsequent documentation commits.
+- `git diff --check` and rustfmt checks of every changed Rust file passed. The optional whole-workspace format check still reports existing formatting differences in untouched files; those files were left as they were.
+- Saved copies of the setup guide, this log, and the successful Windows private-Tor test log in the chat's output folder. Test-only Tor keys and configurations remain in the local scratch directory and are not committed or published.
+
+## Recommended next milestone
+
+Perform a focused adversarial review of this transport and request-isolation boundary, then test recovery and latency over geographically separated onion services. Before implementing payments, specify exactly what the credit issuer and compute nodes can correlate, how metering is verified, and how payouts are calculated. Reuse Monero wallet software for XMR operations; assess an established blind-credit protocol separately. Network anonymity, content confidentiality, integrity, and payment unlinkability need distinct evidence.

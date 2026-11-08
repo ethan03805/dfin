@@ -6,6 +6,44 @@ use tokio::task::JoinHandle;
 
 const WAIT: Duration = Duration::from_secs(3);
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forward_header_does_not_reserve_the_entire_announced_payload() {
+    struct HeaderOnly {
+        header: std::io::Cursor<Vec<u8>>,
+        body_buffer: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl tokio::io::AsyncRead for HeaderOnly {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.header.position() < self.header.get_ref().len() as u64 {
+                return std::pin::Pin::new(&mut self.header).poll_read(cx, buf);
+            }
+            self.body_buffer.store(buf.remaining(), Ordering::Relaxed);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    let f = Fixture::new(2, 4, 1);
+    let mut header = f.stage.max_forward_frame().to_le_bytes().to_vec();
+    header.push(Request::FORWARD_TAG);
+    let body_buffer = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result = f
+        .stage
+        .read_request(Box::new(HeaderOnly {
+            header: std::io::Cursor::new(header),
+            body_buffer: body_buffer.clone(),
+        }))
+        .await;
+    assert!(matches!(result, Err(ReadErr::Net(_))));
+    let reserved = body_buffer.load(Ordering::Relaxed);
+    assert!(
+        reserved <= 64 << 10,
+        "reserved {reserved} bytes after only a length and request tag"
+    );
+}
+
 struct Fixture {
     stage: Arc<Stage>,
     _jobs: mpsc::Receiver<Job>,

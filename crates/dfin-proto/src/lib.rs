@@ -526,9 +526,38 @@ where
             format!("frame of {len} bytes exceeds the {max} byte limit"),
         ));
     }
-    let mut body = vec![0u8; len as usize];
-    r.read_exact(&mut body).await?;
+    let body = read_frame_body(r, len).await?;
     postcard::from_bytes(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Read an already length-checked frame body without allocating its advertised
+/// length up front. The caller applies its smaller message-specific limit first.
+/// A header-only peer costs one small read buffer; storage grows with received
+/// payload. Reads consume exactly `len` bytes, preserving subsequent frames.
+pub async fn read_frame_body<R>(r: &mut R, len: u32) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 16 << 10];
+    while body.len() < len as usize {
+        let n = chunk.len().min(len as usize - body.len());
+        r.read_exact(&mut chunk[..n]).await?;
+        body.try_reserve(n).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "could not allocate frame buffer",
+            )
+        })?;
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok(body)
 }
 
 /// Cheap identity for a GGUF file so the client and every stage can confirm they
@@ -558,6 +587,40 @@ pub fn model_fingerprint(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn header_only_peer_does_not_receive_a_full_frame_sized_buffer() {
+        struct HeaderOnly {
+            header: std::io::Cursor<Vec<u8>>,
+            body_buffer: usize,
+        }
+        impl AsyncRead for HeaderOnly {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                if self.header.position() < self.header.get_ref().len() as u64 {
+                    return std::pin::Pin::new(&mut self.header).poll_read(cx, buf);
+                }
+                self.body_buffer = buf.remaining();
+                // End after just the header. The size of the first requested
+                // body buffer reveals whether allocation preceded any payload.
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut reader = HeaderOnly {
+            header: std::io::Cursor::new((8u32 << 20).to_le_bytes().to_vec()),
+            body_buffer: 0,
+        };
+        let result = read_frame_max::<_, Request>(&mut reader, 8 << 20).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            reader.body_buffer <= 64 << 10,
+            "reserved {} bytes before receiving any payload",
+            reader.body_buffer
+        );
+    }
 
     #[test]
     fn activations_roundtrip_f32() {
@@ -603,6 +666,35 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn large_frame_roundtrip_preserves_the_next_frame() {
+        let req = Request::Forward {
+            route: 1,
+            session: 2,
+            seq: 3,
+            pos0: 0,
+            act: Activations::from_f32(&vec![0.5; 32769], 1, 32769, ActDtype::F32),
+            hops: vec![],
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &req).await.unwrap();
+        write_frame(&mut bytes, &Request::Ping).await.unwrap();
+        let mut reader = std::io::Cursor::new(bytes);
+        let back: Request = read_frame(&mut reader).await.unwrap();
+        assert_eq!(
+            postcard::to_stdvec(&back).unwrap(),
+            postcard::to_stdvec(&req).unwrap()
+        );
+        assert!(matches!(
+            read_frame::<_, Request>(&mut reader).await.unwrap(),
+            Request::Ping
+        ));
+        let truncated = read_frame_body(&mut std::io::Cursor::new(vec![0; 17000]), 18000)
+            .await
+            .unwrap_err();
+        assert_eq!(truncated.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

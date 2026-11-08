@@ -85,6 +85,8 @@ Tor's local proxy is trusted. Tor cannot guarantee protection against a sufficie
 
 Request isolation costs extra circuit/connection setup and repeated prefill. Tor latency and TCP head-of-line blocking can be substantial. The first implementation caps a service at 32 accepted connections, each with at most 64 yamux streams and a 64 MiB receive window. TLS accepts have a 10-second deadline; outbound SOCKS plus TLS has a 60-second deadline. These bounds limit resources but do not solve denial of service or Sybil attacks.
 
+Frame readers grow their buffers as payload arrives instead of allocating the entire announced length from a header alone. Cancelled forwards still waiting in the stage engine queue are discarded before inference; cleanup requests still run. These measures reduce resource retention, while already executing native work and fully transmitted large messages remain bounded by their existing limits.
+
 ## Explicit direct mode
 
 For a LAN experiment or benchmark, every participating command must opt in:

@@ -4,7 +4,8 @@ Start with `../STATUS.md` for what exists and what does not.
 
 | Document | What it is |
 |---|---|
-| `privacy-review.md` | Ongoing adversarial privacy findings, reproductions, fixes, and test results. |
+| `privacy-review-handoff.md` | Concise accomplishments, validation, cleanup, and unresolved work at the user's stop request. |
+| `privacy-review.md` | Adversarial privacy findings, reproductions, fixes, and test results through the stop request. |
 | `anonymity.md` | Strict Tor defaults: how requests work, setup, boundaries, direct-mode migration, verification, and what is reused from Monero/Tor. |
 | `anonymity-work-log.md` | Dated implementation decisions, checks, results, and outstanding work for strict anonymity. |
 | `design-v0.2.md` | The current design: threat model (deplatforming), participants, node classes and where enclaves exist, trust tiers, confidentiality, integrity, anonymity, location, money, what is taken from Monero, phases 1 to 3 with exit criteria, risks. Read this first. |

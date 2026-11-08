@@ -23,8 +23,9 @@ use dfin_net::tunnel::{pump, tunnel_socket};
 use dfin_net::RecvStream;
 use dfin_net::{unseal, Connection, Endpoint, NetError, NodeId, NodeKey};
 use dfin_proto::{
-    forward_frame_limit, read_frame_max, write_frame, ActDtype, Activations, ErrorCode, HopRecord,
-    HopStat, NextHop, NodeRecord, Request, Response, ReturnFrame, ReturnMode, PROTOCOL_VERSION,
+    forward_frame_limit, read_frame_body, read_frame_max, write_frame, ActDtype, Activations,
+    ErrorCode, HopRecord, HopStat, NextHop, NodeRecord, Request, Response, ReturnFrame, ReturnMode,
+    PROTOCOL_VERSION,
 };
 use engine::{Engine, Job, Reply};
 use parking_lot::Mutex;
@@ -870,15 +871,14 @@ impl Stage {
                 "frame of {len} bytes exceeds the {max} byte limit for this request"
             )));
         }
-        let mut body = vec![0u8; len as usize];
-        body[0] = tag;
-        match tokio::time::timeout(budget, AsyncReadExt::read_exact(&mut recv, &mut body[1..]))
-            .await
-        {
-            Ok(Ok(_)) => {}
+        // Preserve the tag already consumed for admission, then grow the buffer
+        // only as payload arrives. A large length alone must not reserve memory.
+        let mut reader = std::io::Cursor::new([tag]).chain(recv);
+        let body = match tokio::time::timeout(budget, read_frame_body(&mut reader, len)).await {
+            Ok(Ok(body)) => body,
             Ok(Err(e)) => return Err(ReadErr::Net(e.into())),
             Err(_) => return Err(ReadErr::Bad("timed out reading the request body".into())),
-        }
+        };
         postcard::from_bytes(&body).map_err(|e| ReadErr::Bad(format!("bad frame: {e}")))
     }
 

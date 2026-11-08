@@ -2,6 +2,12 @@
 
 Started 7 November 2026 from `0512e2d`, the Tor-default implementation in [PR #2](https://github.com/ethan03805/dfin/pull/2). The user authorized continued review, fixes, and testing until stopped. This is an engineering review, not an independent security audit.
 
+**Stopped at the user's request on 7 November 2026.** See the concise
+[handoff](privacy-review-handoff.md). The final local workspace run passed 124
+tests. The latest completed Linux CI at `0e730be` failed during a repeated-disconnect
+test handshake; its fuzzing job passed. This remains unresolved, and the PR is a
+draft. Earlier green CI does not establish that the latest revision is ready.
+
 ## Method and boundaries
 
 Trace every network destination, identity, attacker-controlled message, and request lifetime. Turn suspected failures into reproducible tests before fixing them. Check normal operation after each fix, then exercise real Tor and CI for completed groups of changes. Record unsuccessful hypotheses as well as confirmed findings.
@@ -154,6 +160,32 @@ jobs still run. A native call already in progress cannot be interrupted by this
 check, and previously delivered activations cannot be recalled. This fixes queued
 work retention and availability; it does not conceal activations from the stage.
 
+### P16 — Message headers allocated large buffers before payload arrival
+
+**Status:** fixed; both header-only regressions pass. The common protocol reader
+and stage forward reader allocated the entire declared frame before reading its
+body. A peer could reserve large buffers using only a length header (and, at a
+stage, the request tag), then withhold data until the read deadline. Message-size
+and concurrency limits bounded individual requests but still allowed substantial
+memory amplification.
+
+**Reproduction:** instrumented readers supplied only a header and observed the
+first body read buffer. The common reader exposed an 8 MiB buffer; the small-stage
+fixture exposed 69,631 bytes after its tag. Both failed a 64 KiB bound on the
+original implementation. These tests observe the allocated read slice, not process
+RSS, and do not attempt to exhaust the machine.
+
+**Fix:** both paths use a common exact-length body reader with a 16 KiB scratch
+buffer. The destination vector grows only after a chunk arrives, with fallible
+reservation. Existing request-specific caps and deadlines remain. A large-frame
+roundtrip verifies content, the following frame, and rejection of a truncated
+body. There is no wire-format change.
+
+**Limit:** peers that actually send large valid-sized bodies can still consume
+memory and decoder/compute time within the existing limits. This removes cheap
+header-only allocation amplification; it is not a general denial-of-service
+defense or a global memory budget.
+
 ## Checks completed without a finding so far
 
 - The Tor destination parser runs before opening the proxy socket and rejects IP addresses, ordinary DNS names, onion subdomains, and zero destination ports.
@@ -267,6 +299,10 @@ The starting revision passed 73 regular tests, a real Tor integration test on Wi
 | Dependency advisory scans | 319 workspace packages and 227 generated fuzz-driver packages | Zero listed vulnerabilities; one documented maintenance warning in each |
 | Dependency feature removal + P15 | Complete Windows release workspace | 121 passed, 0 failed; no fixture skips; two slow integrations separately opt-in |
 | Multi-worker revision `e8953e6` | [Linux CI, real Tor, relay expiration, and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42403925196) | Both jobs passed |
+| P16 reproduction | Header-only common reader and stage forward reader | Both failed as expected; full advertised buffers allocated before payload |
+| P16 targeted fixes | Six protocol tests and 27 adversarial application tests | 33 passed, 0 failed; no fixture skips |
+| P01–P16 final local snapshot | Complete Windows release workspace | 124 passed, 0 failed; two slow integrations separately opt-in |
+| Dependency/P15 revision `0e730be` | [Linux CI and fuzzing](https://github.com/ethan03805/dfin/actions/runs/42404522275) | Linux failed: repeated-disconnect fixture received a peer-aborted handshake; fuzzing and both dependency scans passed. Cause unresolved at handoff |
 
 Test setup notes: the first P07 test draft referenced an unavailable test helper and overlapped a Windows binary rebuild with the running Tor test, causing a file-lock build failure. The fixture now uses an isolated temporary cache file, and reproduction ran successfully as a separate binary unit test. Neither build failure is counted as a product regression.
 

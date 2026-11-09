@@ -50,7 +50,7 @@ An agent prepares these and stops; the owner decides.
 The network layer does everything SPEC sections 7.1, 8 and 13 ask of it, on one machine
 and in CI.
 
-- [ ] **1.1 Decide the inference core.** Compare the in-repo runtime (llama.cpp
+- [x] **1.1 Decide the inference core.** Compare the in-repo runtime (llama.cpp
       layer-range patch, `crates/dfin-llama*`, `crates/dfin/src/stage*`) with existing
       split-inference projects, starting from `docs/prior-art-2026-11.md` (Mesh LLM /
       skippy is the closest living one). Judge on: exact output against the unsplit
@@ -60,6 +60,9 @@ and in CI.
       **Done when:** a written recommendation (keep, adopt, or converge) with evidence is
       in `docs/` and the owner has chosen. No code is swapped by this task.
       **Needs:** nothing. Do this first: tasks 1.3 and 1.4 touch the stage engine.
+      **Decided 9 November 2026:** the owner chose to keep the in-repo core
+      (`docs/inference-core-evaluation.md`). The convergence items that document
+      proposes are not tasks yet.
 - [ ] **1.2 Compartmentalisation cap** (SPEC 7.1). The client refuses a route on which
       one node key holds more than the cap or on which fewer than two keys serve the
       swarm's layers; the hub refuses an announcement above the cap; `/status` shows each

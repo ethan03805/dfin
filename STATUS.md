@@ -76,7 +76,7 @@ Each line is a milestone of [docs/PLAN.md](docs/PLAN.md), where the tasks are.
 
 | Milestone | Missing |
 |---|---|
-| 1. Finish the chain | The inference-core decision; the compartmentalisation cap; opt-in conversation sessions; failover of a live session; encryption across the application relay; locked weights by default; tool-call parsing (`tools` is accepted and ignored); macOS CI, clippy and fmt gates |
+| 1. Finish the chain | The compartmentalisation cap; opt-in conversation sessions; failover of a live session; encryption across the application relay; locked weights by default; tool-call parsing (`tools` is accepted and ignored); macOS CI, clippy and fmt gates |
 | 2. Public Tor network | No run across separate machines over public Tor; no operator runbook tested from a clean machine |
 | 3. Tamper detection | Everything: activation sanity checks, redundant execution, shadow admission, reputation, signed logs, trust tiers and pods in the API (a tier suffix on a model name is rejected today) |
 | 4. Money | Everything: mint, credits, wallet, per-token payment, payouts, bonds |

@@ -1,9 +1,12 @@
 # Inference core: keep, adopt or converge
 
 Evaluation for [PLAN.md](PLAN.md) task 1.1, written 9 November 2026. It compares dfin's
-own split-inference core with existing projects and ends in a recommendation. **The
-decision is the owner's** (AGENTS.md rule 9); task 1.1 stays unticked until it is made.
-No code was changed for this evaluation.
+own split-inference core with existing projects and ends in a recommendation. No code was
+changed for this evaluation.
+
+**Decision, 9 November 2026: the owner chose to keep the in-repo core**, as recommended
+below. The three convergence items and the follow-ups under "Found in passing" are
+proposals; none has been accepted or scheduled.
 
 Everything said here about another project was read from its source tree, its issue
 tracker or its release list on the date above, and the claims link to where they were

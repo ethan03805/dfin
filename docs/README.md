@@ -12,6 +12,7 @@ Start with `../AGENTS.md` if you are about to change anything.
 | `protocol.md` | The wire contract: identities, transport and limits, messages, route setup, return modes, relay, directory, shards, wide stage state, fuzzing. |
 | `anonymity.md` | How Tor mode works, how to set it up, and what it does not protect. |
 | `prior-art-2026-11.md` | Other split-inference projects and the state of llama.cpp for the target models, as of November 2026. Input to PLAN task 1.1. |
+| `inference-core-evaluation.md` | Keep, adopt or converge: dfin's split-inference core compared with Mesh LLM / skippy and the other candidates, with a recommendation for the owner. Output of PLAN task 1.1. |
 | `logs/` | Raw benchmark and verification logs, named by what and when. |
 
 ## Archive

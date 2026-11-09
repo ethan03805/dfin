@@ -348,7 +348,7 @@ What each component is built on. Whether it exists is in [STATUS.md](../STATUS.m
 
 | Component | Build on |
 |---|---|
-| Stage runtime | Mainline llama.cpp at a pinned commit plus the layer-range patch (`vendor/README.md`). Whether to keep this or adopt an existing split-inference project is an open evaluation in PLAN.md; the requirement is only that any llama.cpp architecture works as a stage and split output equals unsplit output |
+| Stage runtime | Mainline llama.cpp at a pinned commit plus the layer-range patch (`vendor/README.md`). Existing split-inference projects were evaluated and this core is kept (`inference-core-evaluation.md`); the requirement is that any llama.cpp architecture works as a stage and split output equals unsplit output |
 | Transport | Tor onion services reached through SOCKS; inside the Tor stream, TLS 1.3 with certificates bound to node keys, and yamux for multiplexing. QUIC (quinn) with the same key binding for development mode only |
 | Chain and relays | Own protocol over the transport (`protocol.md`): sealed per-hop route records, three return modes |
 | Tor | A trusted external Tor daemon and `tor-socksproto` today; arti embedded in the binary later |

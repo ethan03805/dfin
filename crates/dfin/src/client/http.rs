@@ -98,8 +98,6 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
             "from_cache": d.from_cache,
             "nodes_listed": d.nodes_listed,
             "nodes_usable": d.nodes_usable,
-            "fence": d.fence,
-            "nodes_fenced_out": d.nodes_fenced_out,
         })
     });
     let stages: Vec<Value> = stage_entries

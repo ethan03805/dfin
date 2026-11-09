@@ -10,7 +10,7 @@
 //! [`unseal`]), so one key per node is all that is ever distributed.
 //!
 //! Tor carries multiplexed TCP streams and enforces onion-only targets; direct QUIC
-//! must be selected explicitly. See `docs/anonymity.md` and `docs/phase1-protocol.md`.
+//! must be selected explicitly. See `docs/anonymity.md` and `docs/protocol.md`.
 
 pub mod directory;
 pub mod identity;
@@ -20,7 +20,6 @@ pub mod sealed;
 mod stream;
 mod tls;
 pub mod transport;
-pub mod tunnel;
 
 pub use identity::{NodeId, NodeKey};
 pub use sealed::{seal, unseal};

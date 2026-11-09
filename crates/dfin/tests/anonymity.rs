@@ -330,7 +330,7 @@ async fn run_scenario(real_tor: bool) {
                 dfin_net::directory::verify_directory(&directory, &hub_key.id()).ok()?;
             for entry in &directory.entries {
                 let record = dfin_net::directory::verify_record(&entry.record).unwrap();
-                assert!(record.cloaked && record.backend.is_empty() && record.region.is_empty());
+                assert!(record.backend.is_empty() && !record.attested);
                 assert!(record
                     .addrs
                     .iter()
@@ -473,16 +473,10 @@ async fn run_scenario(real_tor: bool) {
         }
         assert!(
             credentials.len() >= 20,
-            "expected discovery, routes, probes, and rotated requests"
+            "expected discovery, routes, reachability checks, and rotated requests"
         );
     }
-    // Malicious requests cannot turn a Tor relay into a direct UDP forwarder.
-    let relay = probe.connect(&relay_onion, relay_key.id()).await.unwrap();
-    let r: Response = relay
-        .call(&Request::RelayListen, 65536, Duration::from_secs(3))
-        .await
-        .unwrap();
-    assert!(matches!(r, Response::Error { .. }));
+    // Malicious requests cannot turn a Tor relay into a forwarder to a direct address.
     let relay = probe.connect(&relay_onion, relay_key.id()).await.unwrap();
     let r: Response = relay
         .call(
@@ -501,13 +495,72 @@ async fn run_scenario(real_tor: bool) {
     assert!(matches!(r, Response::Error { .. }));
 }
 
+/// UDP cloaking, region fencing and `dfin probe` were removed on 9 November 2026. Their
+/// flags and the subcommand are unknown to the command line in either network mode,
+/// rather than accepted and ignored.
+#[test]
+fn removed_cloak_and_region_options_are_unknown() {
+    let id = "ab".repeat(32);
+    let node = format!("127.0.0.1:7000/{id}");
+    for args in [
+        vec!["relay", "--public-host", "example.org"],
+        vec!["relay", "--port-range", "7200-7299"],
+        vec!["relay", "--max-cloaked", "4"],
+        vec![
+            "stage",
+            "--model",
+            "missing.gguf",
+            "--layers",
+            "2:6",
+            "--cloak",
+            &node,
+        ],
+        vec![
+            "stage",
+            "--model",
+            "missing.gguf",
+            "--layers",
+            "2:6",
+            "--region",
+            "us",
+        ],
+        vec![
+            "client",
+            "--model",
+            "missing.gguf",
+            "--head",
+            "0:2",
+            "--tail",
+            "6:end",
+            "--region",
+            "us:50",
+        ],
+        vec!["hub", "--probe", &node],
+        vec!["hub", "--region", "us"],
+        vec!["hub", "--probe-timeout", "5"],
+        vec!["probe", "--region", "us"],
+    ] {
+        for network in ["tor", "direct"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_dfin"))
+                .args(["--network", network])
+                .args(&args)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2), "{network} {args:?}");
+            let err = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                err.contains("unexpected argument") || err.contains("unrecognized subcommand"),
+                "{network} {args:?}: {err}"
+            );
+        }
+    }
+}
+
 #[test]
 fn strict_cli_rejects_leaks_before_loading_models_or_binding_services() {
     for args in [
         vec!["client", "--listen", "0.0.0.0:8080"],
         vec!["hub", "--listen", "localhost:7100"],
-        vec!["relay", "--public-host", "example.org"],
-        vec!["probe", "--region", "us"],
         vec!["pod", "--model", "missing.gguf", "--split", "2,6"],
         vec![
             "fetch",
@@ -762,9 +815,7 @@ async fn run_cancellation_case(cancel_at: CancelAt) {
         act_dtype: dfin_proto::ActDtype::F16,
         backend: String::new(),
         protocol: dfin_proto::PROTOCOL_VERSION,
-        region: String::new(),
         attested: false,
-        cloaked: true,
         issued_at: now,
         ttl_secs: 180,
     };
@@ -777,7 +828,6 @@ async fn run_cancellation_case(cancel_at: CancelAt) {
                 record: dfin_net::directory::sign_record(&key, &record).unwrap(),
                 hub_rtt_ms: 1.0,
                 seen_at: now,
-                probes: vec![],
             }],
         },
     )

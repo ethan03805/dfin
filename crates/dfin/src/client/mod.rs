@@ -59,10 +59,6 @@ pub struct ClientArgs {
     /// Where the last verified directory is kept, so routing survives a hub outage.
     #[arg(long, default_value = "dfin-directory.cache")]
     pub directory_cache: PathBuf,
-    /// Only use directory nodes that every probe labelled `region` reaches within `ms`,
-    /// written `region:ms` (e.g. `us:50`). Cloaked nodes are never inside a fence.
-    #[arg(long, value_parser = parse_fence)]
-    pub region: Option<crate::config::RegionFence>,
     /// Route TOML (model, head, tail, stages) instead of the flags above.
     #[arg(long)]
     pub route: Option<PathBuf>,
@@ -128,10 +124,6 @@ fn parse_hub(s: &str) -> Result<dfin_proto::NextHop, String> {
     crate::config::parse_node_addr(s).map_err(|e| format!("hub {e}"))
 }
 
-fn parse_fence(s: &str) -> Result<crate::config::RegionFence, String> {
-    s.parse()
-}
-
 fn parse_act_dtype(s: &str) -> Result<ActDtype, String> {
     s.parse()
 }
@@ -151,10 +143,6 @@ fn parse_flash_attn(s: &str) -> Result<FlashAttn, String> {
 
 pub async fn run(args: ClientArgs, network: crate::network::Network) -> anyhow::Result<()> {
     network.listener(&args.listen)?;
-    anyhow::ensure!(
-        !network.private() || args.region.is_none(),
-        "region fences are unavailable in strict anonymity mode"
-    );
     for target in args.hub.iter().chain(args.relay.iter()) {
         network.target(&target.addr)?;
     }
@@ -207,7 +195,6 @@ pub async fn run(args: ClientArgs, network: crate::network::Network) -> anyhow::
         },
         hub: args.hub.clone(),
         directory_cache: Some(args.directory_cache.clone()),
-        fence: args.region.clone(),
         n_ctx: args.n_ctx,
         n_gpu_layers: args.n_gpu_layers,
         cpu_tensors: args.cpu_tensors.clone(),

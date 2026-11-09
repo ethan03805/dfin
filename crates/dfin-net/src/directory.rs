@@ -11,8 +11,10 @@ use dfin_proto::{
 };
 use ed25519_dalek::{Signature, Signer};
 
-const RECORD_DOMAIN: &[u8] = b"dfin-node-record-v1\0";
-const DIRECTORY_DOMAIN: &[u8] = b"dfin-directory-v1\0";
+// The version in each domain is that of the signed layout. v2 dropped the record's
+// `region` and `cloaked` fields and the entry's per-probe round trips.
+const RECORD_DOMAIN: &[u8] = b"dfin-node-record-v2\0";
+const DIRECTORY_DOMAIN: &[u8] = b"dfin-directory-v2\0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SignError {
@@ -73,7 +75,6 @@ pub fn validate_record(record: &NodeRecord, now: u64) -> Result<(), (ErrorCode, 
     if record.model_fingerprint.len() > 128
         || record.model_name.len() > 256
         || record.backend.len() > 256
-        || record.region.len() > 64
     {
         return bad("text field too long");
     }
@@ -149,9 +150,7 @@ mod tests {
             act_dtype: ActDtype::F16,
             backend: "CPU".into(),
             protocol: PROTOCOL_VERSION,
-            region: "us".into(),
             attested: false,
-            cloaked: false,
             issued_at: 1_800_000_000,
             ttl_secs: 180,
         }
@@ -183,7 +182,6 @@ mod tests {
                 record: sign_record(&node, &record(&node)).unwrap(),
                 hub_rtt_ms: 1.5,
                 seen_at: 1_800_000_000,
-                probes: vec![],
             }],
         };
         let signed = sign_directory(&hub, &dir).unwrap();

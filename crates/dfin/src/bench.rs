@@ -3,7 +3,7 @@
 //! 1. monolithic: one full model, greedy decode;
 //! 2. in-process split: head, middles and tail as separate pieces in this process,
 //!    hidden states round-tripped through the wire encoding;
-//! 3. local pod: real `dfin stage` processes plus a `dfin client` over TCP/HTTP.
+//! 3. local pod: real `dfin stage` processes plus a `dfin client`, over QUIC between them and HTTP to the client.
 
 use crate::pod::{self, PodOptions, SplitPlan};
 use anyhow::Context as _;
@@ -332,7 +332,7 @@ async fn bench_pod(a: &BenchArgs, prompt_text: &str, mono_text: &str) -> Row {
         mode: if a.api_url.is_some() {
             "3 remote pipeline".into()
         } else {
-            "3 local pod (TCP)".into()
+            "3 local pod (QUIC)".into()
         },
         ..Row::default()
     };
@@ -348,6 +348,20 @@ async fn bench_pod(a: &BenchArgs, prompt_text: &str, mono_text: &str) -> Row {
         }
     }
     row
+}
+
+/// The id the API at `api_url` serves (`GET /v1/models`). A server that does not
+/// list one is sent the name `bench` and may ignore it.
+async fn served_model(http: &reqwest::Client, api_url: &str) -> String {
+    let listed: Option<Value> = match http.get(format!("{api_url}/v1/models")).send().await {
+        Ok(r) if r.status().is_success() => r.json().await.ok(),
+        _ => None,
+    };
+    listed
+        .as_ref()
+        .and_then(|v| v["data"][0]["id"].as_str())
+        .unwrap_or("bench")
+        .to_string()
 }
 
 fn get_f64(v: &Value, key: &str) -> Option<f64> {
@@ -389,8 +403,10 @@ async fn bench_pod_inner(
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
+    // The client serves one model and refuses any other name, so ask it which.
+    let model_name = served_model(&http, &api_url).await;
     let body = serde_json::json!({
-        "model": "bench",
+        "model": model_name,
         "prompt": prompt_text,
         "max_tokens": a.gen_tokens,
         "temperature": 0,
@@ -600,7 +616,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
 
     if args.skip_pod {
         rows.push(Row {
-            mode: "3 local pod (TCP)".into(),
+            mode: "3 local pod (QUIC)".into(),
             notes: "skipped (--skip-pod)".into(),
             ..Row::default()
         });

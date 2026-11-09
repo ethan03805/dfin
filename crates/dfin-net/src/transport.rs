@@ -43,14 +43,6 @@ impl Endpoint {
             stream::Endpoint::server(key, listen, proxy).await?,
         ))))
     }
-    pub fn over_tunnel(
-        key: NodeKey,
-        socket: Arc<crate::tunnel::TunnelSocket>,
-    ) -> anyhow::Result<Self> {
-        Ok(Self(EndpointKind::Direct(quic::Endpoint::over_tunnel(
-            key, socket,
-        )?)))
-    }
     pub fn is_private(&self) -> bool {
         matches!(self.0, EndpointKind::Tor(_))
     }

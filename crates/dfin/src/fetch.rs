@@ -516,10 +516,8 @@ mod tests {
             n_seq_max: 2,
             act_dtype: ActDtype::F16,
             backend: String::new(),
-            region: String::new(),
             protocol: PROTOCOL_VERSION,
             attested: false,
-            cloaked: false,
             issued_at: now,
             ttl_secs: 180,
         };
@@ -530,7 +528,6 @@ mod tests {
                 record: sign_record(&key, record).unwrap(),
                 hub_rtt_ms: 1.0,
                 seen_at: now,
-                probes: vec![],
             }],
         };
         assert_eq!(peers_for(&directory(&record), "fp").len(), 1);

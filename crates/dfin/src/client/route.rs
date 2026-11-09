@@ -2,7 +2,7 @@
 //! engine thread. The engine is synchronous; every network call here runs on the
 //! tokio runtime through `Handle::block_on`.
 //!
-//! Protocol: `docs/phase1-protocol.md`.
+//! Protocol: `docs/protocol.md`.
 
 use crate::config::StageEndpoint;
 use dfin_net::transport::{CONTROL_TIMEOUT, MAX_CONTROL_FRAME};

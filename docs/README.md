@@ -1,18 +1,21 @@
 # Documents
 
-Start with `../STATUS.md` for what exists and what does not.
+Start with `../AGENTS.md` if you are about to change anything.
+
+## Current
 
 | Document | What it is |
 |---|---|
-| `privacy-review-handoff.md` | Concise accomplishments, validation, cleanup, and unresolved work at the user's stop request. |
-| `privacy-review.md` | Adversarial privacy findings, reproductions, fixes, and test results through the stop request. |
-| `anonymity.md` | Strict Tor defaults: how requests work, setup, boundaries, direct-mode migration, verification, and what is reused from Monero/Tor. |
-| `anonymity-work-log.md` | Dated implementation decisions, checks, results, and outstanding work for strict anonymity. |
-| `design-v0.2.md` | The current design: threat model (deplatforming), participants, node classes and where enclaves exist, trust tiers, confidentiality, integrity, anonymity, location, money, what is taken from Monero, phases 1 to 3 with exit criteria, risks. Read this first. |
-| `design-v0.1.md` | The first design. Superseded on trust and money, still the reference for the physics: model sizes, what crosses a stage boundary, bandwidth and memory per session, replay logs and failover (section 7), routing (section 8), shards (section 13). |
-| `phase1-protocol.md` | The wire contract of the encrypted chain: identities, transport and limits, messages, route setup, return modes, relay, directory, cloaked nodes, shards, wide stage state, region fencing, fuzzing, then a status and what changed from Phase 0. |
-| `phase0-findings.md` | What was learned building the LAN pod: what each architecture needs at a stage boundary, the patch, tiny-model and real-model results, the two-machine run, cold start. Dated entries. |
-| `phase1-findings.md` | What was learned building the chain: measurements on a real model, lessons from each piece (directory, cloaked nodes, shards and the f16 finding, wide state, fencing, fuzzing), and what is still open. |
-| `prior-art-2026-11.md` | What else exists (Petals, Mesh LLM, prima.cpp, BloomBee, Unsloth's patch) and the state of llama.cpp for the target models, as of November 2026. |
-| `mac-node-prompt.md` | A self-contained prompt for setting up a second machine (a MacBook) as a stage, written for another Claude session to carry out. |
-| `logs/` | Raw benchmark and verification logs the findings cite, named by what and when. |
+| `SPEC.md` | What dfin must do: threat model, participants, trust tiers, confidentiality, integrity, anonymity, money, what is taken from Monero, acceptance tests, risks. All of it is required. |
+| `PLAN.md` | The order of work. Every task has a "done when" and says what it needs. |
+| `../STATUS.md` | What exists today, what does not, and the test or log behind each claim. |
+| `protocol.md` | The wire contract: identities, transport and limits, messages, route setup, return modes, relay, directory, shards, wide stage state, fuzzing. |
+| `anonymity.md` | How Tor mode works, how to set it up, and what it does not protect. |
+| `prior-art-2026-11.md` | Other split-inference projects and the state of llama.cpp for the target models, as of November 2026. Input to PLAN task 1.1. |
+| `logs/` | Raw benchmark and verification logs, named by what and when. |
+
+## Archive
+
+`archive/` holds documents that are no longer maintained. They explain how dfin got
+here and still carry detail the spec points to. Where one disagrees with a current
+document, the current document is right. See `archive/README.md`.

@@ -13,11 +13,11 @@ This is a network privacy prototype, not a claim that inference on strangers' ha
 5. yamux carries dfin's request and return streams over the authenticated TCP connection. Existing frame limits and sealed hop records still apply.
 6. On success, failure, or cancellation, the client closes the request's routes and clears its prefix cache. The next request starts with another key, new connections, random session/route IDs, and a restarted forward sequence counter.
 
-Once the local HTTP server observes a caller disconnecting, it closes that request's Tor connections, including stalled setup and inference. Directory lookup and retry waits stop, and cancelled queued requests do not contact peers. Cancellation is checked between prompt chunks and decode steps; an active native inference call finishes before that check. Data already sent to a node cannot be recalled. See the [adversarial review](privacy-review.md) for reproductions and test evidence.
+Once the local HTTP server observes a caller disconnecting, it closes that request's Tor connections, including stalled setup and inference. Directory lookup and retry waits stop, and cancelled queued requests do not contact peers. Cancellation is checked between prompt chunks and decode steps; an active native inference call finishes before that check. Data already sent to a node cannot be recalled. See the [adversarial review](archive/privacy-review.md) for reproductions and test evidence.
 
 The client still runs the embedding and output head locally. A chain can use direct returns, reverse returns, or a dfin relay. Here, **direct return** means a return stream over an existing Tor connection; it does not enable direct IP networking. A dfin relay is optional and is not a replacement for Tor.
 
-The default does not use a dfin relay. When `--relay` is selected, that relay terminates its transport connections and can inspect model states in both directions. Sealed route instructions stay encrypted to the stages; model states are not end-to-end encrypted across the dfin relay. The client warns at startup and reports `relay_can_read_model_states` in `/status`. Tor routing and direct/reverse returns do not require this additional observer. This application relay differs from the legacy UDP cloaking tunnel, which forwards intact encrypted QUIC packets.
+The default does not use a dfin relay. When `--relay` is selected, that relay terminates its transport connections and can inspect model states in both directions. Sealed route instructions stay encrypted to the stages; model states are not end-to-end encrypted across the dfin relay. The client warns at startup and reports `relay_can_read_model_states` in `/status`. Tor routing and direct/reverse returns do not require this additional observer.
 
 ## Setup
 
@@ -61,7 +61,7 @@ dfin client --model model.gguf --head 0:2 --tail 6:end \
 
 Replace placeholders with actual values. For another local Tor port, add `--tor-proxy 127.0.0.1:9150`. This must be a trusted proxy with stream isolation enabled, not an arbitrary SOCKS service. SOCKS authentication cannot prove that a proxy actually uses Tor.
 
-A hub works the same way: forward its onion service to `127.0.0.1:7100`, run `dfin hub`, and give stages `--hub '<hub-onion>:7100/<hub-node-id>' --advertise '<stage-onion>:7001'`. The client can use `--hub` instead of explicit stages. Strict hubs reject records containing direct addresses, hardware/region disclosures, or unsupported attestation claims. The client applies the same restrictions to signed directories and cached records.
+A hub works the same way: forward its onion service to `127.0.0.1:7100`, run `dfin hub`, and give stages `--hub '<hub-onion>:7100/<hub-node-id>' --advertise '<stage-onion>:7001'`. The client can use `--hub` instead of explicit stages. Strict hubs reject records containing direct addresses, hardware disclosures, or unsupported attestation claims. The client applies the same restrictions to signed directories and cached records.
 
 ## Behavior and limits
 
@@ -73,8 +73,8 @@ A hub works the same way: forward its onion service to `127.0.0.1:7100`, run `df
 | Directory lookups | Separate ephemeral identity from inference |
 | Inference requests | New client key and route per request; no prefix reuse across requests |
 | Model downloads | Onion peers or offline files; manifest HTTP seeds ignored; explicit HTTP seeds rejected |
-| Region claims and geographic probes | Disabled |
-| Legacy UDP relay cloaking | Disabled, including remote requests to allocate a UDP port |
+| Region claims, geographic probes, region fencing | Removed on 9 November 2026; dfin has no location feature in either mode |
+| UDP relay cloaking | Removed on 9 November 2026; a stage is reached at its onion service |
 | Client and optional hub HTTP APIs | Reject foreign browser origins and non-loopback Host headers; no permissive CORS |
 | Unsupported model/trust-tier request | Rejected; never silently treated as an available model |
 | Diagnostics | `/status` reports Tor/direct mode, identity rotation, cache policy, and absent content/attestation guarantees |
@@ -95,7 +95,7 @@ For a LAN experiment or benchmark, every participating command must opt in:
 dfin --network direct pod --model models/tiny-llama-f32.gguf --split 2,6
 ```
 
-Direct mode uses the existing authenticated QUIC transport and exposes network addresses. `pod`, `bench`, and geographic `probe` require this option. Existing LAN benchmark scripts select it explicitly. Switching modes changes the wire transport; direct and Tor endpoints cannot communicate with one another. Rust callers must likewise choose `Endpoint::direct_client`/`direct_server` or `tor_client`/`tor_server` explicitly.
+Direct mode uses the existing authenticated QUIC transport and exposes network addresses. `pod` and `bench` require this option. Existing LAN benchmark scripts select it explicitly. Switching modes changes the wire transport; direct and Tor endpoints cannot communicate with one another. Rust callers must likewise choose `Endpoint::direct_client`/`direct_server` or `tor_client`/`tor_server` explicitly.
 
 ## Verification
 
@@ -113,7 +113,7 @@ The opt-in real Tor test creates nine Tor processes, four onion services, a hub,
 python scripts/test-tor-local.py --tor /path/to/tor --tor-gencert /path/to/tor-gencert
 ```
 
-Prerequisites: verified Tor binaries, the patched inference backend, the generated tiny model, Rust 1.92+, and Python 3.9+. A private Tor network validates compatibility, not real-world anonymity, WAN performance, frontier-model scale, or hostile-network resilience. See [the work log](anonymity-work-log.md) for actual results and outstanding checks.
+Prerequisites: verified Tor binaries, the patched inference backend, the generated tiny model, Rust 1.92+, and Python 3.9+. A private Tor network validates compatibility, not real-world anonymity, WAN performance, frontier-model scale, or hostile-network resilience. See [the work log](archive/anonymity-work-log.md) for actual results and outstanding checks.
 
 Relay lifetime tests also exercise duplicate tokens, stalled connections, cancellation, return-path ownership, and first-stream deadlines. The real two-minute expiration test is separate from the fast suite and runs explicitly in CI:
 

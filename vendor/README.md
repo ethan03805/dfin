@@ -2,11 +2,11 @@
 
 ## llama.cpp
 
-`vendor/llama.cpp` is a checkout of mainline [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-at commit `45b6604b20f17b7d7638042306c0cd1b6af5999c` (5 November 2026), plus the
-**layer-range patch** in `vendor/patches/`. The checkout is not a git submodule yet so that
-the project can be moved around freely during Phase 0; turning it into a submodule plus
-patch series is a Phase 1 housekeeping item.
+`vendor/llama.cpp` is a git submodule of mainline [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+pinned at commit `45b6604b20f17b7d7638042306c0cd1b6af5999c` (5 November 2026). The
+**layer-range patch** in `vendor/patches/` is not committed to the submodule: after
+`git submodule update --init`, `scripts/apply-llama-patch.sh` (or `.ps1`) applies it to
+the working tree, which is why `git status` shows the submodule as modified.
 
 ### The layer-range patch
 

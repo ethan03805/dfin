@@ -1,10 +1,14 @@
 //! Wire protocol between the client daemon and pipeline stage nodes.
 //!
-//! Version 2 (phase 1): frames travel on QUIC streams (see `dfin-net`); routes are
-//! chains of stages set up with sealed per-hop records; results return along the
-//! chain or straight to the client. Each frame is a little-endian `u32` byte length
-//! followed by a [`postcard`]-encoded [`Request`], [`Response`] or [`ReturnFrame`].
-//! The contract is `docs/phase1-protocol.md`.
+//! Version 3: frames travel on the streams of an authenticated transport (see
+//! `dfin-net`); routes are chains of stages set up with sealed per-hop records; results
+//! return along the chain, straight to the client, or through a relay. Each frame is a
+//! little-endian `u32` byte length followed by a [`postcard`]-encoded [`Request`],
+//! [`Response`] or [`ReturnFrame`]. The contract is `docs/protocol.md`.
+//!
+//! Version 3 removed the UDP cloaking tunnel (`RelayListen`, `RelayListening`, the
+//! record's `cloaked` flag) and region fencing (`Probe`, `Probed`, the record's
+//! `region` claim, per-probe round trips in directory entries) from version 2.
 //!
 //! Hidden states travel as [`Activations`]: a dense `[n_tokens, n_embd]` matrix in
 //! row-major order (token-major), as f32 or f16. FP8 is a later phase.
@@ -15,7 +19,7 @@ use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bump whenever the message layout changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest frame either side will accept. A 4k-token prefill chunk of a
 /// 6144-wide model is about 100 MB in f32, so leave generous headroom.
@@ -260,20 +264,12 @@ pub enum Request {
     RelayAttach {
         token: [u8; 16],
     },
-    /// Cloaked node to relay: bind a public port for me and tunnel its datagrams on this
-    /// stream. The reply is `RelayListening`; the stream then carries packet frames.
-    RelayListen,
     /// Node to hub: list me. The hub verifies the signature and dials the first address.
     Announce {
         record: SignedRecord,
     },
     /// Anyone to hub: the current signed directory.
     DirectoryGet,
-    /// Hub to probe: ping `addr` (pinned to `node_id`) and report the round trip.
-    Probe {
-        addr: String,
-        node_id: [u8; 32],
-    },
     /// Fetch `len` bytes at `offset` of shard `split` of the model with id `model_id`
     /// from a node that holds it. Replies `Shard`.
     ShardGet {
@@ -322,15 +318,6 @@ pub enum Response {
         hops: Vec<HopStat>,
     },
     Pong,
-    /// The public `host:port` the relay forwards to the cloaked node.
-    RelayListening {
-        addr: String,
-    },
-    /// A probe's answer: best-of-three round trip and the probe's region label.
-    Probed {
-        rtt_ms: f32,
-        region: String,
-    },
     Directory {
         directory: SignedDirectory,
     },
@@ -356,8 +343,6 @@ impl Response {
             Self::Ack => "Ack",
             Self::ForwardOk { .. } => "ForwardOk",
             Self::Pong => "Pong",
-            Self::RelayListening { .. } => "RelayListening",
-            Self::Probed { .. } => "Probed",
             Self::Directory { .. } => "Directory",
             Self::Shard { .. } => "Shard",
             Self::Error { .. } => "Error",
@@ -397,14 +382,8 @@ pub struct NodeRecord {
     pub act_dtype: ActDtype,
     pub backend: String,
     pub protocol: u32,
-    /// The operator's own claim; verified by nobody in phase 1.
-    pub region: String,
     /// Hardware attestation; always false until phase 2.
     pub attested: bool,
-    /// Addresses are onion services or relay tunnels, not the node's direct listener.
-    /// Geographic probes are not meaningful for these addresses. This flag is not
-    /// proof of anonymity or resistance to traffic correlation.
-    pub cloaked: bool,
     /// Unix seconds when the record was made, and how long it is valid.
     pub issued_at: u64,
     pub ttl_secs: u32,
@@ -425,15 +404,6 @@ pub struct SignedRecord {
     pub signature: Vec<u8>,
 }
 
-/// One vantage point's measurement of a node: best-of-three ping round trip from a
-/// probe standing in `region`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ProbeRtt {
-    pub probe_id: [u8; 32],
-    pub region: String,
-    pub rtt_ms: f32,
-}
-
 /// One directory line: a node's signed record plus what the hub observed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
@@ -442,9 +412,6 @@ pub struct DirectoryEntry {
     pub hub_rtt_ms: f32,
     /// Unix seconds when the hub last accepted an announcement from this node.
     pub seen_at: u64,
-    /// Round trips from the hub's vantage points (empty for cloaked nodes, whose
-    /// addresses are relays).
-    pub probes: Vec<ProbeRtt>,
 }
 
 /// The hub's list. Signed by the hub (`SignedDirectory`).

@@ -77,14 +77,6 @@ bench = false
 
 
 [[bin]]
-name = "tunnel_packet"
-path = "fuzz_targets/tunnel_packet.rs"
-test = false
-doc = false
-bench = false
-
-
-[[bin]]
 name = "frame"
 path = "fuzz_targets/frame.rs"
 test = false

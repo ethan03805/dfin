@@ -118,36 +118,6 @@ impl Endpoint {
         })
     }
 
-    /// A listening endpoint whose datagrams travel through a relay tunnel instead of a
-    /// socket of its own (see the `tunnel` module). It cannot usefully dial.
-    pub fn over_tunnel(
-        key: NodeKey,
-        socket: Arc<crate::tunnel::TunnelSocket>,
-    ) -> anyhow::Result<Endpoint> {
-        let (cert, pkey) = tls::self_signed(&key)?;
-        let provider = tls::provider();
-        let mut cfg = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_client_cert_verifier(Arc::new(tls::AnyClient { provider }))
-            .with_single_cert(vec![cert.clone()], pkey.clone_key())?;
-        cfg.alpn_protocols = vec![ALPN.to_vec()];
-        let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(cfg)?;
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-        server_config.transport_config(transport_config());
-        let inner = quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            Some(server_config),
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )?;
-        Ok(Endpoint {
-            inner,
-            key,
-            cert,
-            pkey: Arc::new(pkey),
-        })
-    }
-
     fn wrap(inner: quinn::Endpoint, key: NodeKey) -> anyhow::Result<Endpoint> {
         let (cert, pkey) = tls::self_signed(&key)?;
         Ok(Endpoint {

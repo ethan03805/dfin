@@ -16,7 +16,6 @@
 
 use dfin_net::directory::{sign_directory, sign_record, verify_directory, verify_record};
 use dfin_net::transport::MAX_CONTROL_FRAME;
-use dfin_net::tunnel::{read_packet, write_packet};
 use dfin_net::{seal, unseal, NodeId, NodeKey};
 use dfin_proto::{
     forward_frame_limit, read_frame_max, Activations, Directory, HopRecord, NodeRecord, Request,
@@ -39,7 +38,6 @@ pub const TARGETS: &[(&str, Target)] = &[
     ("sealed", sealed),
     ("signed_record", signed_record),
     ("signed_directory", signed_directory),
-    ("tunnel_packet", tunnel_packet),
     ("frame", frame),
     ("node_id_text", node_id_text),
     ("activations", activations),
@@ -96,10 +94,6 @@ fn exercise_directory(dir: &Directory) {
             exercise_record(&r);
         }
         let _ = e.hub_rtt_ms.max(0.0);
-        for p in &e.probes {
-            let _ = p.rtt_ms <= 50.0;
-            let _ = NodeId(p.probe_id).short();
-        }
     }
 }
 
@@ -140,9 +134,6 @@ fn exercise_response(resp: &Response) {
         Response::Shard { total, data } => {
             let _ = total.checked_add(data.len() as u64);
         }
-        Response::RelayListening { addr } => {
-            let _ = addr.parse::<SocketAddr>();
-        }
         Response::HelloOk { node_id, .. } => {
             let _ = NodeId(*node_id).verifying_key();
         }
@@ -150,7 +141,7 @@ fn exercise_response(resp: &Response) {
     }
 }
 
-/// A `Request` as a stage, relay, hub or probe reads it.
+/// A `Request` as a stage, relay or hub reads it.
 pub fn request(data: &[u8]) -> bool {
     let Ok(req) = postcard::from_bytes::<Request>(data) else {
         return false;
@@ -171,10 +162,6 @@ pub fn request(data: &[u8]) -> bool {
             if let Ok(rec) = verify_record(record) {
                 exercise_record(&rec);
             }
-        }
-        Request::Probe { addr, node_id } => {
-            let _ = addr.parse::<SocketAddr>();
-            let _ = NodeId(*node_id).verifying_key();
         }
         Request::RelayOpen { first_hop, .. } => {
             let _ = first_hop.addr.parse::<SocketAddr>();
@@ -284,23 +271,6 @@ pub fn signed_directory(data: &[u8]) -> bool {
     decoded
 }
 
-/// A tunnel packet frame as a relay or cloaked stage reads it from the tunnel stream.
-pub fn tunnel_packet(data: &[u8]) -> bool {
-    let mut cursor = data;
-    let Ok(p) = rt().block_on(read_packet(&mut cursor)) else {
-        return false;
-    };
-    let mut out = Vec::new();
-    rt().block_on(write_packet(&mut out, &p))
-        .expect("a packet that was read writes");
-    let mut again = &out[..];
-    let p2 = rt()
-        .block_on(read_packet(&mut again))
-        .expect("a packet that was written reads");
-    assert_eq!((p.addr, &p.data), (p2.addr, &p2.data));
-    true
-}
-
 /// A length-prefixed frame as `read_frame_max` reads it. The first byte picks the
 /// limit the reader was given; the rest is the stream.
 pub fn frame(data: &[u8]) -> bool {
@@ -360,10 +330,8 @@ pub fn activations(data: &[u8]) -> bool {
 /// test truncates and flips.
 pub mod seeds {
     use super::*;
-    use dfin_net::tunnel::Packet;
     use dfin_proto::{
-        write_frame, ActDtype, DirectoryEntry, ErrorCode, HopStat, NextHop, ProbeRtt,
-        PROTOCOL_VERSION,
+        write_frame, ActDtype, DirectoryEntry, ErrorCode, HopStat, NextHop, PROTOCOL_VERSION,
     };
 
     fn enc<T: Serialize>(v: &T) -> Vec<u8> {
@@ -390,9 +358,7 @@ pub mod seeds {
             act_dtype: ActDtype::F16,
             backend: "CPU".into(),
             protocol: PROTOCOL_VERSION,
-            region: "us".into(),
             attested: false,
-            cloaked: false,
             issued_at: 1_800_000_000,
             ttl_secs: 180,
         }
@@ -411,24 +377,19 @@ pub mod seeds {
                     record: signed_record_(),
                     hub_rtt_ms: 1.5,
                     seen_at: 1_800_000_005,
-                    probes: vec![ProbeRtt {
-                        probe_id: [9; 32],
-                        region: "us".into(),
-                        rtt_ms: 12.0,
-                    }],
                 },
                 DirectoryEntry {
                     record: sign_record(
                         fixed_key(),
                         &NodeRecord {
-                            cloaked: true,
+                            addrs: vec![format!("{}.onion:7001", "a".repeat(56))],
+                            backend: String::new(),
                             ..record()
                         },
                     )
                     .unwrap(),
                     hub_rtt_ms: 0.4,
                     seen_at: 1_800_000_009,
-                    probes: vec![],
                 },
             ],
         }
@@ -518,15 +479,10 @@ pub mod seeds {
                 },
             },
             Request::RelayAttach { token: [3; 16] },
-            Request::RelayListen,
             Request::Announce {
                 record: signed_record_(),
             },
             Request::DirectoryGet,
-            Request::Probe {
-                addr: "10.0.0.5:7001".into(),
-                node_id: *fixed_key().id().as_bytes(),
-            },
             Request::ShardGet {
                 model_id: "ab".repeat(32),
                 split: 3,
@@ -558,13 +514,6 @@ pub mod seeds {
                 hops: stats(),
             },
             Response::Pong,
-            Response::RelayListening {
-                addr: "203.0.113.5:7210".into(),
-            },
-            Response::Probed {
-                rtt_ms: 12.5,
-                region: "us".into(),
-            },
             Response::Directory {
                 directory: sign_directory(fixed_key(), &directory_()).unwrap(),
             },
@@ -605,30 +554,19 @@ pub mod seeds {
                 enc(&sign_directory(fixed_key(), &directory_()).unwrap()),
                 enc(&directory_()),
             ],
-            "tunnel_packet" => [
-                Packet {
-                    addr: "192.0.2.1:4433".parse().unwrap(),
-                    data: vec![0xc0; 40],
-                },
-                Packet {
-                    addr: "[2001:db8::1]:4433".parse().unwrap(),
-                    data: vec![],
-                },
-            ]
-            .iter()
-            .map(|p| {
-                let mut out = Vec::new();
-                rt().block_on(write_packet(&mut out, p)).unwrap();
-                out
-            })
-            .collect(),
             "frame" => {
+                // Hello, a Forward, an Announce (the largest control frame) and Ping.
                 let reqs = requests();
+                let pick = |want: fn(&Request) -> bool| {
+                    reqs.iter()
+                        .find(|r| want(r))
+                        .expect("the seed list has one")
+                };
                 vec![
-                    framed(2, &reqs[0]),
-                    framed(2, &reqs[3]),
-                    framed(3, &reqs[10]),
-                    framed(1, &reqs[1]),
+                    framed(2, pick(|r| matches!(r, Request::Hello { .. }))),
+                    framed(2, pick(|r| matches!(r, Request::Forward { .. }))),
+                    framed(3, pick(|r| matches!(r, Request::Announce { .. }))),
+                    framed(1, pick(|r| matches!(r, Request::Ping))),
                 ]
             }
             "node_id_text" => vec![fixed_key().id().to_string().into_bytes()],

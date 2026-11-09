@@ -52,6 +52,10 @@ fn every_target_survives_seeds_mutations_and_noise() {
 
         for (i, seed) in seeds.iter().enumerate() {
             assert!(run(name, *target, &format!("seed {i}"), seed), "{name} seed {i} does not decode");
+            // The seed itself is the accepted outcome. An authenticated box rejects every
+            // real mutation, and its bytes differ on each run, so without this the count
+            // of accepted inputs for `sealed` depended on chance.
+            count(true);
             // Every truncation.
             for cut in 0..seed.len() {
                 count(run(name, *target, &format!("seed {i} cut at {cut}"), &seed[..cut]));
@@ -160,7 +164,11 @@ fn hostile_activation_shapes_are_shape_errors() {
 #[test]
 fn non_canonical_tags_are_refused() {
     use dfin_proto::Request;
-    let mut body = postcard::to_stdvec(&seeds::requests()[3]).unwrap();
+    let forward = seeds::requests()
+        .into_iter()
+        .find(|r| matches!(r, Request::Forward { .. }))
+        .expect("the seed list has a Forward");
+    let mut body = postcard::to_stdvec(&forward).unwrap();
     assert_eq!(body[0], Request::FORWARD_TAG);
     body.splice(0..1, [0x80 | Request::FORWARD_TAG, 0x00]);
     let decoded: Request = postcard::from_bytes(&body).expect("postcard accepts it");

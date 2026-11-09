@@ -1,13 +1,16 @@
-# Phase 1 protocol: identities, transport, chains
+# dfin wire protocol: identities, transport, chains
 
-Status: being built, 6 November 2026. This is the contract between `dfin-net`,
-`dfin-proto` version 2, `dfin stage`, `dfin relay` and the client daemon. Design
-background is in [design-v0.2.md](design-v0.2.md) sections 8 and 13.
+This is the contract between `dfin-net`, `dfin-proto` version 3, `dfin stage`,
+`dfin relay`, `dfin hub` and the client daemon. Design background is in
+[SPEC.md](SPEC.md).
 
-**7 November update:** Tor is now the default transport; see
-[strict anonymity](anonymity.md) for its setup and security boundaries. Messages and
-sealed route records below are unchanged. QUIC, UDP relay cloaking, HTTP seeds, and
-region fencing below apply only to explicit `--network direct` mode.
+Tor is the default transport; see [strict anonymity](anonymity.md) for its setup and
+security boundaries. QUIC and HTTP shard seeds exist only in explicit
+`--network direct` mode, which is for LANs, local pods, benchmarks and tests.
+
+Protocol version 3 (9 November 2026) removed UDP relay cloaking and region fencing
+from version 2: two requests, two replies, two record fields and the per-probe round
+trips in directory entries are gone (sections 9 and 12). Versions do not interoperate.
 
 ## 1. Identities
 
@@ -25,23 +28,37 @@ Every node and every client connection has an Ed25519 key.
 
 ## 2. Transport
 
-QUIC (quinn) with TLS 1.3 (rustls). There are no certificate authorities.
+Two transports carry the same application frames, and a process uses exactly one:
+
+- **Tor (default).** TLS 1.3 (rustls) over a SOCKS5 connection through a local Tor
+  daemon to a v3 onion service, with yamux multiplexing streams inside TLS. ALPN
+  `dfin/1-tor-yamux`. Its stream framing and limits are in section 3.
+- **Direct (`--network direct`).** QUIC (quinn) with TLS 1.3 (rustls). ALPN `dfin/1`,
+  idle timeout 30 s with keep-alives every 6 s. It exposes IP addresses and provides
+  no anonymity.
+
+Tor and direct endpoints cannot talk to each other and neither falls back to the
+other. There are no certificate authorities in either. Common to both:
 
 - Each side presents a self-signed certificate whose subject public key is its
   Ed25519 key. The dialer knows the node id it expects and refuses any other key.
   The listener accepts any client certificate and records its key as the peer id.
-- ALPN `dfin/1`. Idle timeout 30 s with keep-alives every 5 s.
 - Every request is one bidirectional stream: the opener writes one frame, the
   acceptor writes one frame in reply, both sides finish. Frames are the Phase 0
   framing (little-endian u32 length, postcard body). Results that travel to a
   return target (section 5) go on unidirectional streams opened by the sender.
 - The first stream on a connection to a stage must be `Hello`. Until it succeeds
-  the stage answers everything else with `BadRequest`.
+  the stage answers everything else with `BadRequest`, except `Ping` and `ShardGet`.
 
-Limits, enforced at the receiver: frame size by message type (`Forward` bounded by
-`n_batch * n_embd * 4` bytes plus headers, everything else 64 KiB), at most 64 routes
-per connection, `n_seq_max` sessions per stage, one `Forward` in flight per session,
-10 s to read a control frame, 600 s for a `Forward` reply.
+Limits, enforced at the receiver. Frame size by message type: a `Forward` and its
+result at most `n_tokens * width * 4` bytes plus 64 KiB of headroom, where a stage
+bounds `n_tokens` by its `n_batch` and `width` is the wider of its input and output
+rows (section 11); a directory reply at most 16 MiB; a shard reply at most 4 MiB plus
+64 KiB; every other frame 64 KiB; nothing above 1 GiB. A reader checks the limit for
+the message it expects before reading the body, and grows its buffer as payload
+arrives instead of allocating the announced length. Also: at most 64 routes per
+connection, `n_seq_max` sessions per stage, one `Forward` in flight per session, 10 s
+to read a control frame, 600 s for a `Forward` reply.
 
 Pending setup counts toward the route limit and reserves its route number. Each
 route owns a separate next-hop connection; pooling those connections would merge
@@ -51,7 +68,7 @@ them before releasing its routes. `RouteClose` cancels outstanding route operati
 before queuing engine cleanup. Native inference already executing cannot be interrupted;
 cleanup follows it. Disconnects cascade through the route-owned connections.
 
-## 3. Messages (dfin-proto version 2)
+## 3. Messages (dfin-proto version 3)
 
 ### Tor transport framing (default)
 
@@ -88,14 +105,22 @@ Requests:
 | `RouteClose { route }` | previous hop or client | Tear the route down along the chain |
 | `Ping` | anyone | Round-trip measurement |
 | `RelayOpen { token, first_hop }`, `RelayAttach { token }` | client, last hop to relay | Section 6 |
-| `RelayListen` | cloaked node to relay | Allocate a public port for me; this stream becomes the tunnel (section 9) |
 | `Announce { record }` | node to hub | List me; `record` is a `SignedRecord` (section 8) |
 | `DirectoryGet` | anyone to hub | The current `SignedDirectory` |
 | `ShardGet { model_id, split, offset, len }` | fetcher to a node | Up to 4 MiB of a shard the node holds; replies `Shard { total, data }` (section 10) |
 
-Replies: `HelloOk { layer_begin, layer_end, n_embd, n_ctx, n_seq_max, backend, node_id }`,
-`RouteOk { hops }` (number of hops that acknowledged), `Ack`, `ForwardOk { session, seq,
-act, hops }`, `Pong`, `Error { code, message }`.
+Replies: `HelloOk { layer_begin, layer_end, n_embd, n_embd_inp, n_embd_out, n_ctx,
+n_seq_max, backend, node_id }` (`n_embd_inp` and `n_embd_out` are the widths of the rows
+the stage takes and produces, section 11), `RouteOk { hops }` (number of hops that
+acknowledged), `Ack`, `ForwardOk { session, seq, act, hops }`, `Pong`,
+`Directory { directory }`, `Shard { total, data }`, `Error { code, message }`.
+
+In postcard's encoding the variant index is the first byte. Requests, in order from 0:
+`Hello`, `RouteSetup`, `Forward`, `SeqRm`, `SessionClose`, `RouteClose`, `Ping`,
+`RelayOpen`, `RelayAttach`, `Announce`, `DirectoryGet`, `ShardGet`. Replies: `HelloOk`,
+`RouteOk`, `Ack`, `ForwardOk`, `Pong`, `Directory`, `Shard`, `Error`. A stage sizes its
+read from that first byte: only `Forward` (index 2) may be large, and a non-minimal
+encoding of the index is refused.
 
 `route` is a 64-bit number chosen by the client; a node keys routes by (incoming
 connection, route), so two clients choosing the same number cannot collide.
@@ -151,7 +176,7 @@ application identities remain visible according to each peer's role.
 |---|---|---|---|
 | `Reverse` | Replies `ForwardOk` on the stream it was asked on | Waits for the downstream reply and relays it | Hop 1 only (or nobody with a relay) |
 | `Direct { client_id }` | Opens a unidirectional stream on its connection from `client_id` and writes `ForwardOk` | Replies `Ack` at once, without waiting | Hop 1 and hop N |
-| `Relay { addr, node_id, token }` | Connects to the relay, attaches with `token`, writes `ForwardOk` on a unidirectional stream | Replies `Ack` at once | No stage sees the client's IP. The relay sees it in direct mode; Tor hides it. The relay can inspect model states |
+| `Relay { relay, token }` | Connects to the relay, attaches with `token`, writes `ForwardOk` on a unidirectional stream | Replies `Ack` at once | No stage sees the client's IP. The relay sees it in direct mode; Tor hides it. The relay can inspect model states |
 
 In `Direct` mode the client has connected to the last hop (with `Hello`) before
 route setup, and the last hop finds that connection by the client's key.
@@ -176,8 +201,7 @@ between a last hop and the client, keyed by a client-chosen 16-byte token.
 Only the sealed route records remain encrypted to their stage keys. The application
 relay is an additional observer of potentially revealing states; it does not provide
 end-to-end content confidentiality. This corrects the earlier ciphertext-only claim.
-The UDP cloaking tunnel in section 9 is different: its inner QUIC encryption ends
-at the stage. Relay sessions are kept in memory, not persisted.
+Relay sessions are kept in memory, not persisted.
 
 Client side: `RelayOpen { token, first_hop: (addr, node_id) }` on the first stream;
 afterwards every stream the client opens is piped to a new stream on the relay's
@@ -196,7 +220,8 @@ Cancelling a caller cancels its dial and stream copies. Losing either the client
 its return path tears down the session. Sessions with no return attachment expire
 after two minutes, even if their first-hop connection remains open. The first stream
 and frame must arrive within ten seconds. Stream-copy tasks are bounded to 128 for
-request/reply directions and 64 for results. A relay answers `Ping` for readiness checks.
+request/reply directions and 64 for results. A relay answers `Ping` for readiness
+checks and any other first request with `BadRequest`.
 
 ## 7. What a stage keeps
 
@@ -210,10 +235,9 @@ any of this.
 
 A **node record** is what a stage says about itself: node id, dialable addresses, model
 fingerprint and name, layer range, `n_layer`, `n_embd`, KV capacity per session, session
-slots, activation type, backend, protocol version, a free-text region claim, an
-`attested` flag (always false in phase 1), `issued_at` (unix seconds) and `ttl_secs`. The
-stage signs the postcard bytes of the record with its Ed25519 key under the domain
-`dfin-node-record-v1`, and announces the `SignedRecord` to each hub it was given
+slots, activation type, backend, protocol version, an `attested` flag (always false
+today), `issued_at` (unix seconds) and `ttl_secs`. The stage signs the postcard bytes of
+the record with its Ed25519 key under the domain `dfin-node-record-v2`, and announces the `SignedRecord` to each hub it was given
 (`--hub`, repeatable; `--advertise` names the address others should dial) every
 `--announce-every` seconds, with a lifetime of three announcement periods.
 
@@ -221,18 +245,21 @@ The **hub** (`dfin hub`) verifies the signature, checks the record's bounds (pro
 version, one to eight addresses, text lengths, a middle layer range inside the model, a
 lifetime of at most an hour, a time stamp within ten minutes of its clock), dials the
 first address pinned to the node id and pings it three times, and refuses the
-announcement if it does not answer (`Unreachable`). It keeps the best ping as
-`hub_rtt_ms`, one vantage point; section 12 adds more. Records are dropped when they
-expire. `DirectoryGet` returns a `Directory` (hub id, `issued_at`, entries sorted by node
-id, each a signed record plus the hub's observations) signed by the hub under the domain
-`dfin-directory-v1`. With `--http`, the same list is served as JSON for people.
+announcement if it does not answer (`Unreachable`). The check is allowed 5 s in direct
+mode and 60 s over Tor. The hub keeps the best ping as `hub_rtt_ms`, a routing hint and
+nothing more. Records are dropped when they expire. `DirectoryGet` returns a `Directory`
+(hub id, `issued_at`, entries sorted by node id, each a signed record plus `hub_rtt_ms`
+and `seen_at`) signed by the hub under the domain `dfin-directory-v2`. With `--http`,
+the same list is served as JSON for people. In Tor mode the hub lists, and the client
+uses, only records whose every address is a v3 onion name, with an empty `backend` and
+`attested` false.
 
-Announcements reserve the node identity and directory capacity before probing;
-duplicate pending announcements are refused. Refreshes of listed nodes remain possible
-at capacity. There are at most 32 simultaneous announcement probes across the hub and
-32 request handlers per connection. Disconnecting cancels pending probes and releases
-their reservations. Probe connections close on failure as well as success, and record
-lifetimes are checked again before insertion.
+Announcements reserve the node identity and directory capacity before the
+reachability check; duplicate pending announcements are refused. Refreshes of listed
+nodes remain possible at capacity. There are at most 32 simultaneous reachability
+checks across the hub and 32 request handlers per connection. Disconnecting cancels
+pending checks and releases their reservations. Check connections close on failure as
+well as success, and record lifetimes are checked again before insertion.
 
 The hub never assigns routes. A **client** given `--hub host:port/<node id>` and no
 `--stage` fetches the directory, verifies the hub's signature against the pinned id and
@@ -251,34 +278,8 @@ reputation.
 
 ## 9. Cloaked nodes
 
-A stage started with `--cloak host:port/<relay id>` and no `--listen` opens no port.
-It dials the relay, opens one bidirectional stream, and sends `RelayListen`. The relay
-binds a UDP port on its public address, answers `RelayListening { addr }` on that
-stream without finishing it, and from then on the stream is a tunnel: every datagram
-that reaches the port goes down the stream as a frame (`u16` length, 16-byte
-IPv6-mapped address, `u16` port, payload), and every frame the node sends up goes out
-of the port to the address named in it.
-
-The address the relay attaches is **synthetic**: one from 100.64.0.0/10 allotted per
-real sender, mapped back only inside the relay. The node's QUIC endpoint runs over the
-tunnel and sees those synthetic addresses as its peers, so a cloaked node learns no
-address of any dialer, neighbour, hub or client, while dialers learn only the relay's
-address and port.
-
-Dialers need nothing new: the directory record lists `relay-host:port` as the node's
-address, with `cloaked: true`, and a dial to it is an ordinary QUIC connection pinned to
-the node's key. The handshake and every byte after it are end to end between dialer
-and node; the relay forwards ciphertext it cannot read. The hub's reachability probe
-and `hub_rtt_ms` therefore describe the path to the relay, and the client treats
-`cloaked` records as unplaceable for any region preference.
-
-A cloaked node's stage still dials out normally (to the hub, to its next hop, to the
-relay) from an ephemeral port. `--cloak` is repeatable; each relay yields one public
-address and the record lists them all. When the tunnel breaks the stage re-registers
-after five seconds, usually getting a new port, and its next announcement carries it.
-The relay refuses registrations beyond `--max-cloaked`, allocates from `--port-range`
-when one is given, and needs a public host (`--public-host`, or a specific `--listen`
-address) to name the ports by.
+Removed 9 November 2026: the UDP cloaking tunnel (`dfin stage --cloak`, `RelayListen`,
+`RelayListening`, the record's `cloaked` flag) is gone; onion services replace it.
 
 ## 10. Shards
 
@@ -351,40 +352,8 @@ model's `n_embd`; the per-boundary widths follow from the model and the layer ra
 
 ## 12. Region fencing
 
-The directory's `hub_rtt_ms` is one vantage point. Fencing needs several, so a hub can
-be given **probes**: `dfin probe --region <label> --allow <hub id>` is a small node that
-answers `Probe { addr, node_id }` from an allowed asker by dialing `addr` pinned to
-`node_id`, pinging it three times, and replying `Probed { rtt_ms, region }` with the best
-round trip and its own label. It answers nobody else (`BadRequest`), caps how many
-probes it runs per minute (`RateLimited`), and reports `Unreachable` when the target
-does not answer. With no `--allow` it answers anyone and says so in its log, which makes
-it a scanner for whoever finds it; a public probe should always carry an allow list.
-
-The hub (`--probe host:port/<probe id>`, repeatable) asks every probe about each
-announcing node after its own reachability check, in sequence, and stores the answers in
-the entry as `probes: Vec<ProbeRtt { probe_id, region, rtt_ms }>`; `--region <label>` on
-the hub makes its own ping count as a probe in that region. A cloaked node gets no
-measurements: its address is a relay's, so any round trip would place the relay. Probes
-that fail or refuse are left out rather than failing the announcement. The signed
-directory and the JSON view both carry the list.
-
-The client turns the evidence into a policy with `--region <label>:<ms>`: a node is
-inside the fence only if it is not cloaked, at least one probe labelled `<label>`
-measured it, and every such probe measured it at or under `<ms>`. The route is chosen
-from the nodes inside the fence by the usual rule (fewest hops, then lowest hub round
-trip), and if no chain remains the client says how many usable nodes the fence excluded
-and refuses to start, or to reroute. `/status` shows the fence in force, the count it
-excluded, and on each hop `fenced: "<label>"` or `cloaked: true`.
-
-What a fence proves is what design v0.2 section 9 says it proves: light in fibre allows
-about 100 km per millisecond of round trip, so a node that every probe in a region
-reaches within a bound has its network interface within that distance of all of them.
-It says nothing about where the computation runs; a fenced node could forward
-activations anywhere. Attestation (phase 2) is what closes that gap. Nor does the fence
-defend against a hub that lies: the client trusts the hub it pinned for the whole
-directory already, and probe results are part of that trust. A hub operator who wants
-to be checked publishes the probe ids, and a later version can let clients ask the
-probes themselves.
+Removed 9 November 2026: `dfin probe`, `Probe`/`Probed`, region claims, per-probe round
+trips and client fences are gone; dfin has no location feature.
 
 ## 13. Fuzzing
 
@@ -394,7 +363,7 @@ the bytes do decode, does what the real code does next: re-encodes the value and
 the encoding is stable, converts activations both ways, verifies signatures, opens inner
 sealed records, parses addresses. The targets are `request`, `response`,
 `return_frame`, `hop_record`, `sealed`, `signed_record`, `signed_directory`,
-`tunnel_packet`, `frame` (the length-prefixed reader under each limit a receiver uses,
+`frame` (the length-prefixed reader under each limit a receiver uses,
 plus the rule that only `Forward` may carry the Forward tag in its first byte),
 `node_id_text` and `activations`. Sealed and signed inputs use a fixed key, so a
 fuzzer can evolve past the cryptographic checks and reach the code behind them.
@@ -410,8 +379,8 @@ target under the address sanitizer for a short time on each push.
 The value-level rules of the binary are covered by generated-value tests rather than
 byte fuzzing, since the types already decoded: route choice over directories with bad
 signatures, empty address lists, absurd layer ranges, NaN round trips, expired and
-far-future records, under random fences and exclusions, must never panic and must only
-return chains that tile the requested layers with addressable, unfenced nodes; and the
+far-future records, under random exclusions, must never panic and must only
+return chains that tile the requested layers with addressable nodes; and the
 hub's record check must accept only records with the bounds the hub relies on
 afterwards.
 
@@ -419,18 +388,20 @@ Not fuzzed here: QUIC and TLS (quinn and rustls fuzz their own decoders), and th
 model computation (llama.cpp's problem; a stage's activation input is bounded in shape
 before it reaches the model).
 
-## 14. Status, 7 November 2026
+## 14. Status, 9 November 2026
 
-Built and tested: identities, transport, sealed records, route setup, forwarding, all
-three return modes, `dfin relay`, the signed directory with `dfin hub` and client-side
-routing with rerouting when a stage dies (section 8), cloaked nodes (section 9), weight
-shards (section 10), wide stage state (section 11), region fencing with `dfin probe`
-(section 12), the limits in section 2 and fuzzed decoders (section 13). Verified with
-the tiny model (unit, protocol, fuzz and end-to-end tests in every mode, including a
-hub, a stage killed mid-run, a cloaked stage behind a relay, a stage fetching its shards
-from a peer, and two probes fencing a route) and on GLM-4.7-Flash on one machine
-(`docs/phase1-findings.md`). Not yet done from the phase 1 list: replay-log failover of
-a live session. The whole picture, done and open, is in `STATUS.md` at the repository
+Built and tested: identities, both transports (section 2), sealed records, route setup,
+forwarding, all three return modes, `dfin relay`, the signed directory with `dfin hub`
+and client-side routing with rerouting when a stage dies (section 8), weight shards
+(section 10), wide stage state (section 11), the limits in section 2 and fuzzed decoders
+(section 13). Verified with the tiny models (unit, protocol, fuzz and end-to-end tests
+in every return mode, including a hub, a stage killed mid-run and a stage fetching its
+shards from a peer; the same flow over a private Tor network in CI) and on
+GLM-4.7-Flash on one machine in direct mode (`docs/archive/phase1-findings.md`).
+
+Removed on 9 November 2026 with protocol version 3: cloaked nodes (section 9) and
+region fencing with `dfin probe` (section 12). Not yet done: replay-log failover of a
+live session. The whole picture, done and open, is in `STATUS.md` at the repository
 root.
 
 ## 15. What changed from Phase 0 and why

@@ -2,6 +2,7 @@
 //! Direct loopback transport here provides no anonymity; inference is covered by e2e.
 use super::*;
 use dfin_net::{seal, SendStream};
+use dfin_proto::read_frame_max;
 use tokio::task::JoinHandle;
 
 const WAIT: Duration = Duration::from_secs(3);
@@ -81,7 +82,6 @@ impl Fixture {
             clients: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             max_routes,
-            cloak_addrs: Mutex::new(vec![]),
             shards: None,
         });
         // Own connection tasks, including when a failed assertion drops the fixture.
@@ -466,8 +466,16 @@ async fn unexpected_setup_response_does_not_reflect_its_payload() {
     let (_peer, _conn, mut send, task) = pending(&f, &client).await;
     reply(
         &mut send,
-        &Response::RelayListening {
-            addr: "private-response-canary".into(),
+        &Response::HelloOk {
+            layer_begin: 2,
+            layer_end: 4,
+            n_embd: 64,
+            n_embd_inp: 64,
+            n_embd_out: 64,
+            n_ctx: 512,
+            n_seq_max: 1,
+            backend: "private-response-canary".into(),
+            node_id: [0; 32],
         },
     )
     .await

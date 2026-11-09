@@ -19,10 +19,7 @@ impl Fixture {
             endpoint: endpoint.clone(),
             state: Mutex::new(DirectoryState::default()),
             max_records,
-            probe_timeout: Duration::from_secs(30),
-            probes: vec![],
-            region: None,
-            probe_conns: tokio::sync::Mutex::new(HashMap::new()),
+            reach_timeout: Duration::from_secs(30),
         });
         let copy = hub.clone();
         let task = tokio::spawn(async move {
@@ -94,9 +91,7 @@ impl Node {
             act_dtype: ActDtype::F32,
             backend: String::new(),
             protocol: PROTOCOL_VERSION,
-            region: String::new(),
             attested: false,
-            cloaked: false,
             issued_at: unix_now(),
             ttl_secs: 180,
         };
@@ -148,7 +143,7 @@ fn announce(hub: &Arc<Hub>, node: &Node) -> JoinHandle<Response> {
     tokio::spawn(async move { hub.announce(signed).await })
 }
 
-async fn finish_probe(conn: &Connection, mut first: SendStream) {
+async fn finish_check(conn: &Connection, mut first: SendStream) {
     reply(&mut first, &Response::Pong).await.unwrap();
     for _ in 0..2 {
         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
@@ -173,12 +168,12 @@ async fn concurrent_announcements_cannot_overfill_the_directory() {
     let response = tokio::time::timeout(WAIT, f.hub.announce(second.signed.clone()))
         .await
         .unwrap();
-    finish_probe(&conn, send).await;
+    finish_check(&conn, send).await;
     assert!(matches!(pending.await.unwrap(), Response::Ack));
     assert_eq!(
         f.hub.state.lock().entries.len(),
         1,
-        "concurrent probes bypassed the record limit"
+        "concurrent announcements bypassed the record limit"
     );
     assert!(
         matches!(
@@ -202,7 +197,7 @@ async fn concurrent_announcements_cannot_overfill_the_directory() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn duplicate_pending_announcements_do_not_start_another_probe() {
+async fn duplicate_pending_announcements_do_not_start_another_check() {
     let f = Fixture::new(2);
     let mut node = Node::new();
     let pending = announce(&f.hub, &node);
@@ -211,7 +206,7 @@ async fn duplicate_pending_announcements_do_not_start_another_probe() {
     let response = tokio::time::timeout(WAIT, f.hub.announce(node.signed.clone()))
         .await
         .unwrap();
-    finish_probe(&conn, send).await;
+    finish_check(&conn, send).await;
     assert!(matches!(pending.await.unwrap(), Response::Ack));
     assert!(
         matches!(
@@ -226,7 +221,7 @@ async fn duplicate_pending_announcements_do_not_start_another_probe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn disconnect_cancels_announcement_probe_and_releases_capacity() {
+async fn disconnect_cancels_announcement_check_and_releases_capacity() {
     let f = Fixture::new(1);
     let node = Node::new();
     let (_ep, client) = f.client().await;
@@ -245,7 +240,7 @@ async fn disconnect_cancels_announcement_probe_and_releases_capacity() {
     pending.abort();
     assert!(
         tokio::time::timeout(WAIT, conn.closed()).await.is_ok(),
-        "probe outlived its caller"
+        "reachability check outlived its caller"
     );
     let mut next = Node::new();
     next.answer_later_connections();
@@ -258,7 +253,7 @@ async fn disconnect_cancels_announcement_probe_and_releases_capacity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_probe_closes_its_connection_and_releases_the_reservation() {
+async fn failed_check_closes_its_connection_and_releases_the_reservation() {
     let f = Fixture::new(1);
     let mut node = Node::new();
     let pending = announce(&f.hub, &node);
@@ -282,7 +277,7 @@ async fn failed_probe_closes_its_connection_and_releases_the_reservation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_large_directory_still_bounds_simultaneous_probes() {
+async fn a_large_directory_still_bounds_simultaneous_checks() {
     let f = Fixture::new(1000);
     let mut held = Vec::new();
     for _ in 0..32 {
@@ -327,11 +322,11 @@ async fn repeated_cancelled_announcements_release_all_reservations() {
             )
             .await
         });
-        let (probe, _send) = node.hold_first_ping().await;
+        let (check, _send) = node.hold_first_ping().await;
         client.close("cancelled iteration");
         request.abort();
         let _ = request.await;
-        assert!(tokio::time::timeout(WAIT, probe.closed()).await.is_ok());
+        assert!(tokio::time::timeout(WAIT, check.closed()).await.is_ok());
         tokio::time::timeout(WAIT, async {
             while !f.hub.state.lock().pending.is_empty() {
                 tokio::task::yield_now().await;

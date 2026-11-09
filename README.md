@@ -1,68 +1,54 @@
 # dfin: Decentralized Frontier Inference Network
 
-Pipeline-parallel inference of large open models across several machines, with the
-privacy-relevant pieces (token embedding, first layers, last layer, LM head) running on
-the user's own machine, over an authenticated chain with sealed per-hop routes.
-Tor is the default transport; inference nodes still receive potentially revealing model states.
-The aim is a network of strangers' hardware that keeps serving frontier
-open-weight models if hosted endpoints for them disappear.
+dfin runs one large open-weight model across many machines owned by unrelated people.
+Each machine holds a contiguous slice of the model's layers and never the whole model.
+The first and last layers stay on the user's own machine, so no node sees text or
+logits, and every connection goes through Tor, so no node learns who is asking. The aim
+is a network that keeps serving frontier open models if hosted endpoints for them
+disappear.
 
-**What exists and what does not: [STATUS.md](STATUS.md).** In short: one LAN pod works
-and has been measured on a real model across two machines; the encrypted chain (node
-keys, QUIC, relays, a signed directory, cloaked nodes, weight shards, region fencing,
-fuzzed decoders) is built and tested, with failover of a live session still to do; trust,
-money and scale have not started. **Strict anonymity setup and limits:
-[docs/anonymity.md](docs/anonymity.md).** Existing LAN examples below require explicit
-`--network direct`, which disables anonymity.
+**Security and anonymity are the product.** Read what is and is not protected before
+relying on it: a node receives intermediate model states and could, with effort,
+reconstruct the input from them. Tamper detection, payments and several other required
+parts are not built yet.
 
-Design: [docs/design-v0.2.md](docs/design-v0.2.md) (threat model, trust tiers, attested
-and open nodes, anonymity, money, phases), with the model physics in
-[docs/design-v0.1.md](docs/design-v0.1.md). The wire contract:
-[docs/phase1-protocol.md](docs/phase1-protocol.md). Every document is listed in
-[docs/README.md](docs/README.md).
-
-## What is here
-
-| Path | What |
+| To find out | Read |
 |---|---|
-| `vendor/llama.cpp` | Mainline llama.cpp (pinned) plus the **layer-range patch**; see `vendor/README.md` |
-| `crates/dfin-llama-sys` | Raw bindings to the patched libllama (bindgen, prebuilt DLLs) |
-| `crates/dfin-llama` | Safe wrapper: `Model` (full or partial), `Context`, tokenizer, chat templates |
-| `crates/dfin-proto` | Wire protocol: postcard frames, f32/f16 activations, routes, sealed hop records |
-| `crates/dfin-net` | Node identities, strict Tor/TLS/yamux, explicit direct QUIC, sealed boxes |
-| `crates/dfin` | The `dfin` binary: `stage`, `client`, `relay`, `hub`, `probe`, `fetch`, `pod`, `bench` |
-| `crates/dfin-fuzz` | Fuzz targets for every wire decoder, run as ordinary tests everywhere and under libFuzzer through `fuzz/` |
-| `tools/` | Synthetic test-model generators (random weights, valid structure) and the shard tool |
-| `scripts/` | Build llama.cpp, regenerate bindings, benchmark and two-machine scripts (each listed in `STATUS.md`) |
-| `docs/` | Design, protocol, findings and logs; `docs/README.md` says what each is |
+| What dfin must do, all of it required | [docs/SPEC.md](docs/SPEC.md) |
+| What exists today and how it was checked | [STATUS.md](STATUS.md) |
+| What gets built next | [docs/PLAN.md](docs/PLAN.md) |
+| The bytes on the wire | [docs/protocol.md](docs/protocol.md) |
+| How to run it over Tor, and its limits | [docs/anonymity.md](docs/anonymity.md) |
+| The rules for changing this repository | [AGENTS.md](AGENTS.md) |
 
-### How a request flows
+## How a request flows
 
 ```
 agent framework (OpenCode, Hermes, curl)
-        │  OpenAI API, localhost
+        │  OpenAI API, numeric loopback only
         ▼
- dfin --network direct client ── head: embedding + layers [0,a)      (user's machine)
-        │  hidden states, f16, Tor + TLS with pinned node keys
-        │  (optionally through another dfin --network direct relay)
+ dfin client ── head: embedding + layers [0,a)        (user's machine)
+        │  hidden states, through Tor to an onion service,
+        │  TLS 1.3 inside with the node's key pinned
         ▼
- dfin --network direct stage  ── layers [a,b)                         (node)
-        │  stage dials the next stage; each knows only its neighbours
+ dfin stage  ── layers [a,b)                           (a stranger's node)
+        │  the stage dials the next stage; each knows only its neighbours
         ▼
- dfin --network direct stage  ── layers [b,c)                         (node)
-        │  result straight back to the client, or via the relay, or back along the chain
+ dfin stage  ── layers [b,c)                           (another stranger's node)
+        │  result back to the client: directly, back along the chain,
+        │  or through an optional relay
         ▼
- dfin --network direct client ── tail: layers [c,n) + norm + LM head  (user's machine)
-                sampling, streaming (prefix reuse only in explicit direct mode)
+ dfin client ── tail: layers [c,n) + norm + LM head    (user's machine)
+                sampling, streaming
 ```
 
-Every node has an Ed25519 key; its public key is the node id, which clients pin when
-they dial. Route instructions are sealed to each hop's key, so a hop learns only its two
-neighbours. The wire contract is [docs/phase1-protocol.md](docs/phase1-protocol.md).
+Every node has an Ed25519 key; its public key is the node id, which dialers pin. Route
+instructions are sealed to each hop's key, so a hop learns only its two neighbours. Each
+request uses a fresh client key and a fresh route.
 
 Every piece is the same GGUF file opened with a different layer range, so any
-architecture llama.cpp supports (including `glm-dsa`, `glm5-next`, `kimi-k3`) works as
-a stage, with llama.cpp's quantizations, GPU backends, KV cache types and expert
+architecture llama.cpp supports (including `glm-dsa`, `glm5-next` and `kimi-k3`) works
+as a stage, with llama.cpp's quantizations, GPU backends, KV cache types and expert
 offload (`--cpu-tensors exps`) intact.
 
 ## Get the source
@@ -74,87 +60,169 @@ scripts/apply-llama-patch.sh        # Windows: .\scripts\apply-llama-patch.ps1
 ```
 
 `vendor/llama.cpp` is a submodule pinned to an upstream commit; the script applies
-`vendor/patches/0001-layer-range.patch` on top (idempotent). If the shallow submodule
-fetch fails, run `git submodule update --init` without `--shallow-submodules`.
+`vendor/patches/0001-layer-range.patch` on top. If the shallow submodule fetch fails,
+run `git submodule update --init` without `--shallow-submodules`.
 
-## Build (macOS and Linux)
+## Build
+
+### macOS and Linux
 
 Prerequisites: a C++ toolchain (`xcode-select --install` on macOS; gcc or clang on
-Linux), CMake 3.21+, Rust 1.92+ (`rustup`). On Apple Silicon the Metal backend is on
-by default; on Linux pass `GGML_VULKAN=ON` or `GGML_CUDA=ON` to the script for a GPU.
+Linux), CMake 3.21+, Rust 1.92+ (`rustup`), Python 3.10+ for the test models. On Apple
+Silicon the Metal backend is on by default; on Linux pass `GGML_VULKAN=ON` or
+`GGML_CUDA=ON` to the script for a GPU.
 
 ```bash
-scripts/build-llama.sh              # 5 to 15 minutes
-cargo build --release
+scripts/build-llama.sh              # 5 to 15 minutes; TARGETS=llama builds only the library
+cargo build --release --locked
 ```
 
 The Rust build links against `vendor/llama.cpp/build` (override with
 `DFIN_LLAMA_BUILD_DIR`) and copies the shared libraries next to the binaries. The
-checked-in FFI bindings were generated on Windows x64; if `cargo test -p dfin-llama-sys`
-fails its layout tests on your platform, regenerate them with `scripts/gen-bindings.sh`
-(needs `cargo install bindgen-cli` and libclang).
+checked-in FFI bindings were generated on Windows x64; regenerate them with
+`scripts/gen-bindings.sh` (needs `cargo install bindgen-cli` and libclang) only if the
+llama.cpp pin or the patch changes the C API.
+
+### Windows
+
+Prerequisites: Visual Studio 2022 with C++ tools, CMake, Rust 1.92+, Python 3.10+, and
+the Vulkan SDK for AMD, Intel or NVIDIA GPUs through Vulkan. Keep the checkout on a
+short path, because MSVC breaks beyond 260-character paths. A `subst` drive works:
+
+```powershell
+subst W: C:\path\to\this\checkout
+cd W:\
+.\scripts\build-llama.ps1          # llama.cpp with Vulkan, Release (10 to 20 minutes)
+cargo build --release --locked
+```
 
 ### Docker (Linux, CPU only)
 
 The `Dockerfile` builds llama.cpp and the workspace in a builder stage and ships `dfin`
-with its shared libraries on `debian:trixie-slim` (about 140 MB). It needs the submodule
-checked out; the comment at the top says how Vulkan and CUDA variants would be added.
+with its shared libraries on `debian:trixie-slim`. It needs the submodule checked out.
 
 ```bash
 docker build -t dfin .
 docker run --rm dfin --help
 ```
 
-### Continuous integration
+## Test models and tests
 
-`.github/workflows/ci.yml` runs on every push to `main` and every pull request: it checks
-out the submodule, applies the patch, builds llama.cpp (CPU, `GGML_NATIVE=OFF` so the
-cached build is portable between runners), generates the tiny test model and runs
-`cargo test --release --workspace` on `ubuntu-latest`. The llama.cpp build tree is cached
-on the submodule commit and the patch, so only changes to either rebuild it.
+No weights ship with the repository. Tiny random-weight models are enough to exercise
+every code path end to end. Generate all of them: tests that cannot find their model
+print `SKIP` and pass.
 
-## Build (Windows)
-
-Prerequisites: Visual Studio 2022 with C++ tools, CMake, Rust 1.92+, Python 3.10+,
-and the Vulkan SDK for AMD/Intel/NVIDIA GPUs through Vulkan. Keep the checkout on a
-short path: MSVC breaks beyond 260-character paths. A `subst` drive works:
-
-```powershell
-subst W: C:\path\to\this\checkout
+```bash
+python3 -m venv .venv
+.venv/bin/pip install numpy -e vendor/llama.cpp/gguf-py
+.venv/bin/python tools/make_tiny_llama.py models/tiny-llama-f32.gguf
+.venv/bin/python tools/shard_gguf.py models/tiny-llama-f32.gguf --out models/tiny-shards
+.venv/bin/python tools/make_tiny_kimi_k3.py models/tiny-kimi-k3-res.gguf --attn-res-block-size 2
+.venv/bin/python tools/make_tiny_glm5_next.py models/tiny-glm5-next.gguf
+cargo test --release --workspace --locked
 ```
 
-```powershell
-cd W:\
-.\scripts\build-llama.ps1          # llama.cpp with Vulkan, Release (10 to 20 minutes)
-cargo build --release
+On Windows the interpreter is `.venv\Scripts\python.exe`. The suite needs no Tor: it
+uses a local SOCKS fixture. Two slower tests are ignored by default and run in CI: the
+real two-minute relay expiry, and full inference through a private nine-node Tor network
+(`scripts/test-tor-local.py`, which needs `tor` and `tor-gencert`). See
+[docs/anonymity.md](docs/anonymity.md), "Verification".
+
+## Run it over Tor
+
+This is how dfin is meant to be used. Each stage, hub and relay is a Tor onion service
+listening on loopback; dfin talks to a Tor daemon you run and never falls back to a
+direct connection. [docs/anonymity.md](docs/anonymity.md) has the Tor configuration and
+the limits. In outline:
+
+```bash
+# on a node: forward an onion service to 127.0.0.1:7001 in torrc, then
+dfin stage --model model.gguf --layers 2:6 --identity stage.key --listen 127.0.0.1:7001
+
+# on the user's machine: name the stage by onion address and node id
+dfin client --model model.gguf --head 0:2 --tail 6:end \
+  --stage '<stage-onion>:7001/<stage-node-id>=2:6' --listen 127.0.0.1:8080
 ```
 
-### Test model
+Then point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. `GET /status`
+shows the network mode, the route with each stage's node id, timings and return mode,
+and states which guarantees are absent.
 
-No weights ship with the repo. A tiny random-weight Llama (1.6 MB) is enough to test
-every code path end to end:
+Instead of naming every stage, run a hub and let stages announce themselves:
 
-```powershell
-uv venv .venv; uv pip install --python .venv/Scripts/python.exe numpy -e vendor/llama.cpp/gguf-py
-.venv\Scripts\python.exe tools\make_tiny_llama.py models\tiny-llama-f32.gguf
-.venv\Scripts\python.exe tools\shard_gguf.py models\tiny-llama-f32.gguf --out models\tiny-shards
-.venv\Scripts\python.exe tools\make_tiny_kimi_k3.py models\tiny-kimi-k3-res.gguf --attn-res-block-size 2
-.venv\Scripts\python.exe tools\make_tiny_glm5_next.py models\tiny-glm5-next.gguf
-cargo test
+```bash
+dfin hub    --listen 127.0.0.1:7100 --identity hub.key
+dfin stage  ... --hub '<hub-onion>:7100/<hub-node-id>' --advertise '<stage-onion>:7001'
+dfin client --model model.gguf --head 0:2 --tail 6:end --hub '<hub-onion>:7100/<hub-node-id>'
 ```
 
-The integration tests split the tiny model into head, middle and tail pieces and check
-that the pipelined logits equal the monolithic ones.
+A stage signs a record of what it serves and announces it; the hub checks the
+signature, dials the stage to confirm it answers, and publishes a signed list. The
+client verifies both signatures, chooses its own route, keeps a copy of the list for
+when the hub is down, and moves to another chain when a stage dies between requests.
+The hub never chooses routes for anyone.
 
-### Fuzzing the decoders
+### Shards: fetching only your layers
 
-Every byte a node reads from a peer goes through a decoder in `crates/dfin-fuzz`: one
-function per wire type (requests, responses, return frames, hop records, sealed boxes,
-signed records and directories, tunnel packets, length-prefixed frames, node ids,
-activations), each taking arbitrary bytes and never allowed to panic. `cargo test`
-runs them all over their seeds, every truncation and bit flip of every seed, and random
-noise, on any platform. For a real fuzzer, the `fuzz/` crate wraps the same functions
-for libFuzzer (nightly, Linux or macOS):
+A node that serves a tenth of a 365 GB model should not download all of it.
+`tools/shard_gguf.py` cuts a GGUF into one file per layer plus the metadata, embedding
+and output head, with a manifest of sizes and SHA-256 hashes. The model id is a hash
+over those hashes.
+
+```bash
+.venv/bin/python tools/shard_gguf.py model.gguf --out shards/
+dfin stage --model shards/model.manifest.json --layers 40:77 --fetch --hub ... --identity node.key
+dfin fetch --manifest shards/model.manifest.json --layers 0:3 --hub ...
+```
+
+A stage given a manifest and `--fetch` downloads the shards its layers need from nodes
+in the directory that serve the same model, checks each against the manifest, and loads
+only what it holds.
+
+### Sizing a node
+
+The model file must be byte-identical to the client's (the handshake checks a
+fingerprint). Each stage maps only its own layers, so a node needs memory for its range:
+roughly `(RAM in GB - 4) / (model GB / layers)` layers. On Apple Silicon use
+`--n-gpu-layers -1` and no `--cpu-tensors`; on a PC with a small GPU and a big MoE model
+use `--n-gpu-layers -1 --cpu-tensors exps`. Start a stage with `--mlock` so the first
+request is as fast as later ones. `--no-mmap` is only safe with memory to spare. Use
+`--act-dtype f32` when exact agreement with the unsplit model matters; half precision
+is faster and can flip near-tie tokens.
+
+## Development mode: one machine or a LAN
+
+`--network direct` replaces Tor with QUIC between addresses you name. It exposes network
+addresses, makes no anonymity claim, and cannot talk to Tor-mode nodes. It exists for
+local pods, benchmarks and tests.
+
+```bash
+# head = layers 0:2 on the client, one stage 2:5, tail 5:8 on the client
+dfin --network direct pod --model models/tiny-llama-f32.gguf --split 2,5 --listen 127.0.0.1:8080
+
+# monolithic versus in-process split versus a local pod
+dfin --network direct bench --model models/tiny-llama-f32.gguf --split 3,6 --gen-tokens 64
+```
+
+By hand on a LAN, each stage prints its node id at startup and the client names every
+stage as `host:port/<node id>=a:b`. Stages are QUIC over UDP, so open the UDP port.
+
+```bash
+dfin --network direct stage  --model model.gguf --layers 3:40 --listen 0.0.0.0:7001 --identity node.key --mlock
+dfin --network direct client --model model.gguf --head 0:3 --tail 40:end \
+  --stage 192.168.1.10:7001/<id>=3:40 --listen 127.0.0.1:8080
+```
+
+`scripts/` has the benchmark scripts used for the measurements in STATUS.md; each says
+at its top what it needs.
+
+## Fuzzing the decoders
+
+Every byte a node reads from a peer goes through a decoder in `crates/dfin-fuzz`, one
+function per wire type, each taking arbitrary bytes and never allowed to panic.
+`cargo test` runs them over their seeds, every truncation and bit flip of every seed,
+and random noise. For a real fuzzer, `fuzz/` wraps the same functions for libFuzzer
+(nightly Rust, Linux or macOS):
 
 ```bash
 cargo install cargo-fuzz
@@ -162,189 +230,13 @@ cargo run --release -p dfin-fuzz --bin dfin-fuzz-seeds -- fuzz/corpus
 cargo +nightly fuzz run request -- -max_total_time=120
 ```
 
-CI runs every target for a short time on each push; anything it finds lands in
-`fuzz/artifacts`, which the ordinary tests replay afterwards.
+## Continuous integration
 
-## Run a local pod
-
-```powershell
-# head = layers 0:2 on the client, one stage 2:5, tail 5:8 on the client
-dfin --network direct pod --model models\tiny-llama-f32.gguf --split 2,5 --listen 127.0.0.1:8080
-```
-
-Or by hand, one process per machine. Each stage prints its node id at startup (the key
-lives in `--identity`, default `dfin-stage.key`, created on first run); the client names
-every stage as `host:port/<node id>=a:b` and refuses any other key:
-
-```powershell
-dfin --network direct stage  --model model.gguf --layers 3:40  --listen 0.0.0.0:7001 --identity node.key --n-gpu-layers -1 --cpu-tensors exps --mlock
-dfin --network direct stage  --model model.gguf --layers 40:77 --listen 0.0.0.0:7001 --identity node.key --n-gpu-layers -1 --cpu-tensors exps --mlock
-dfin --network direct client --model model.gguf --head 0:3 --tail 77:end --stage 192.168.1.10:7001/<id1>=3:40 --stage 192.168.1.11:7001/<id2>=40:77 --listen 127.0.0.1:8080
-```
-
-Stages are QUIC over UDP: open the UDP port, not a TCP one. The client dials only the
-first stage (and the last, in the default `--return direct` mode, which is where results
-come back from); the stages dial each other. `--return reverse` sends results back along
-the chain so only the first stage learns the client's address, at the cost of one extra
-link crossing per stage. To hide the client's address from every stage, run a relay and
-name it:
-
-```powershell
-dfin --network direct relay  --listen 0.0.0.0:7000 --identity relay.key
-dfin --network direct client ... --relay 203.0.113.5:7000/<relay id>
-```
-
-The relay pipes streams between the client and the first stage and between the last stage
-and the client; it sees addresses and ciphertext, never a route record or an activation
-in a form it can use. `dfin --network direct pod --relay` and `dfin --network direct bench --relay` start one locally.
-
-### Finding stages through a hub
-
-Instead of naming every stage, run a hub and let stages announce themselves:
-
-```powershell
-dfin --network direct hub    --listen 0.0.0.0:7100 --identity hub.key --http 127.0.0.1:7180
-dfin --network direct stage  ... --hub 203.0.113.9:7100/<hub id> --advertise 198.51.100.4:7001
-dfin --network direct client --model model.gguf --head 0:3 --tail 77:end --hub 203.0.113.9:7100/<hub id> --listen 127.0.0.1:8080
-```
-
-A stage signs a record of what it serves and announces it every minute; the hub checks
-the signature, dials the stage to confirm it answers, and publishes a signed list
-(`GET /directory` on the HTTP port shows it as JSON). The client verifies both signatures,
-picks the chain with the fewest hops between its head and tail, keeps a copy of the list
-in `--directory-cache` for when the hub is down, and when a stage dies it fetches the
-list again and moves to another chain. The hub never chooses routes for anyone.
-
-### Shards: fetching only your layers
-
-A 365 GB model should not have to be downloaded whole by a node that serves a tenth of
-it. `tools/shard_gguf.py` cuts a GGUF into split files, one per layer plus one each for
-the metadata, the embedding and the output head, and writes a manifest with every
-shard's size and SHA-256. The model id is a hash over those hashes, so a node holding
-three shards and a client holding the whole set agree on what model it is.
-
-```powershell
-.venv\Scripts\python.exe tools\shard_gguf.py model.gguf --out shards\ --seed https://example.org/shards
-dfin --network direct stage  --model shards\model.manifest.json --layers 40:77 --fetch --hub ... --identity node.key
-dfin --network direct fetch  --manifest shards\model.manifest.json --layers 0:3 --hub ...
-```
-
-A stage given a manifest and `--fetch` downloads the shards its layers need before
-loading: from nodes in the hub's directory that serve the same model (they serve any
-shard they hold over the same QUIC transport), or from the HTTP seeds named in the
-manifest or with `--seed`. Every download is checked against the manifest before it is
-used, and the loader skips shards that are not on disk, so a node's directory holds its
-own layers and nothing else. The client takes a manifest too (its head and tail need
-the embedding and output shards).
-
-### Running a stage without opening a port
-
-An operator who does not want to expose an address runs the stage cloaked:
-
-```powershell
-dfin --network direct relay  --listen 203.0.113.5:7000 --identity relay.key --port-range 7200-7299
-dfin --network direct stage  --model model.gguf --layers 40:77 --identity node.key --cloak 203.0.113.5:7000/<relay id> --hub ... --mlock
-```
-
-The stage dials the relay, the relay allocates a public port for it and forwards that
-port's traffic through the stage's own outbound connection, and the directory lists the
-relay's address for the stage. Dialers still get a QUIC connection pinned to the stage's
-key, end to end; the relay sees ciphertext. The relay also replaces every dialer's address
-with a synthetic one before the stage sees it, so a cloaked stage learns nobody's IP, and
-nobody but the relay learns the stage's. Such a stage cannot be placed by timing, and the
-directory says so (`cloaked: true`).
-
-### Fencing a route to a region
-
-Where a node's network interface is can be bounded by timing from several places. Run
-probes in the places you care about, tell the hub about them, and let clients choose:
-
-```powershell
-dfin --network direct probe  --listen 0.0.0.0:7300 --identity probe-east.key --region us --allow <hub id>
-dfin --network direct probe  --listen 0.0.0.0:7300 --identity probe-west.key --region us --allow <hub id>
-dfin --network direct hub    ... --probe 198.51.100.7:7300/<probe-east id> --probe 203.0.113.40:7300/<probe-west id>
-dfin --network direct client ... --hub ... --region us:50
-```
-
-Each probe pings every announcing node on the hub's request and reports the best round
-trip under its own label; the directory publishes all of them. A client fenced to
-`us:50` uses only nodes that every probe labelled `us` reaches within 50 ms, which with
-one probe on each coast puts the node in North America and nowhere else. Cloaked nodes
-are never inside a fence, since only their relay can be timed. `GET /status` says which
-hops passed the fence and how many usable nodes it excluded. A fence bounds where the
-node's network interface is, not where it runs the computation; attestation in phase 2
-is what closes that.
-
-On a node that only serves a stage, the model file must be byte-identical to the
-client's (the handshake checks a fingerprint); each stage maps only its own layers, so a
-node needs memory for its range, not for the whole model. Pick the range by the node's
-memory: roughly `(RAM in GB - 4) / (model GB / layers)` layers. On Apple Silicon use
-`--n-gpu-layers -1` (Metal, unified memory) and no `--cpu-tensors`; on a PC with a small
-GPU and a big MoE model use `--n-gpu-layers -1 --cpu-tensors exps`.
-
-Recommended stage flags on a node that serves one piece: `--mlock` (lock the mapped
-weights at load; the first request is then as fast as later ones, at the cost of a longer
-start) and the default thread count. `--no-mmap` reads the weights into private memory and
-is only safe when the machine has memory to spare beyond the piece.
-
-Then point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. `GET /status`
-shows the route with each stage's node id, the chain's round-trip and setup times and
-return mode, per-stage compute times, and prefix-cache hits.
-
-```powershell
-dfin --network direct bench --model models\tiny-llama-f32.gguf --split 3,6 --gen-tokens 64
-```
-
-prints monolithic versus in-process split versus local-pod-over-TCP decode speed.
-
-## Verification on one machine (5 November 2026)
-
-`scripts/phase0-verify.sh` runs the whole workspace test suite, builds the release binary
-and benchmarks every tiny model three ways: monolithic, split in-process (head, middle,
-tail as separate pieces in one process) and as a local pod over TCP driven through the
-OpenAI API. Log: `docs/logs/phase0-verify-2026-11-05.log`. Ryzen 5 7600X3D, CPU only, f16
-activations, 32 prompt tokens, 64 generated, release build:
-
-| Tiny model (8 layers, n_embd 64) | Split | Monolithic ms/token | In-process split | Local pod over TCP | Output |
-|---|---|---|---|---|---|
-| `llama` | 3,6 | 0.18 | 0.23 | 0.41 (stage RTT 0.41, of which compute 0.34) | identical |
-| `glm-dsa` | 2,6 | 0.33 | 0.54 | 0.70 (stage RTT 0.89, compute 0.82) | identical |
-| `kimi-k3` | 2,5 | 0.44 | 0.51 | 0.92 (stage RTT 1.02, compute 0.95) | identical |
-
-What this does and does not show: the mechanism is exact end to end for all three
-architectures, and the protocol costs about 0.1 to 0.25 ms per hop on localhost (framing,
-TCP, f16 conversion). It says nothing about real speeds: a 365 GB model on a LAN pod is
-dominated by memory bandwidth and network RTT, which only real hardware can measure.
-
-### Two machines over WiFi
-
-`scripts/lan-pod.sh <model.gguf> <remote host:port> <N> <LAST>` runs the head, a local stage
-and the tail here against a stage already running on another machine for layers `1:N`.
-Results for GLM-4.7-Flash with a MacBook Air (M4, 16 GB, Metal) serving layers 1:21 and this
-PC serving 21:46: 16.2 to 16.8 tok/s decode against 19.8 on one machine, identical text,
-prefill of 281 tokens in 1.6 s with the local stage locked in RAM. The gap is the WiFi round
-trip (23 ms per token on a link with a 3 ms ping floor); the protocol itself costs 0.4 ms per
-hop on loopback. Details in `docs/phase0-findings.md`, log in
-`docs/logs/lan-pod-glm47flash-2026-11-06.log`.
-
-### Real model on one machine
-
-`scripts/real-model-bench.sh <model.gguf> <split>` runs the same three modes on a real GGUF,
-plus a stock llama.cpp baseline and a live pod with chat requests;
-`scripts/real-model-contention.sh` checks how much co-locating several pieces on one CPU costs.
-Results for GLM-4.7-Flash (30B-A3B, Q4_K_M, 18.5 GB, experts in RAM and attention on the
-GPU) are in `docs/phase0-findings.md` and `docs/logs/real-model-glm47flash-2026-11-05.log`.
-Model files live under `models/` and are not part of the repository.
-
-## Status
-
-[STATUS.md](STATUS.md) is the single list of what is done, what is open, and what each
-open item needs, with the test or log that backs each finished piece. The short version:
-Phase 0 (one LAN pod) is complete; Phase 1 (the encrypted chain) is complete except
-failover of a live session; Phases 2 (trust and money) and 3 (scale) have not started.
-Until the integrity checks of phase 2 exist, only run stages for clients you know, and
-only list stages on a hub you run.
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request, on
+Linux: it builds the patched llama.cpp, audits dependencies, generates the tiny models,
+runs the whole test suite, then the two ignored tests (relay expiry and the private Tor
+network), and fuzzes every decoder for a short time on nightly.
 
 ## License
 
-Apache-2.0 for this repository. llama.cpp is MIT.
+Apache-2.0 for this repository; see [LICENSE](LICENSE). llama.cpp is MIT.

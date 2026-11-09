@@ -1,96 +1,126 @@
 # Status
 
-dfin runs one open-weight model across several machines, each holding a contiguous
-range of layers, with the first and last layers on the user's own machine. The point is
-a network of strangers' hardware that keeps serving frontier open models if hosted
-endpoints for them disappear, with the user unidentifiable by the nodes and the nodes
-unable to tamper undetected. The design is `docs/design-v0.2.md`; this page is the one
-place that says what of it exists, what does not, and what each missing piece needs.
+What of [docs/SPEC.md](docs/SPEC.md) exists today, what does not, and the test or log
+behind each claim. The order in which the missing parts get built is
+[docs/PLAN.md](docs/PLAN.md). Last updated 9 November 2026.
 
-Last updated 7 November 2026. Phase 0 (one LAN pod) is complete. Phase 1 (the
-encrypted chain) is complete except for failover of a live session. Phases 2 (trust and
-money) and 3 (scale) have not started.
+Test suite at this revision, on macOS (Apple Silicon): **124 passed, 0 failed, 2 ignored**
+with all tiny models generated and nothing skipped. The two ignored tests were run
+separately and pass: the two-minute relay expiry, and full inference through a private
+nine-node Tor network (`scripts/test-tor-local.py`, Tor 0.4.9.16). CI on Linux has not
+yet run this revision. Wire protocol version 3.
 
-Strict Tor anonymity is now the default: onion-only destinations, pinned TLS identities,
-separate discovery/request keys, and no direct fallback. The initial milestone passed
-73 regular tests, wire-decoder fuzzing, and real Tor integration on Windows and Linux
-using a private nine-node Tor network. An ongoing adversarial review has since added
-cancellation, identity, HTTP admission, and relay lifetime regressions; see the
-[review and current test results](docs/privacy-review.md). This does not yet
-provide content confidentiality, verified computation, or anonymous payment credits.
-See [setup and limits](docs/anonymity.md) and [the work log](docs/anonymity-work-log.md).
-The optional application relay can read model states; ordinary Tor routes do not
-require that additional observer. Relay content confidentiality remains unimplemented.
+## In short
 
-## Done
+The chain works: a model split into layer ranges, run by separate processes that reach
+each other as Tor onion services, with output identical to the unsplit model. That has
+been tested on one machine, in CI, and through a private Tor network. It has **not**
+been run across separate machines on the public Tor network, and it has not been run at
+frontier size.
+
+Most of what makes dfin safe to use with strangers is not built: nothing detects a node
+tampering with its slice, nothing stops one node from holding nearly the whole model,
+there is no money, and there is one hub. **Until PLAN milestone 3 is done, only run
+stages for clients you know, and only list stages on a hub you run.**
+
+## What a user is protected from today
+
+| Property (SPEC) | Today |
+|---|---|
+| Nodes cannot learn who is asking (8) | Built. Tor only, no fallback, fresh key and route per request. Tested on a private Tor network, not measured on the public one |
+| Requests cannot be joined to each other (8.1) | Built for the default. The opt-in conversation session does not exist yet, so every turn prefills its whole conversation |
+| No node sees text or logits (6.2) | Built: the client keeps the embedding, first layers, last layer and output head |
+| No node holds a whole model (7.1) | **Not enforced.** A client can be pointed at a single stage holding every layer but the client's own |
+| Tampering is detected (7.2) | **Not built.** No sanity checks on activations, no redundant execution, no reputation |
+| Content is confidential from a node (6) | **No**, and on consumer nodes it will not be: a node can with effort reconstruct its input. The optional attested tier is not built |
+| A relay cannot read what it carries (8.2) | **No.** The optional application relay can read model states; `/status` says so |
+| Payments cannot be joined to usage (10) | No money exists |
+| No single point of failure (12) | One hub. Clients keep routing from a cached directory while it is down |
+
+## Built
 
 | What | Where | How it was checked |
 |---|---|---|
-| **Phase 0: one LAN pod** | | |
-| Layer-range patch on mainline llama.cpp: a process loads and runs only its layers and takes or emits the hidden state at the boundary | `vendor/patches/`, `vendor/README.md` | Exact against the whole model on tiny `llama`, `glm-dsa`, `kimi-k3` and `glm5-next` models, CPU and Vulkan (`crates/dfin-llama/tests`) |
+| Layer-range patch on mainline llama.cpp: a process loads and runs only its layers and takes or emits the hidden state at the boundary | `vendor/patches/`, `vendor/README.md` | Exact against the whole model in the test suite for tiny `llama`, `kimi-k3` and `glm5-next` models (`crates/dfin-llama/tests`); `glm-dsa` by benchmark script only (`docs/logs/phase0-verify-2026-11-05.log`) |
 | Rust bindings and a safe wrapper (model, context, tokenizer, chat templates) | `crates/dfin-llama-sys`, `crates/dfin-llama` | Same tests |
-| Stage runtime, client daemon with an OpenAI-compatible API (streaming, prefix cache, sampler), pod launcher, benchmark | `crates/dfin` | End-to-end tests over the tiny model in every mode (`crates/dfin/tests/e2e.rs`); `scripts/phase0-verify.sh` |
-| A real model on one machine: GLM-4.7-Flash in four pieces, identical output to the whole model, almost no speed loss in-process | `docs/phase0-findings.md`, `docs/logs/real-model-*.log` | `scripts/real-model-bench.sh`, `scripts/real-model-contention.sh` |
-| Two machines over WiFi: identical output; the gap to one machine is the WiFi round trip | `docs/phase0-findings.md`, `docs/logs/lan-pod-*.log` | `scripts/lan-pod.sh` with a MacBook Air as the second machine |
-| **Phase 1: the encrypted chain** | | |
-| Tor by default: onion-only discovery and inference, authenticated TLS streams, new request identities, no direct fallback, local API protections | `docs/anonymity.md`, `crates/dfin-net/src/stream.rs`, `crates/dfin/src/network.rs` | Privacy regression tests and full tiny-model inference through real Tor on Windows and Linux; `scripts/test-tor-local.py` |
-| Node identities (Ed25519), QUIC with certificates pinned to node keys, sealed per-hop route records, chain forwarding stage to stage, three return modes, `dfin relay` | `crates/dfin-net`, `crates/dfin-proto`, protocol sections 1 to 6 | End-to-end tests in every return mode; GLM-4.7-Flash through the chain with identical text and under a millisecond of chain overhead per token (`docs/phase1-findings.md`) |
-| Linux build, a CPU-only container image, continuous integration | `Dockerfile`, `.github/workflows/ci.yml` | Every push builds and runs the whole suite on Linux |
-| Signed directory: `dfin hub`, node announcements with reachability checks, client-side route choice, a cache for hub outages, rerouting when a stage dies | protocol section 8 | End-to-end test that kills a stage and watches the client move |
-| Cloaked nodes: no inbound port, reachable through a relay-allocated port over the node's own tunnel, end-to-end QUIC, the node never sees a dialer's address | protocol section 9 | End-to-end test through a relay |
-| Weight shards: per-layer split files with a hashed manifest, a loader that tolerates absent shards, nodes serving the shards they hold, fetching from directory peers or HTTP seeds | protocol section 10, `tools/shard_gguf.py` | End-to-end test of a stage fetching from a peer; GLM-4.7-Flash from shards matches the single file (f32) |
+| Stage runtime, client daemon with an OpenAI-compatible API (streaming, sampler), pod launcher, benchmark | `crates/dfin` | End-to-end tests over the tiny model in every return mode (`crates/dfin/tests/e2e.rs`) |
+| Tor transport: onion-only destinations through an external Tor daemon, TLS 1.3 with pinned node keys, yamux streams, fresh SOCKS isolation per connection, no direct fallback | `crates/dfin-net/src/stream.rs`, `crates/dfin/src/network.rs`, `docs/anonymity.md` | Transport and privacy regression tests against a local SOCKS fixture; full tiny-model inference through a private nine-node Tor network on Windows, Linux and macOS (`scripts/test-tor-local.py`, run in CI) |
+| Request isolation: new client key, route, session and route ids per request; separate keys for directory lookups; routes and caches cleared on success, error and cancellation | `crates/dfin/src/client`, `crates/dfin/src/stage` | `crates/dfin/tests/anonymity.rs`, `crates/dfin/src/stage/privacy_tests.rs`; adversarial review P01 to P16 (`docs/archive/privacy-review.md`) |
+| Node identities (Ed25519), sealed per-hop route records, chain forwarding stage to stage, three return modes, `dfin relay` | `crates/dfin-net`, `crates/dfin-proto`, protocol sections 1 to 6 | End-to-end tests in every return mode; relay lifetime tests (`crates/dfin/tests/relay_privacy.rs`) |
+| Signed directory: `dfin hub`, node announcements with reachability checks, client-side route choice, a cache for hub outages, rerouting between requests when a stage dies | protocol section 8 | End-to-end test that kills a stage and watches the client move |
+| Weight shards: per-layer split files with a hashed manifest, a loader that tolerates absent shards, nodes serving the shards they hold to directory peers | protocol section 10, `tools/shard_gguf.py` | End-to-end test of a stage fetching from a peer; shard path and download hardening tests (`crates/dfin/src/fetch/privacy_tests.rs`) |
 | Stage state wider than one residual vector, for `glm5-next` hyper-connections and Kimi K3 attention-residual banks | protocol section 11 | Three-piece pipelines of tiny models match the whole model (`crates/dfin-llama/tests/wide_state.rs`) |
-| Region fencing: `dfin probe` vantage points, per-probe round trips in the directory, a client fence that excludes cloaked nodes | protocol section 12 | End-to-end test with two probes, one of them far |
-| Fuzzed decoders: a libFuzzer target per wire type, the same targets as ordinary tests, generated-value tests for route choice and the hub's checks, a fuzz run in CI | protocol section 13, `crates/dfin-fuzz`, `fuzz/` | CI's first runs found two shape-arithmetic overflows and a tag ambiguity in the first second of fuzzing; all three fixed with regression tests (`docs/phase1-findings.md` section 10) |
-| Hardening: frame size limits by message type, read and idle timeouts, route and stream caps per connection | protocol section 2 | Protocol tests (`crates/dfin/tests/stage_proto.rs`) |
+| Hardening: frame size limits by message type, incremental frame reads, read and idle timeouts, route and stream caps, local API origin and host checks | protocol section 2 | Protocol tests (`crates/dfin/tests/stage_proto.rs`), hub and stage privacy tests |
+| Fuzzed decoders: one target per wire type, the same targets as ordinary tests, a libFuzzer run in CI | protocol section 13, `crates/dfin-fuzz`, `fuzz/` | CI's first runs found two shape-arithmetic overflows and a tag ambiguity; all fixed with regression tests |
+| Development mode: QUIC between named addresses for local pods, benchmarks and tests | `crates/dfin-net/src/quic.rs`, `dfin pod`, `dfin bench` | The end-to-end suite runs on it |
+| Linux build, a CPU-only container image, continuous integration | `Dockerfile`, `.github/workflows/ci.yml` | Every pull request builds, audits dependencies, runs the suite, the two slow tests and a short fuzz |
 
-## Open
+### Measured
 
-| What | Why it matters | What it needs |
+All on a LAN in development mode, before Tor was the transport. Nothing has been
+measured over Tor.
+
+| Measurement | Result | Log |
 |---|---|---|
-| **Phase 1, remaining** | | |
-| Failover of a live session: when a stage dies mid-generation the user sees a pause, not a lost conversation | The chain already reroutes between requests; a session in flight still dies with its stage | A per-session replay log on each stage (its emitted hidden states), the client rebuilding the route and replaying into the replacement, an end-to-end test that kills a stage mid-generation. Design v0.1 section 7 |
-| Two machines on the new transport | The two-machine result above was measured on the Phase 0 TCP binary; the MacBook still runs it | Someone to run `docs/mac-node-prompt.md` on the Mac, then `scripts/lan-pod.sh` |
-| Reproducible builds | Phase 1's exit criterion says a third party reproduces the build; nothing has been done towards it | A pinned toolchain, a build in a container, a published hash, and a second machine that gets the same bytes |
-| Phase 1's exit test | "Three pods in three cities serve one model through relays" has not been run | Three machines in three places, which means rented ones |
-| **Phase 2: trust and money** (not started) | | |
-| Attested stages: a stage image whose measurement the client verifies before trusting it with activations | The only strong statement the network can make about what a node runs; agents are meant to default to attested routes | Server hardware with an enclave (AMD SEV-SNP or Intel TDX), an image build, the verification path in the client, and a disclosure of what attestation does not cover (physical attacks). Design v0.2 sections 4 to 6 |
-| Integrity for open nodes: shadow admission, sampled redundancy, signed logs, bonds | Without it a node can return steered activations and only norm checks catch it | A second execution of sampled tokens on another node, a signed log format, and a delisting rule. Design v0.2 section 7 |
-| Money: a full-reserve mint, XMR in (USD while a processor allows), per-token payment, daily payouts to operators, reserve proofs | The incentive for strangers to run nodes | A design pass on the mint and wallet, Cashu-style blind credits, and legal review before the mint opens. Design v0.2 section 10 |
-| Trust tiers in the API | Users choose pod, attested, ends-only or open routes per request | The tier field, the router honouring it, and the status reporting it |
-| **Phase 3: scale** (not started) | | |
-| The scale gate: GLM-5.3 at 3 tokens per second or better across 4 to 8 machines on an attested route | The go or no-go for the whole idea at frontier size | Rented machines, sharded loading of a 365 GB model, and the measurements |
-| Speculative decoding: MTP head in the client tail, a client-side draft model | Turns a network-bound decode into a usable one | The MTP graph in the patched llama.cpp and the verify path in the client |
-| Kimi K3 via anchor pods; hub and mint federation; a measured Tor mode; an agent (OpenCode) completing a real task | The rest of the phase 3 list | Each is its own piece of work once the gate passes |
-| **Smaller items, any phase** | | |
-| Tool-call parsing in the OpenAI layer | Requests with `tools` are accepted, calls are not parsed | A parser per chat template |
-| Micro-batching across sessions on a stage | A stage serving several sessions reads its weights once per step instead of once per session; this is the economic engine of the design | A batching scheduler in the stage engine |
-| More than one hub and directory mirroring | One hub is still one point of failure and one observer of directory queries; fetching over Tor now exists | Hub peering, independent directory sources, and a client selection policy |
-| Probes signing their answers, clients querying probes directly, reputation | The client trusts the hub for everything in the directory today | A signature on each probe answer and a client path to ask probes |
+| GLM-4.7-Flash (30B-A3B, Q4_K_M, 18.5 GB) in four pieces on one machine | Identical text to the unsplit model; 20.6 tok/s against 19.8 | `docs/logs/real-model-glm47flash-2026-11-05.log` |
+| The same model across two machines over home WiFi | Identical text; 16.2 to 16.8 tok/s. Measured on the first TCP build, not the current transport | `docs/logs/lan-pod-glm47flash-2026-11-06.log` |
+| The same model through the chain on one machine | Identical text at f32; under a millisecond of chain overhead per token | `docs/logs/phase1-chain-glm47flash-2026-11-06.log` |
+| The same model served from a partial shard directory | Matches the single file at f32 | `docs/logs/phase1-shards-f32-glm47flash-2026-11-06.log` |
 
-## Known limitations
+Details and the reasoning behind them are in `docs/archive/phase0-findings.md` and
+`docs/archive/phase1-findings.md`.
 
-- Half-precision activations between stages flip near-tie tokens on GLM-4.7-Flash; full precision reproduces llama.cpp's single-file output exactly (`docs/phase1-findings.md` section 7). The scripts use f16 for speed; use `--act-dtype f32` when exactness matters.
-- The client trusts the hub it pinned for the whole directory, including probe results. A region fence bounds where a node's network interface is, not where its computation runs.
-- Until the integrity checks of phase 2 exist, only run stages for clients you know, and only list stages on a hub you run.
-- Cold start is a load-time problem: a stage should start with `--mlock`, or the first request pays for paging the weights in.
-- The libFuzzer targets need nightly Rust; on a machine without it the same targets run as ordinary tests, and CI runs the real fuzzer.
-- The end-to-end tests spawn processes and load models; on a loaded machine one can time out. Rerun that test binary alone before calling it a failure.
+## Not built
+
+Each line is a milestone of [docs/PLAN.md](docs/PLAN.md), where the tasks are.
+
+| Milestone | Missing |
+|---|---|
+| 1. Finish the chain | The inference-core decision; the compartmentalisation cap; opt-in conversation sessions; failover of a live session; encryption across the application relay; locked weights by default; tool-call parsing (`tools` is accepted and ignored); macOS CI, clippy and fmt gates |
+| 2. Public Tor network | No run across separate machines over public Tor; no operator runbook tested from a clean machine |
+| 3. Tamper detection | Everything: activation sanity checks, redundant execution, shadow admission, reputation, signed logs, trust tiers and pods in the API (a tier suffix on a model name is rejected today) |
+| 4. Money | Everything: mint, credits, wallet, per-token payment, payouts, bonds |
+| 5. No centre | Several hubs and mirroring, onion seed lists, operator-independence evidence, mint federation, reproducible builds and signed releases, embedded Tor, chaff |
+| 6. Frontier scale | GLM-5.3 has never been loaded; the 3 tok/s measurement has not been run; micro-batching, speculative decoding, Kimi K3 boundary rules, FP8 activations, gateway |
+| 7. Attested tier (optional add-on) | Everything. The `attested` flag in directory records is always false and Tor-mode hubs and clients reject records that claim it |
+
+## Known problems and limits
+
+- **One test fails intermittently and the cause is unknown.**
+  `stage::privacy_tests::repeated_disconnects_release_client_identities_and_engine_handles`
+  failed once in CI on Linux (run 42404522275, commit `0e730be`, peer-aborted handshake)
+  and once on macOS on 9 November 2026 during a full-suite run ("handshake timed out"
+  on a development-mode QUIC connect). It then passed 12 times out of 12 run alone, and
+  in two further full-suite runs. PLAN task 1.8.
+- **The helper scripts were ported but not all rerun.** `scripts/phase0-verify.sh` was
+  run on macOS. `lan-pod.sh`, `real-model-bench.sh`, `real-model-contention.sh` and
+  `phase1-shards-check.sh` were made portable (shared helpers in `scripts/common.sh`)
+  and syntax-checked only; their Linux and Windows branches have not been run, and
+  `lan-pod.sh` gained an unverified `LOCAL_STAGE` setting.
+- Hub and relay connections do not check the protocol version; only a stage `Hello` and
+  a directory record do.
+- **Tests skip silently without their models.** A green run only means something if all
+  four tiny model sets were generated first (README, "Test models and tests").
+- Half-precision activations between stages flip near-tie tokens on GLM-4.7-Flash; full
+  precision reproduces llama.cpp's single-file output exactly. Use `--act-dtype f32`
+  when exactness matters.
+- The client trusts the one hub it pinned for the whole directory.
+- Cold start: a stage should be started with `--mlock`, or the first request pays for
+  paging the weights in. PLAN task 1.6 makes that the default.
+- The libFuzzer targets need nightly Rust; without it the same targets run as ordinary
+  tests, and CI runs the real fuzzer.
+- The end-to-end tests spawn processes and load models; on a loaded machine one can time
+  out. Rerun that test binary alone before calling it a failure.
+- CI covers Linux only. macOS and Windows are built and tested by hand.
 
 ## How to check it yourself
 
 ```bash
-cargo test                                   # unit, protocol, fuzz-smoke and end-to-end tests (needs the tiny models, see README)
-cargo test -p dfin --test e2e                # the process-spawning tests alone
-cargo test -p dfin-fuzz -- --nocapture       # the fuzz targets over seeds, mutations and noise, with counts
+cargo test --release --workspace --locked    # unit, protocol, privacy, fuzz-smoke and end-to-end tests
+cargo test --release -p dfin --test e2e      # the process-spawning tests alone
+cargo test --release -p dfin-fuzz -- --nocapture   # the fuzz targets over seeds, mutations and noise
 cargo +nightly fuzz run request              # a real fuzz run (nightly; see fuzz/Cargo.toml)
-scripts/phase0-verify.sh                     # the Phase 0 benchmark of the tiny models three ways
+python scripts/test-tor-local.py --tor <tor> --tor-gencert <tor-gencert>   # inference through a private Tor network
+scripts/phase0-verify.sh                     # benchmark the tiny models three ways (development mode)
 scripts/real-model-bench.sh <gguf> <split>   # a real model: whole, split in-process, and as a local pod
-scripts/phase1-chain-bench.sh                # a real model through the encrypted chain on one machine
-scripts/phase1-shards-check.sh               # a real model served from a partial shard directory
-scripts/lan-pod.sh <gguf> <host:port> <N>    # two machines, a stage already running on the other one
 ```
-
-## Where things are written down
-
-`docs/README.md` lists every document and what it is for.

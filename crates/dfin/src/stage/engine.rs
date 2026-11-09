@@ -108,6 +108,13 @@ impl Engine {
                     act,
                     reply,
                 } => {
+                    // The request handler may have been cancelled while this job
+                    // waited behind other native work. Do not allocate a session
+                    // or run inference for a caller that has already gone away.
+                    // Close/CloseConn jobs still run so existing state is freed.
+                    if reply.is_closed() {
+                        continue;
+                    }
                     let r = self.forward(conn, session, seq, pos0, &act);
                     let _ = reply.send(r);
                 }
@@ -178,7 +185,10 @@ impl Engine {
         if act.n_embd as usize != n_in {
             return err(
                 ErrorCode::BadRequest,
-                format!("activation width {} != this stage's input width {n_in}", act.n_embd),
+                format!(
+                    "activation width {} != this stage's input width {n_in}",
+                    act.n_embd
+                ),
             );
         }
         if n_tokens == 0 {
@@ -280,5 +290,122 @@ impl Engine {
             "forward"
         );
         Reply::Forward { act, compute_ms }
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+    use dfin_llama::{ContextParams, Model, ModelParams};
+    use std::{path::PathBuf, sync::Arc};
+
+    fn fixture() -> Option<(Engine, Activations)> {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-llama-f32.gguf");
+        if !dfin_llama::has_layer_range() || !path.is_file() {
+            eprintln!("SKIP: stage engine privacy test requires the patched tiny model fixture");
+            return None;
+        }
+        let model = Arc::new(
+            Model::load(
+                &path,
+                &ModelParams {
+                    n_gpu_layers: 0,
+                    ..ModelParams::range(2, 4)
+                },
+            )
+            .unwrap(),
+        );
+        let ctx = Context::new(
+            model,
+            &ContextParams {
+                n_ctx: 128,
+                n_batch: 32,
+                n_ubatch: 32,
+                n_seq_max: 1,
+                n_threads: 1,
+                n_threads_batch: 1,
+                embeddings: true,
+                ..ContextParams::default()
+            },
+        )
+        .unwrap();
+        let act = Activations::from_f32(
+            &vec![0.25; ctx.n_embd_inp()],
+            1,
+            ctx.n_embd_inp(),
+            ActDtype::F32,
+        );
+        let engine = Engine::new(ctx, ActDtype::F32, 32);
+        Some((engine, act))
+    }
+
+    #[test]
+    fn cancelled_queued_forward_does_not_allocate_a_model_session() {
+        let Some((engine, act)) = fixture() else {
+            return;
+        };
+        let (jobs, queue) = mpsc::channel(4);
+        let (cancelled, receiver) = oneshot::channel();
+        drop(receiver);
+        jobs.blocking_send(Job::Forward {
+            conn: 1,
+            session: 1,
+            seq: 0,
+            pos0: 0,
+            act: act.clone(),
+            reply: cancelled,
+        })
+        .unwrap();
+        let (reply, result) = oneshot::channel();
+        jobs.blocking_send(Job::Forward {
+            conn: 2,
+            session: 1,
+            seq: 0,
+            pos0: 0,
+            act,
+            reply,
+        })
+        .unwrap();
+        // Disconnect cleanup can be queued after another client's request.
+        jobs.blocking_send(Job::CloseConn { conn: 1 }).unwrap();
+        drop(jobs);
+        engine.run(queue);
+        let response = result.blocking_recv().unwrap();
+        assert!(matches!(response, Reply::Forward { .. }), "{response:?}");
+    }
+
+    #[test]
+    fn cleanup_still_frees_state_when_its_reply_receiver_is_gone() {
+        let Some((mut engine, act)) = fixture() else {
+            return;
+        };
+        assert!(matches!(
+            engine.forward(1, 1, 0, 0, &act),
+            Reply::Forward { .. }
+        ));
+        let (jobs, queue) = mpsc::channel(2);
+        let (reply, receiver) = oneshot::channel();
+        drop(receiver);
+        jobs.blocking_send(Job::Close {
+            conn: 1,
+            session: 1,
+            reply,
+        })
+        .unwrap();
+        let (reply, result) = oneshot::channel();
+        jobs.blocking_send(Job::Forward {
+            conn: 2,
+            session: 1,
+            seq: 0,
+            pos0: 0,
+            act,
+            reply,
+        })
+        .unwrap();
+        drop(jobs);
+        engine.run(queue);
+        let response = result.blocking_recv().unwrap();
+        assert!(matches!(response, Reply::Forward { .. }), "{response:?}");
     }
 }

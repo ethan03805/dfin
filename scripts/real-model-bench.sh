@@ -27,17 +27,17 @@ echo "### 2. stock llama.cpp baseline (llama-bench, -ngl 99, experts on CPU)"
 "$LB/llama-bench.exe" -m "$MODEL" -ngl 99 -ot "exps=CPU" -p "$PROMPT" -n "$GEN" -r 2 2>&1 | grep -E "^\||model|error" | tail -6
 
 echo "### 3. dfin bench, GPU + experts in RAM, f16 wire"
-"$B" bench --model "$MODEL" --split "$SPLIT" --gen-tokens "$GEN" --prompt-tokens "$PROMPT" --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --log warn 2>&1 | filter | tail -9
+"$B" --network direct bench --model "$MODEL" --split "$SPLIT" --gen-tokens "$GEN" --prompt-tokens "$PROMPT" --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --log warn 2>&1 | filter | tail -9
 
 echo "### 4. dfin bench, GPU + experts in RAM, f32 wire"
-"$B" bench --model "$MODEL" --split "$SPLIT" --gen-tokens "$GEN" --prompt-tokens "$PROMPT" --n-gpu-layers -1 --cpu-tensors exps --act-dtype f32 --log warn 2>&1 | filter | tail -9
+"$B" --network direct bench --model "$MODEL" --split "$SPLIT" --gen-tokens "$GEN" --prompt-tokens "$PROMPT" --n-gpu-layers -1 --cpu-tensors exps --act-dtype f32 --log warn 2>&1 | filter | tail -9
 
 echo "### 5. dfin bench, CPU only, f16 wire"
-"$B" bench --model "$MODEL" --split "$SPLIT" --gen-tokens 32 --prompt-tokens 128 --n-gpu-layers 0 --act-dtype f16 --log warn 2>&1 | filter | tail -9
+"$B" --network direct bench --model "$MODEL" --split "$SPLIT" --gen-tokens 32 --prompt-tokens 128 --n-gpu-layers 0 --act-dtype f16 --log warn 2>&1 | filter | tail -9
 
 echo "### 6. live pod: memory per piece and one chat request"
 PORT=8123
-"$B" pod --model "$MODEL" --split "$SPLIT" --listen 127.0.0.1:$PORT --base-port 7201 --n-ctx 8192 --n-seq-max 2 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --log info > pod.log 2>&1 &
+"$B" --network direct pod --model "$MODEL" --split "$SPLIT" --listen 127.0.0.1:$PORT --base-port 7201 --n-ctx 8192 --n-seq-max 2 --n-gpu-layers -1 --cpu-tensors exps --act-dtype f16 --log info > pod.log 2>&1 &
 PODPID=$!
 for i in $(seq 1 240); do
     if curl.exe -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then break; fi

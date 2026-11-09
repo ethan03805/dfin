@@ -8,9 +8,42 @@
 use anyhow::{bail, Context as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub const FORMAT: &str = "dfin-shards-v1";
+
+/// Manifest names are single portable GGUF filenames, never paths. Apply the
+/// Windows rules on every platform so a manifest cannot become unsafe when moved.
+pub fn shard_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    if name.is_empty()
+        || name.len() > 200
+        || !name.to_ascii_lowercase().ends_with(".gguf")
+        || name.ends_with([' ', '.'])
+        || name
+            .chars()
+            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+    {
+        bail!("shard must name a single portable GGUF file");
+    }
+    let base = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    let port = base
+        .strip_prefix("COM")
+        .or_else(|| base.strip_prefix("LPT"));
+    if matches!(
+        base.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) || port.is_some_and(|n| n.chars().count() == 1 && "0123456789¹²³".contains(n))
+    {
+        bail!("shard filename names a reserved device");
+    }
+    Ok(dir.join(name))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Split {
@@ -47,10 +80,38 @@ impl Manifest {
         let m: Manifest =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         if m.format != FORMAT {
-            bail!("{}: format {:?}, expected {FORMAT}", path.display(), m.format);
+            bail!(
+                "{}: format {:?}, expected {FORMAT}",
+                path.display(),
+                m.format
+            );
         }
         if m.splits.is_empty() {
             bail!("{}: no splits", path.display());
+        }
+        shard_path(Path::new("."), &m.first)?;
+        let mut numbers = HashSet::new();
+        let mut names = HashSet::new();
+        for split in &m.splits {
+            shard_path(Path::new("."), &split.file)?;
+            if !numbers.insert(split.no) || !names.insert(split.file.to_lowercase()) {
+                bail!("duplicate shard number or filename");
+            }
+            if split.sha256.len() != 64
+                || !split
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                bail!("shard hash must be 64 lowercase hexadecimal digits");
+            }
+        }
+        if !m
+            .splits
+            .iter()
+            .any(|split| split.no == 0 && split.file == m.first)
+        {
+            bail!("first must name split zero in the manifest");
         }
         let computed = m.compute_id();
         if !m.model_id.is_empty() && m.model_id != computed {
@@ -116,11 +177,13 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 
 /// Is `split` present in `dir` with the right size (cheap) and, if asked, the right hash?
 pub fn have_split(dir: &Path, split: &Split, verify_hash: bool) -> bool {
-    let p = dir.join(&split.file);
-    let Ok(md) = std::fs::metadata(&p) else {
+    let Ok(p) = shard_path(dir, &split.file) else {
         return false;
     };
-    if md.len() != split.size {
+    let Ok(md) = std::fs::symlink_metadata(&p) else {
+        return false;
+    };
+    if !md.file_type().is_file() || md.len() != split.size {
         return false;
     }
     if verify_hash {
@@ -150,7 +213,10 @@ pub fn resolve_model(path: &Path) -> anyhow::Result<ResolvedModel> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let manifest_path = if name.ends_with(".manifest.json") {
         Some(path.to_path_buf())
     } else {
@@ -224,6 +290,96 @@ mod tests {
             seeds: vec![],
             model_id: String::new(),
         }
+    }
+
+    #[test]
+    fn shard_filenames_cannot_escape_or_name_windows_devices() {
+        for name in [
+            "../outside.gguf",
+            "..\\outside.gguf",
+            "/outside.gguf",
+            "C:outside.gguf",
+            "C:\\outside.gguf",
+            "\\\\server\\share\\outside.gguf",
+            "nested/file.gguf",
+            "file.gguf:secret",
+            "file.gguf\0",
+            "file.gguf ",
+            "file.gguf.",
+            "NUL.gguf",
+            "con.GGUF",
+            "COM1.gguf",
+            "COM¹.gguf",
+            "LPT9.gguf",
+            "CON .gguf",
+            "CONOUT$.gguf",
+            "file.key",
+            "",
+            ".",
+            "..",
+        ] {
+            assert!(
+                shard_path(Path::new("model"), name).is_err(),
+                "accepted {name:?}"
+            );
+        }
+        for name in ["m-00001-of-00005.gguf", "模型.gguf", "model weights.GGUF"] {
+            assert_eq!(
+                shard_path(Path::new("model"), name).unwrap(),
+                Path::new("model").join(name)
+            );
+        }
+    }
+
+    #[test]
+    fn manifests_reject_ambiguous_files_and_unbound_first_shards() {
+        let path = std::env::temp_dir().join(format!(
+            "dfin-manifest-test-{:016x}.json",
+            rand::random::<u64>()
+        ));
+        let valid = manifest();
+        let mut variants = Vec::new();
+        let mut m = valid.clone();
+        m.first = "different.gguf".into();
+        variants.push(m);
+        let mut m = valid.clone();
+        m.splits[1].file = m.splits[0].file.to_uppercase();
+        variants.push(m);
+        let mut m = valid.clone();
+        m.splits[1].no = 0;
+        variants.push(m);
+        let mut m = valid.clone();
+        m.splits[1].sha256 = "0\n1:1".into();
+        variants.push(m);
+        for m in variants {
+            std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+            let result = Manifest::load(&path);
+            std::fs::remove_file(&path).unwrap();
+            assert!(result.is_err());
+        }
+        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+        let result = Manifest::load(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shard_presence_does_not_follow_a_symlink() {
+        let root =
+            std::env::temp_dir().join(format!("dfin-shard-link-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let secret = root.join("private");
+        std::fs::write(&secret, b"private").unwrap();
+        let mut split = manifest().splits.remove(0);
+        split.size = 7;
+        let link = root.join(&split.file);
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let present = have_split(&root, &split, false);
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(&secret).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        assert!(!present, "accepted a symbolic link as a model shard");
     }
 
     #[test]

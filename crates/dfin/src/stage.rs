@@ -1,5 +1,5 @@
 //! `dfin stage`: serve one contiguous middle layer range `[a, b)` of a GGUF as one hop
-//! of a route chain, over the authenticated QUIC transport.
+//! of a route chain, over authenticated Tor/TLS or explicit direct QUIC.
 //!
 //! Protocol: `docs/phase1-protocol.md`. The first stream on a connection must carry
 //! `Hello`. A `RouteSetup` opens this node's sealed record, dials the next hop if there
@@ -9,6 +9,8 @@
 //! every later hop, and are acknowledged once the whole chain has done them.
 
 mod engine;
+#[cfg(test)]
+mod privacy_tests;
 
 use crate::config::{parse_node_addr, LayerRange};
 use crate::shards::{resolve_model, Manifest};
@@ -18,23 +20,23 @@ use dfin_llama::{Context, ContextParams, FlashAttn, KvType, Model, ModelParams};
 use dfin_net::directory::sign_record;
 use dfin_net::transport::{reply, CONTROL_TIMEOUT, MAX_CONTROL_FRAME};
 use dfin_net::tunnel::{pump, tunnel_socket};
+use dfin_net::RecvStream;
 use dfin_net::{unseal, Connection, Endpoint, NetError, NodeId, NodeKey};
 use dfin_proto::{
-    forward_frame_limit, read_frame_max, write_frame, ActDtype, Activations, ErrorCode,
-    HopRecord, HopStat, NextHop, NodeRecord, Request, Response, ReturnFrame, ReturnMode,
+    forward_frame_limit, read_frame_body, read_frame_max, write_frame, ActDtype, Activations,
+    ErrorCode, HopRecord, HopStat, NextHop, NodeRecord, Request, Response, ReturnFrame, ReturnMode,
     PROTOCOL_VERSION,
 };
 use engine::{Engine, Job, Reply};
 use parking_lot::Mutex;
-use dfin_net::RecvStream;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Time allowed for a forward to travel the rest of the chain and come back.
@@ -82,11 +84,11 @@ pub struct StageArgs {
     /// embedding or the LM head (those run on the client).
     #[arg(long)]
     pub layers: LayerRange,
-    /// Address to listen on (UDP, QUIC). Defaults to `0.0.0.0:7001`, or to no public
-    /// listener at all when `--cloak` is given.
+    /// Local listener (TCP in Tor mode, UDP in direct mode). Defaults to
+    /// `127.0.0.1:7001`, or no listener with direct-mode `--cloak`.
     #[arg(long)]
     pub listen: Option<String>,
-    /// Be reachable only through this relay (`host:port/<node id>`): the stage dials
+    /// Direct mode only: be reachable through this relay (`host:port/<node id>`). The stage dials
     /// the relay, which allocates a public port and tunnels its traffic here. No port
     /// is opened on this machine and no dialer's address is ever seen. Repeatable.
     #[arg(long = "cloak", value_parser = parse_node_addr)]
@@ -200,7 +202,36 @@ pub fn log_devices() {
     }
 }
 
-pub async fn run(args: StageArgs) -> anyhow::Result<()> {
+pub async fn run(args: StageArgs, network: crate::network::Network) -> anyhow::Result<()> {
+    if let Some(listen) = &args.listen {
+        network.listener(listen)?;
+    }
+    for hub in &args.hubs {
+        network.target(&hub.addr)?;
+    }
+    if network.private() {
+        anyhow::ensure!(
+            args.cloaks.is_empty(),
+            "UDP relay cloaking is unavailable in Tor mode; publish an onion service instead"
+        );
+        anyhow::ensure!(
+            args.region.is_empty(),
+            "region claims are disabled in strict anonymity mode"
+        );
+        anyhow::ensure!(
+            args.seeds.is_empty(),
+            "HTTP seeds are disabled in strict anonymity mode"
+        );
+        if !args.hubs.is_empty() {
+            network.target(
+                args.advertise
+                    .as_deref()
+                    .context("Tor announcements require --advertise <v3-onion>:<port>")?,
+            )?;
+        } else if let Some(advertise) = &args.advertise {
+            network.target(advertise)?;
+        }
+    }
     dfin_llama::init();
     if args.layers.begin == 0 || args.layers.end == -1 {
         bail!(
@@ -230,7 +261,9 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         if args.hubs.is_empty() && args.seeds.is_empty() && manifest.seeds.is_empty() {
             bail!("--fetch needs a --hub or a --seed to fetch from");
         }
-        let ep = Endpoint::client(key.clone()).context("creating fetch endpoint")?;
+        let ep = network
+            .client(NodeKey::generate())
+            .context("creating fetch endpoint")?;
         let n = crate::fetch::fetch_missing(
             &ep,
             manifest,
@@ -327,7 +360,11 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         n_ctx_seq,
         n_seq_max,
         n_batch: args.n_batch,
-        backend: backend_summary(args.n_gpu_layers),
+        backend: if network.private() {
+            String::new()
+        } else {
+            backend_summary(args.n_gpu_layers)
+        },
         node_id: key.id(),
     });
 
@@ -336,20 +373,18 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
 
     let listen_text = match (&args.listen, args.cloaks.is_empty()) {
         (Some(l), _) => Some(l.clone()),
-        (None, true) => Some("0.0.0.0:7001".to_string()),
+        (None, true) => Some("127.0.0.1:7001".to_string()),
         (None, false) => None,
     };
     let (endpoint, listening) = match &listen_text {
         Some(l) => {
-            let listen: SocketAddr = tokio::net::lookup_host(l)
+            let ep = network
+                .server(key, l)
                 .await
-                .with_context(|| format!("resolving {l}"))?
-                .next()
-                .with_context(|| format!("{l} resolved to nothing"))?;
-            let ep = Endpoint::server(key, listen).with_context(|| format!("listening on {listen}"))?;
+                .with_context(|| format!("listening on {l}"))?;
             (ep, true)
         }
-        None => (Endpoint::client(key).context("creating endpoint")?, false),
+        None => (network.client(key).context("creating endpoint")?, false),
     };
     let addr = endpoint.local_addr()?;
     if listening {
@@ -369,7 +404,6 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
         jobs,
         endpoint: endpoint.clone(),
         clients: Mutex::new(HashMap::new()),
-        outbound: Mutex::new(HashMap::new()),
         next_handle: AtomicU64::new(1),
         max_routes: args.max_routes.max(1),
         cloak_addrs: Mutex::new(Vec::new()),
@@ -413,7 +447,7 @@ pub async fn run(args: StageArgs) -> anyhow::Result<()> {
             protocol: PROTOCOL_VERSION,
             region: args.region.clone(),
             attested: false,
-            cloaked: !args.cloaks.is_empty(),
+            cloaked: network.private() || !args.cloaks.is_empty(),
             issued_at: 0,
             ttl_secs: (args.announce_every.max(5) * 3).min(dfin_proto::MAX_RECORD_TTL_SECS as u64)
                 as u32,
@@ -459,9 +493,9 @@ async fn accept_loop(stage: Arc<Stage>, endpoint: Endpoint) {
         tokio::spawn(async move {
             let peer = conn.remote_address();
             let id = conn.peer_id();
-            debug!(%peer, peer_id = %id.short(), "connection opened");
+            debug!(?peer, peer_id = %id.short(), "connection opened");
             stage.serve_conn(conn).await;
-            debug!(%peer, peer_id = %id.short(), "connection closed");
+            debug!(?peer, peer_id = %id.short(), "connection closed");
         });
     }
 }
@@ -494,7 +528,7 @@ async fn cloak_once(stage: &Arc<Stage>, relay: &NextHop) -> anyhow::Result<()> {
     let public = match resp {
         Response::RelayListening { addr } => addr,
         Response::Error { code, message } => bail!("relay refused ({code:?}): {message}"),
-        other => bail!("unexpected relay reply {other:?}"),
+        other => bail!("unexpected relay reply {}", other.kind()),
     };
     let (sock, inbound, outbound) = tunnel_socket();
     let ep = Endpoint::over_tunnel(stage.endpoint.key().clone(), sock)
@@ -534,7 +568,9 @@ async fn announce_loop(
         let mut record = template.clone();
         record.issued_at = crate::hub::unix_now();
         record.addrs = advertise.iter().cloned().collect();
-        record.addrs.extend(stage.cloak_addrs.lock().iter().cloned());
+        record
+            .addrs
+            .extend(stage.cloak_addrs.lock().iter().cloned());
         if record.addrs.is_empty() {
             debug!("no address to announce yet");
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -568,7 +604,7 @@ async fn announce_loop(
                         record: signed.clone(),
                     },
                     MAX_CONTROL_FRAME,
-                    Duration::from_secs(20),
+                    Duration::from_secs(if endpoint.is_private() { 90 } else { 20 }),
                 )
                 .await;
             match r {
@@ -584,7 +620,9 @@ async fn announce_loop(
                     warn!(hub = %hub.addr, ?code, "announcement refused: {message}");
                     announced.insert(id, false);
                 }
-                Ok(other) => warn!(hub = %hub.addr, "unexpected announce reply {other:?}"),
+                Ok(other) => {
+                    warn!(hub = %hub.addr, reply = other.kind(), "unexpected announce reply")
+                }
                 Err(e) => {
                     warn!(hub = %hub.addr, "announce failed: {e}");
                     conns.remove(&id);
@@ -651,16 +689,78 @@ fn check_hello(req: &Request, info: &StageInfo) -> Result<Response, Response> {
 struct RouteState {
     /// Engine key for this route's sessions.
     handle: u64,
-    next: Option<(NextHop, Connection)>,
+    next: Option<(NextHop, RouteConnection)>,
     ret: ReturnMode,
     /// Where results go in `Direct` and `Relay` modes.
-    return_conn: Option<Connection>,
+    return_conn: Option<ReturnConnection>,
+    cancelled: CancellationToken,
+    /// Closing waits for cancelled handlers to stop queuing engine jobs.
+    operations: tokio::sync::RwLock<()>,
+}
+
+impl RouteState {
+    fn close_connections(&self) {
+        if let Some((_, conn)) = &self.next {
+            conn.close("route ended");
+        }
+        if let Some(ReturnConnection::Relay(conn)) = &self.return_conn {
+            conn.close("route ended");
+        }
+    }
+}
+
+/// A downstream connection belongs to one route, including while it is being
+/// established. Dropping a failed/cancelled setup closes it immediately.
+struct RouteConnection(Connection);
+
+impl std::ops::Deref for RouteConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+impl Drop for RouteConnection {
+    fn drop(&mut self) {
+        self.0.close("route ended");
+    }
+}
+
+enum ReturnConnection {
+    // The client's pre-existing connection can carry other routes too.
+    Direct(Connection),
+    Relay(RouteConnection),
+}
+
+impl std::ops::Deref for ReturnConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Direct(c) => c,
+            Self::Relay(c) => c,
+        }
+    }
 }
 
 struct ConnState {
     conn: Connection,
     hello: AtomicBool,
-    routes: Mutex<HashMap<u64, Arc<RouteState>>>,
+    /// None reserves the route number and capacity while setup is pending.
+    routes: Mutex<HashMap<u64, Option<Arc<RouteState>>>>,
+}
+
+struct RouteReservation {
+    state: Arc<ConnState>,
+    route: u64,
+    committed: bool,
+}
+
+impl Drop for RouteReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.state.routes.lock().remove(&self.route);
+        }
+    }
 }
 
 struct Stage {
@@ -669,8 +769,6 @@ struct Stage {
     endpoint: Endpoint,
     /// Connections that completed `Hello`, by peer id, for direct returns.
     clients: Mutex<HashMap<NodeId, Connection>>,
-    /// Connections to next hops that completed `Hello`, by address and id.
-    outbound: Mutex<HashMap<(String, NodeId), Connection>>,
     next_handle: AtomicU64,
     max_routes: usize,
     /// Public addresses relays currently forward to this stage.
@@ -688,7 +786,10 @@ enum ReadErr {
 
 impl Stage {
     fn max_forward_frame(&self) -> u32 {
-        forward_frame_limit(self.info.n_batch, self.info.n_embd_inp.max(self.info.n_embd_out))
+        forward_frame_limit(
+            self.info.n_batch,
+            self.info.n_embd_inp.max(self.info.n_embd_out),
+        )
     }
 
     async fn serve_conn(self: &Arc<Self>, conn: Connection) {
@@ -697,8 +798,14 @@ impl Stage {
             hello: AtomicBool::new(false),
             routes: Mutex::new(HashMap::new()),
         });
+        let mut requests = tokio::task::JoinSet::new();
         loop {
-            let (mut send, recv) = match conn.accept_bi().await {
+            let accepted = tokio::select! {
+                _ = conn.closed() => break,
+                _ = requests.join_next(), if !requests.is_empty() => continue,
+                r = conn.accept_bi(), if requests.len() < 32 => r,
+            };
+            let (mut send, recv) = match accepted {
                 Ok(x) => x,
                 Err(e) => {
                     debug!("{e}");
@@ -707,7 +814,7 @@ impl Stage {
             };
             let stage = self.clone();
             let st = st.clone();
-            tokio::spawn(async move {
+            requests.spawn(async move {
                 let resp = match stage.read_request(recv).await {
                     Ok(req) => stage.handle(&st, req).await,
                     Err(ReadErr::Eof) => return,
@@ -725,6 +832,9 @@ impl Stage {
                 }
             });
         }
+        conn.close("stage connection ended");
+        // No handler may install a route or enqueue engine work after teardown.
+        requests.shutdown().await;
         self.teardown(&st).await;
     }
 
@@ -739,7 +849,9 @@ impl Stage {
         };
         let (len, tag) = match tokio::time::timeout(CONTROL_TIMEOUT, head).await {
             Ok(Ok(x)) => x,
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(ReadErr::Eof),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(ReadErr::Eof)
+            }
             Ok(Err(e)) => return Err(ReadErr::Net(e.into())),
             Err(_) => return Err(ReadErr::Bad("timed out reading the request header".into())),
         };
@@ -759,13 +871,14 @@ impl Stage {
                 "frame of {len} bytes exceeds the {max} byte limit for this request"
             )));
         }
-        let mut body = vec![0u8; len as usize];
-        body[0] = tag;
-        match tokio::time::timeout(budget, AsyncReadExt::read_exact(&mut recv, &mut body[1..])).await {
-            Ok(Ok(_)) => {}
+        // Preserve the tag already consumed for admission, then grow the buffer
+        // only as payload arrives. A large length alone must not reserve memory.
+        let mut reader = std::io::Cursor::new([tag]).chain(recv);
+        let body = match tokio::time::timeout(budget, read_frame_body(&mut reader, len)).await {
+            Ok(Ok(body)) => body,
             Ok(Err(e)) => return Err(ReadErr::Net(e.into())),
             Err(_) => return Err(ReadErr::Bad("timed out reading the request body".into())),
-        }
+        };
         postcard::from_bytes(&body).map_err(|e| ReadErr::Bad(format!("bad frame: {e}")))
     }
 
@@ -826,57 +939,90 @@ impl Stage {
                 p0,
                 p1,
             } => {
-                let Some(rs) = st.routes.lock().get(&route).cloned() else {
+                let Some(rs) = st.routes.lock().get(&route).and_then(Clone::clone) else {
                     return error(ErrorCode::UnknownRoute, format!("unknown route {route}"));
                 };
-                let (tx, rx) = oneshot::channel();
-                let job = Job::SeqRm {
-                    conn: rs.handle,
-                    session,
-                    p0,
-                    p1,
-                    reply: tx,
-                };
-                match self.run_job(job, rx).await {
-                    Reply::Ok => {}
-                    Reply::Error { code, message } => return error(code, message),
-                    Reply::Forward { .. } => return error(ErrorCode::Internal, "engine replied oddly"),
-                }
-                self.downstream_ack(&rs, &Request::SeqRm { route, session, p0, p1 })
+                self.with_route(&rs, route, async {
+                    let (tx, rx) = oneshot::channel();
+                    let job = Job::SeqRm {
+                        conn: rs.handle,
+                        session,
+                        p0,
+                        p1,
+                        reply: tx,
+                    };
+                    match self.run_job(job, rx).await {
+                        Reply::Ok => {}
+                        Reply::Error { code, message } => return error(code, message),
+                        Reply::Forward { .. } => {
+                            return error(ErrorCode::Internal, "engine replied oddly")
+                        }
+                    }
+                    self.downstream_ack(
+                        &rs,
+                        &Request::SeqRm {
+                            route,
+                            session,
+                            p0,
+                            p1,
+                        },
+                    )
                     .await
+                })
+                .await
             }
             Request::SessionClose { route, session } => {
-                let Some(rs) = st.routes.lock().get(&route).cloned() else {
+                let Some(rs) = st.routes.lock().get(&route).and_then(Clone::clone) else {
                     return error(ErrorCode::UnknownRoute, format!("unknown route {route}"));
                 };
-                let (tx, rx) = oneshot::channel();
-                let job = Job::Close {
-                    conn: rs.handle,
-                    session,
-                    reply: tx,
-                };
-                match self.run_job(job, rx).await {
-                    Reply::Ok => {}
-                    Reply::Error { code, message } => return error(code, message),
-                    Reply::Forward { .. } => return error(ErrorCode::Internal, "engine replied oddly"),
-                }
-                self.downstream_ack(&rs, &Request::SessionClose { route, session })
-                    .await
+                self.with_route(&rs, route, async {
+                    let (tx, rx) = oneshot::channel();
+                    let job = Job::Close {
+                        conn: rs.handle,
+                        session,
+                        reply: tx,
+                    };
+                    match self.run_job(job, rx).await {
+                        Reply::Ok => {}
+                        Reply::Error { code, message } => return error(code, message),
+                        Reply::Forward { .. } => {
+                            return error(ErrorCode::Internal, "engine replied oddly")
+                        }
+                    }
+                    self.downstream_ack(&rs, &Request::SessionClose { route, session })
+                        .await
+                })
+                .await
             }
             Request::RouteClose { route } => {
-                let Some(rs) = st.routes.lock().remove(&route) else {
-                    return error(ErrorCode::UnknownRoute, format!("unknown route {route}"));
+                let Some(rs) = st.routes.lock().get(&route).and_then(Clone::clone) else {
+                    return error(
+                        ErrorCode::UnknownRoute,
+                        format!("unknown or pending route {route}"),
+                    );
                 };
-                self.close_route(&rs, route).await
+                // Keep it in the table until cleanup completes: disconnecting
+                // during this await must still leave teardown able to find it.
+                let response = self.close_route(&rs, route).await;
+                let mut routes = st.routes.lock();
+                if routes
+                    .get(&route)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|current| Arc::ptr_eq(current, &rs))
+                {
+                    routes.remove(&route);
+                }
+                response
             }
             Request::RelayOpen { .. }
             | Request::RelayAttach { .. }
             | Request::RelayListen
             | Request::Announce { .. }
             | Request::DirectoryGet
-            | Request::Probe { .. } => {
-                error(ErrorCode::BadRequest, "this node is a stage, not a relay or hub")
-            }
+            | Request::Probe { .. } => error(
+                ErrorCode::BadRequest,
+                "this node is a stage, not a relay or hub",
+            ),
         }
     }
 
@@ -891,20 +1037,30 @@ impl Stage {
         rx.await.unwrap_or_else(|_| stopped())
     }
 
-    /// Dial the next hop (or reuse the connection) and complete `Hello` with it.
-    async fn outbound(&self, nh: &NextHop) -> Result<Connection, Response> {
-        let id = NodeId(nh.node_id);
-        let key = (nh.addr.clone(), id);
-        if let Some(c) = self.outbound.lock().get(&key) {
-            if !c.is_closed() {
-                return Ok(c.clone());
-            }
+    async fn with_route(
+        &self,
+        rs: &RouteState,
+        route: u64,
+        operation: impl std::future::Future<Output = Response>,
+    ) -> Response {
+        let _guard = rs.operations.read().await;
+        tokio::select! {
+            biased;
+            _ = rs.cancelled.cancelled() => error(ErrorCode::UnknownRoute, format!("route {route} closed")),
+            response = operation => response,
         }
-        let conn = self
-            .endpoint
-            .connect(&nh.addr, id)
-            .await
-            .map_err(|e| error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)))?;
+    }
+
+    /// Dial a route-owned next hop and complete `Hello` with it. Sharing an
+    /// outbound connection would merge independent clients' route namespaces.
+    async fn outbound(&self, nh: &NextHop) -> Result<RouteConnection, Response> {
+        let id = NodeId(nh.node_id);
+        let conn = RouteConnection(
+            self.endpoint
+                .connect(&nh.addr, id)
+                .await
+                .map_err(|_| error(ErrorCode::Downstream, "next hop connection failed"))?,
+        );
         let hello = Request::Hello {
             version: PROTOCOL_VERSION,
             model_fingerprint: self.info.fingerprint.clone(),
@@ -914,48 +1070,46 @@ impl Stage {
         let r: Response = conn
             .call(&hello, MAX_CONTROL_FRAME, CONTROL_TIMEOUT)
             .await
-            .map_err(|e| error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)))?;
+            .map_err(|_| error(ErrorCode::Downstream, "next hop hello failed"))?;
         match r {
             Response::HelloOk {
-                n_embd,
-                n_embd_inp,
-                ..
+                n_embd, n_embd_inp, ..
             } if n_embd == self.info.n_embd && n_embd_inp == self.info.n_embd_out => {}
             Response::HelloOk {
-                n_embd,
-                n_embd_inp,
-                ..
+                n_embd, n_embd_inp, ..
             } => {
                 return Err(error(
                     ErrorCode::Downstream,
                     format!(
-                        "next hop {}: takes rows of {n_embd_inp} (n_embd {n_embd}), this stage produces {}",
-                        nh.addr, self.info.n_embd_out
-                    ),
+                    "next hop takes rows of {n_embd_inp} (n_embd {n_embd}), this stage produces {}",
+                    self.info.n_embd_out
+                ),
                 ))
             }
-            Response::Error { code, message } => {
+            Response::Error { code, .. } => {
                 return Err(error(
                     ErrorCode::Downstream,
-                    format!("next hop {} refused hello ({code:?}): {message}", nh.addr),
+                    format!("next hop refused hello ({code:?})"),
                 ))
             }
             other => {
                 return Err(error(
                     ErrorCode::Downstream,
-                    format!("next hop {}: unexpected hello reply {other:?}", nh.addr),
+                    format!("next hop returned unexpected hello reply {}", other.kind()),
                 ))
             }
         }
-        self.outbound.lock().insert(key, conn.clone());
         Ok(conn)
     }
 
     async fn route_setup(&self, st: &Arc<ConnState>, route: u64, hop: Vec<u8>) -> Response {
         {
-            let routes = st.routes.lock();
+            let mut routes = st.routes.lock();
             if routes.contains_key(&route) {
-                return error(ErrorCode::BadRequest, format!("route {route} already exists"));
+                return error(
+                    ErrorCode::BadRequest,
+                    format!("route {route} already exists"),
+                );
             }
             if routes.len() >= self.max_routes {
                 return error(
@@ -963,7 +1117,13 @@ impl Stage {
                     format!("{} routes already open on this connection", routes.len()),
                 );
             }
+            routes.insert(route, None);
         }
+        let mut reservation = RouteReservation {
+            state: st.clone(),
+            route,
+            committed: false,
+        };
         let plain = match unseal(self.endpoint.key(), &hop) {
             Ok(p) => p,
             Err(e) => return error(ErrorCode::BadRecord, e.to_string()),
@@ -1003,21 +1163,19 @@ impl Stage {
                 .await;
             match r {
                 Ok(Response::RouteOk { hops: h }) => hops = h,
-                Ok(Response::Error { code, message }) => {
+                Ok(Response::Error { code, .. }) => {
                     return error(
                         ErrorCode::Downstream,
-                        format!("next hop {} ({code:?}): {message}", nh.addr),
+                        format!("next hop refused setup ({code:?})"),
                     )
                 }
                 Ok(other) => {
                     return error(
                         ErrorCode::Downstream,
-                        format!("next hop {}: unexpected setup reply {other:?}", nh.addr),
+                        format!("next hop returned unexpected setup reply {}", other.kind()),
                     )
                 }
-                Err(e) => {
-                    return error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr))
-                }
+                Err(_) => return error(ErrorCode::Downstream, "next hop setup failed"),
             }
             next = Some((nh, conn));
         }
@@ -1028,11 +1186,13 @@ impl Stage {
                 ReturnMode::Direct { client_id } => {
                     let id = NodeId(*client_id);
                     match self.clients.lock().get(&id) {
-                        Some(c) if !c.is_closed() => return_conn = Some(c.clone()),
+                        Some(c) if !c.is_closed() => {
+                            return_conn = Some(ReturnConnection::Direct(c.clone()))
+                        }
                         _ => {
                             return error(
                                 ErrorCode::NoReturnPath,
-                                format!("no live connection from client {}", id.short()),
+                                "no live direct return connection",
                             )
                         }
                     }
@@ -1043,12 +1203,9 @@ impl Stage {
                         .connect(&relay.addr, NodeId(relay.node_id))
                         .await
                     {
-                        Ok(c) => c,
-                        Err(e) => {
-                            return error(
-                                ErrorCode::NoReturnPath,
-                                format!("relay {}: {e}", relay.addr),
-                            )
+                        Ok(c) => RouteConnection(c),
+                        Err(_) => {
+                            return error(ErrorCode::NoReturnPath, "return relay connection failed")
                         }
                     };
                     let r: Result<Response, NetError> = conn
@@ -1059,43 +1216,43 @@ impl Stage {
                         )
                         .await;
                     match r {
-                        Ok(Response::Ack) => return_conn = Some(conn),
-                        Ok(Response::Error { code, message }) => {
+                        Ok(Response::Ack) => return_conn = Some(ReturnConnection::Relay(conn)),
+                        Ok(Response::Error { code, .. }) => {
                             return error(
                                 ErrorCode::NoReturnPath,
-                                format!("relay {} ({code:?}): {message}", relay.addr),
+                                format!("return relay refused attachment ({code:?})"),
                             )
                         }
                         Ok(other) => {
                             return error(
                                 ErrorCode::NoReturnPath,
-                                format!("relay {}: unexpected reply {other:?}", relay.addr),
+                                format!("return relay sent unexpected reply {}", other.kind()),
                             )
                         }
-                        Err(e) => {
-                            return error(
-                                ErrorCode::NoReturnPath,
-                                format!("relay {}: {e}", relay.addr),
-                            )
+                        Err(_) => {
+                            return error(ErrorCode::NoReturnPath, "return relay attachment failed")
                         }
                     }
                 }
             }
         }
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let Some(hops) = hops.checked_add(1) else {
+            return error(ErrorCode::Downstream, "invalid downstream hop count");
+        };
         let rs = Arc::new(RouteState {
             handle,
             next,
             ret: rec.ret,
             return_conn,
+            cancelled: CancellationToken::new(),
+            operations: tokio::sync::RwLock::new(()),
         });
         let mut routes = st.routes.lock();
-        if routes.len() >= self.max_routes {
-            return error(ErrorCode::RouteLimit, "route limit reached");
-        }
-        routes.insert(route, rs);
-        debug!(route, handle, hops = hops + 1, "route set up");
-        Response::RouteOk { hops: hops + 1 }
+        routes.insert(route, Some(rs));
+        reservation.committed = true;
+        debug!(route, handle, hops, "route set up");
+        Response::RouteOk { hops }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1109,90 +1266,97 @@ impl Stage {
         act: Activations,
         mut hops: Vec<HopStat>,
     ) -> Response {
-        let Some(rs) = st.routes.lock().get(&route).cloned() else {
+        let Some(rs) = st.routes.lock().get(&route).and_then(Clone::clone) else {
             return error(ErrorCode::UnknownRoute, format!("unknown route {route}"));
         };
-        if hops.len() > 256 {
-            return error(ErrorCode::BadRequest, "too many hop stats");
-        }
-        let (tx, rx) = oneshot::channel();
-        let job = Job::Forward {
-            conn: rs.handle,
-            session,
-            seq,
-            pos0,
-            act,
-            reply: tx,
-        };
-        let (out, compute_ms) = match self.run_job(job, rx).await {
-            Reply::Forward { act, compute_ms } => (act, compute_ms),
-            Reply::Error { code, message } => {
-                // The client may be waiting on the return path rather than on this stream.
-                self.deliver_error(&rs, route, session, seq, code, &message)
-                    .await;
-                return error(code, message);
+        self.with_route(&rs, route, async {
+            if hops.len() > 256 {
+                return error(ErrorCode::BadRequest, "too many hop stats");
             }
-            Reply::Ok => return error(ErrorCode::Internal, "engine replied oddly"),
-        };
-        hops.push(HopStat {
-            layer_begin: self.info.layer_begin,
-            layer_end: self.info.layer_end,
-            compute_ms,
-        });
-        match &rs.next {
-            Some((nh, conn)) => {
-                let limit = forward_frame_limit(out.n_tokens, out.n_embd);
-                let r: Result<Response, NetError> = conn
-                    .call(
-                        &Request::Forward {
+            let (tx, rx) = oneshot::channel();
+            let job = Job::Forward {
+                conn: rs.handle,
+                session,
+                seq,
+                pos0,
+                act,
+                reply: tx,
+            };
+            let (out, compute_ms) = match self.run_job(job, rx).await {
+                Reply::Forward { act, compute_ms } => (act, compute_ms),
+                Reply::Error { code, message } => {
+                    // The client may be waiting on the return path rather than on this stream.
+                    self.deliver_error(&rs, route, session, seq, code, &message)
+                        .await;
+                    return error(code, message);
+                }
+                Reply::Ok => return error(ErrorCode::Internal, "engine replied oddly"),
+            };
+            hops.push(HopStat {
+                layer_begin: self.info.layer_begin,
+                layer_end: self.info.layer_end,
+                compute_ms,
+            });
+            match &rs.next {
+                Some((_, conn)) => {
+                    let limit = forward_frame_limit(out.n_tokens, out.n_embd);
+                    let r: Result<Response, NetError> = conn
+                        .call(
+                            &Request::Forward {
+                                route,
+                                session,
+                                seq,
+                                pos0,
+                                act: out,
+                                hops,
+                            },
+                            limit,
+                            FORWARD_TIMEOUT,
+                        )
+                        .await;
+                    match r {
+                        Ok(resp @ (Response::Ack | Response::ForwardOk { .. })) => resp,
+                        Ok(Response::Error { code, .. }) => {
+                            error(code, "downstream forward refused")
+                        }
+                        Ok(other) => error(
+                            ErrorCode::Downstream,
+                            format!("unexpected forward reply {}", other.kind()),
+                        ),
+                        Err(_) => error(ErrorCode::Downstream, "next hop forward failed"),
+                    }
+                }
+                None => match &rs.ret {
+                    ReturnMode::Reverse => Response::ForwardOk {
+                        session,
+                        seq,
+                        act: out,
+                        hops,
+                    },
+                    ReturnMode::Direct { .. } | ReturnMode::Relay { .. } => {
+                        let frame = ReturnFrame {
                             route,
                             session,
                             seq,
-                            pos0,
-                            act: out,
-                            hops,
-                        },
-                        limit,
-                        FORWARD_TIMEOUT,
-                    )
-                    .await;
-                match r {
-                    Ok(resp) => resp,
-                    Err(e) => error(
-                        ErrorCode::Downstream,
-                        format!("next hop {}: {e}", nh.addr),
-                    ),
-                }
-            }
-            None => match &rs.ret {
-                ReturnMode::Reverse => Response::ForwardOk {
-                    session,
-                    seq,
-                    act: out,
-                    hops,
-                },
-                ReturnMode::Direct { .. } | ReturnMode::Relay { .. } => {
-                    let frame = ReturnFrame {
-                        route,
-                        session,
-                        seq,
-                        body: Response::ForwardOk {
-                            session,
-                            seq,
-                            act: out,
-                            hops,
-                        },
-                    };
-                    match &rs.return_conn {
-                        Some(c) => match c.send_uni(&frame).await {
-                            Ok(()) => Response::Ack,
-                            Err(e) => error(ErrorCode::NoReturnPath, format!("return path: {e}")),
-                        },
-                        None => error(ErrorCode::NoReturnPath, "no return connection"),
+                            body: Response::ForwardOk {
+                                session,
+                                seq,
+                                act: out,
+                                hops,
+                            },
+                        };
+                        match &rs.return_conn {
+                            Some(c) => match c.send_uni(&frame).await {
+                                Ok(()) => Response::Ack,
+                                Err(_) => error(ErrorCode::NoReturnPath, "return path send failed"),
+                            },
+                            None => error(ErrorCode::NoReturnPath, "no return connection"),
+                        }
                     }
-                }
-            },
-        }
+                },
+            }
+        })
+        .await
     }
 
     /// In direct and relay modes the client listens on the return path; tell it there.
@@ -1221,34 +1385,51 @@ impl Stage {
 
     /// Forward a control request down the chain and wait for its `Ack`.
     async fn downstream_ack(&self, rs: &RouteState, req: &Request) -> Response {
-        let Some((nh, conn)) = &rs.next else {
+        let Some((_, conn)) = &rs.next else {
             return Response::Ack;
         };
         let r: Result<Response, NetError> =
             conn.call(req, MAX_CONTROL_FRAME, CONTROL_TIMEOUT).await;
         match r {
             Ok(Response::Ack) => Response::Ack,
-            Ok(Response::Error { code, message }) => error(
+            Ok(Response::Error { code, .. }) => error(
                 ErrorCode::Downstream,
-                format!("next hop {} ({code:?}): {message}", nh.addr),
+                format!("downstream control request refused ({code:?})"),
             ),
             Ok(other) => error(
                 ErrorCode::Downstream,
-                format!("next hop {}: unexpected reply {other:?}", nh.addr),
+                format!("unexpected downstream control reply {}", other.kind()),
             ),
-            Err(e) => error(ErrorCode::Downstream, format!("next hop {}: {e}", nh.addr)),
+            Err(_) => error(ErrorCode::Downstream, "downstream control request failed"),
         }
     }
 
     async fn close_route(&self, rs: &RouteState, route: u64) -> Response {
+        rs.cancelled.cancel();
+        let _exclusive = rs.operations.write().await;
         let _ = self.jobs.send(Job::CloseConn { conn: rs.handle }).await;
-        self.downstream_ack(rs, &Request::RouteClose { route }).await
+        let response = self
+            .downstream_ack(rs, &Request::RouteClose { route })
+            .await;
+        rs.close_connections();
+        response
     }
 
     async fn teardown(&self, st: &Arc<ConnState>) {
-        let routes: Vec<(u64, Arc<RouteState>)> = st.routes.lock().drain().collect();
-        for (route, rs) in routes {
-            let _ = self.close_route(&rs, route).await;
+        let routes: Vec<(u64, Arc<RouteState>)> = st
+            .routes
+            .lock()
+            .drain()
+            .filter_map(|(route, state)| state.map(|state| (route, state)))
+            .collect();
+        // All handlers were joined before this point. Closing route-owned
+        // downstream connections cascades cancellation without network waits.
+        for (_, rs) in &routes {
+            rs.cancelled.cancel();
+            rs.close_connections();
+        }
+        for (_, rs) in routes {
+            let _ = self.jobs.send(Job::CloseConn { conn: rs.handle }).await;
         }
         let mut clients = self.clients.lock();
         if let Some(c) = clients.get(&st.conn.peer_id()) {

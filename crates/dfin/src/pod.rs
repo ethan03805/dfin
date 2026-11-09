@@ -230,6 +230,7 @@ impl Drop for PodHandle {
 
 fn base_command(exe: &Path, log: &Option<String>) -> Command {
     let mut cmd = Command::new(exe);
+    cmd.args(["--network", "direct"]);
     if let Some(l) = log {
         cmd.arg("--log").arg(l);
     }
@@ -367,7 +368,7 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
     } else {
         None
     };
-    let probe = Endpoint::client(NodeKey::generate()).context("creating probe endpoint")?;
+    let probe = Endpoint::direct_client(NodeKey::generate()).context("creating probe endpoint")?;
 
     let mut handle = PodHandle {
         api_url: String::new(),
@@ -425,7 +426,14 @@ pub async fn spawn_pod(opts: PodOptions) -> anyhow::Result<PodHandle> {
             .with_context(|| format!("spawning {}", exe.display()))?;
         handle.children.push(PodChild { name, child });
         let last = handle.children.len() - 1;
-        wait_for_stage(&probe, *addr, *id, &mut handle.children[last], opts.ready_timeout).await?;
+        wait_for_stage(
+            &probe,
+            *addr,
+            *id,
+            &mut handle.children[last],
+            opts.ready_timeout,
+        )
+        .await?;
         info!("{} is up", handle.children[last].name);
     }
     for (i, addr) in stage_addrs.iter().enumerate() {

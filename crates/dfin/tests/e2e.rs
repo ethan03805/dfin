@@ -146,6 +146,7 @@ impl Procs {
             std::env::temp_dir().join(format!("dfin-e2e-{}-{}.log", name, std::process::id()));
         let file = std::fs::File::create(&log).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_dfin"))
+            .args(["--network", "direct"])
             .args(args)
             .env("DFIN_LOG", "info")
             .stdin(Stdio::null())
@@ -201,7 +202,7 @@ impl Procs {
 
     async fn wait_stage(&mut self, i: usize, port: u16, id: NodeId, timeout: Duration) {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let probe = Endpoint::client(NodeKey::generate()).unwrap();
+        let probe = Endpoint::direct_client(NodeKey::generate()).unwrap();
         let deadline = Instant::now() + timeout;
         loop {
             if stage_answers(&probe, &addr.to_string(), id).await {
@@ -468,10 +469,14 @@ async fn pipeline_with_two_stages(return_mode: &str) {
         None
     };
     for (i, port, id) in stage_idx {
-        procs.wait_stage(i, port, id, Duration::from_secs(120)).await;
+        procs
+            .wait_stage(i, port, id, Duration::from_secs(120))
+            .await;
     }
     if let Some((i, port, key)) = &relay {
-        procs.wait_stage(*i, *port, key.id, Duration::from_secs(60)).await;
+        procs
+            .wait_stage(*i, *port, key.id, Duration::from_secs(60))
+            .await;
     }
     let mut args: Vec<String> = [
         "client",
@@ -529,7 +534,10 @@ async fn pipeline_with_two_stages(return_mode: &str) {
         stages.iter().all(|s| s["forwards"].as_u64().unwrap() > 0),
         "{status:#}"
     );
-    assert_eq!(status["stats"]["chain"]["return_mode"], return_mode, "{status:#}");
+    assert_eq!(
+        status["stats"]["chain"]["return_mode"], return_mode,
+        "{status:#}"
+    );
     assert!(
         status["stats"]["chain"]["forwards"].as_u64().unwrap() > 0,
         "{status:#}"
@@ -609,51 +617,68 @@ async fn route_from_hub_and_reroute_after_stage_death() {
     }
     let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
     let model = model_path().display().to_string();
-    let probe = Endpoint::client(NodeKey::generate()).unwrap();
+    let probe = Endpoint::direct_client(NodeKey::generate()).unwrap();
     let mut procs = Procs::default();
 
     let hub_port = free_udp_port();
     let hub_key = StageKey::new("hub");
     let hub_addr = format!("127.0.0.1:{hub_port}");
-    let hub_args: Vec<String> = ["hub", "--listen", &hub_addr, "--identity", &hub_key.path.display().to_string()]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let hub_args: Vec<String> = [
+        "hub",
+        "--listen",
+        &hub_addr,
+        "--identity",
+        &hub_key.path.display().to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let hi = procs.spawn("hub", &hub_args);
-    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120))
+        .await;
     let hub_flag = format!("{hub_addr}/{}", hub_key.id);
 
-    let spawn_stage = |procs: &mut Procs, name: &str, layers: &str, key: &StageKey, port: u16| -> usize {
-        let args: Vec<String> = [
-            "stage",
-            "--model",
-            &model,
-            "--layers",
-            layers,
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--identity",
-            &key.path.display().to_string(),
-            "--hub",
-            &hub_flag,
-            "--announce-every",
-            "5",
-            "--n-gpu-layers",
-            "0",
-            "--act-dtype",
-            "f32",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        procs.spawn(name, &args)
-    };
-    let (k1, k2, k3) = (StageKey::new("s1"), StageKey::new("s2"), StageKey::new("s3"));
+    let spawn_stage =
+        |procs: &mut Procs, name: &str, layers: &str, key: &StageKey, port: u16| -> usize {
+            let args: Vec<String> = [
+                "stage",
+                "--model",
+                &model,
+                "--layers",
+                layers,
+                "--listen",
+                &format!("127.0.0.1:{port}"),
+                "--identity",
+                &key.path.display().to_string(),
+                "--hub",
+                &hub_flag,
+                "--announce-every",
+                "5",
+                "--n-gpu-layers",
+                "0",
+                "--act-dtype",
+                "f32",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            procs.spawn(name, &args)
+        };
+    let (k1, k2, k3) = (
+        StageKey::new("s1"),
+        StageKey::new("s2"),
+        StageKey::new("s3"),
+    );
     let (p1, p2, p3) = (free_udp_port(), free_udp_port(), free_udp_port());
     let s1 = spawn_stage(&mut procs, "stage1", "2:4", &k1, p1);
     let s2 = spawn_stage(&mut procs, "stage2", "4:6", &k2, p2);
-    procs.wait_stage(s1, p1, k1.id, Duration::from_secs(120)).await;
-    procs.wait_stage(s2, p2, k2.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(s1, p1, k1.id, Duration::from_secs(120))
+        .await;
+    procs
+        .wait_stage(s2, p2, k2.id, Duration::from_secs(120))
+        .await;
     wait_listed(&probe, &hub_addr, hub_key.id, 2, &procs).await;
 
     let pc = free_port();
@@ -690,7 +715,12 @@ async fn route_from_hub_and_reroute_after_stage_death() {
     procs.wait_health(ci, &base, Duration::from_secs(120)).await;
     exercise(&procs, &base, &expected).await;
 
-    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    let status: Value = reqwest::get(format!("{base}/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(status["route"].as_array().unwrap().len(), 4, "{status:#}");
     assert_eq!(status["directory"]["nodes_usable"], 2, "{status:#}");
     assert_eq!(status["directory"]["from_cache"], false, "{status:#}");
@@ -700,7 +730,9 @@ async fn route_from_hub_and_reroute_after_stage_death() {
 
     // A replacement for layers 2:4 joins, then the first stage dies.
     let s3 = spawn_stage(&mut procs, "stage3", "2:4", &k3, p3);
-    procs.wait_stage(s3, p3, k3.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(s3, p3, k3.id, Duration::from_secs(120))
+        .await;
     wait_listed(&probe, &hub_addr, hub_key.id, 3, &procs).await;
     procs.kill(s1);
 
@@ -718,17 +750,34 @@ async fn route_from_hub_and_reroute_after_stage_death() {
             let v: Value = serde_json::from_str(&body).unwrap();
             let text = v["choices"][0]["text"].as_str().unwrap_or("");
             assert_eq!(text, expected, "rerouted output differs");
-            let status: Value = http.get(format!("{base}/status")).send().await.unwrap().json().await.unwrap();
-            let now_first = status["route"][1]["node_id"].as_str().unwrap_or("").to_string();
+            let status: Value = http
+                .get(format!("{base}/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let now_first = status["route"][1]["node_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             if now_first == k3.id.to_string() {
-                assert!(status["stats"]["chain"]["rebuilds"].as_u64().unwrap() >= 1, "{status:#}");
+                assert!(
+                    status["stats"]["chain"]["rebuilds"].as_u64().unwrap() >= 1,
+                    "{status:#}"
+                );
                 rerouted = true;
                 break;
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    assert!(rerouted, "client did not reroute to the replacement stage\n{}", procs.logs());
+    assert!(
+        rerouted,
+        "client did not reroute to the replacement stage\n{}",
+        procs.logs()
+    );
     let _ = std::fs::remove_file(&cache);
 }
 
@@ -742,7 +791,7 @@ async fn cloaked_stage_through_relay() {
     }
     let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
     let model = model_path().display().to_string();
-    let probe = Endpoint::client(NodeKey::generate()).unwrap();
+    let probe = Endpoint::direct_client(NodeKey::generate()).unwrap();
     let mut procs = Procs::default();
 
     let hub_port = free_udp_port();
@@ -762,7 +811,9 @@ async fn cloaked_stage_through_relay() {
     .map(|s| s.to_string())
     .collect();
     let hi = procs.spawn("hub", &hub_args);
-    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120))
+        .await;
     let hub_flag = format!("{hub_addr}/{}", hub_key.id);
 
     let relay_port = free_udp_port();
@@ -778,17 +829,31 @@ async fn cloaked_stage_through_relay() {
     .map(|s| s.to_string())
     .collect();
     let ri = procs.spawn("relay", &relay_args);
-    procs.wait_stage(ri, relay_port, relay_key.id, Duration::from_secs(60)).await;
+    procs
+        .wait_stage(ri, relay_port, relay_key.id, Duration::from_secs(60))
+        .await;
     let relay_flag = format!("127.0.0.1:{relay_port}/{}", relay_key.id);
 
     let (k1, k2) = (StageKey::new("s1"), StageKey::new("s2"));
     let p1 = free_udp_port();
     let args1: Vec<String> = [
-        "stage", "--model", &model, "--layers", "2:4",
-        "--listen", &format!("127.0.0.1:{p1}"),
-        "--identity", &k1.path.display().to_string(),
-        "--hub", &hub_flag, "--announce-every", "5",
-        "--n-gpu-layers", "0", "--act-dtype", "f32",
+        "stage",
+        "--model",
+        &model,
+        "--layers",
+        "2:4",
+        "--listen",
+        &format!("127.0.0.1:{p1}"),
+        "--identity",
+        &k1.path.display().to_string(),
+        "--hub",
+        &hub_flag,
+        "--announce-every",
+        "5",
+        "--n-gpu-layers",
+        "0",
+        "--act-dtype",
+        "f32",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -796,17 +861,31 @@ async fn cloaked_stage_through_relay() {
     let s1 = procs.spawn("stage1", &args1);
     // The cloaked stage: no --listen at all.
     let args2: Vec<String> = [
-        "stage", "--model", &model, "--layers", "4:6",
-        "--identity", &k2.path.display().to_string(),
-        "--cloak", &relay_flag,
-        "--hub", &hub_flag, "--announce-every", "5",
-        "--n-gpu-layers", "0", "--act-dtype", "f32",
+        "stage",
+        "--model",
+        &model,
+        "--layers",
+        "4:6",
+        "--identity",
+        &k2.path.display().to_string(),
+        "--cloak",
+        &relay_flag,
+        "--hub",
+        &hub_flag,
+        "--announce-every",
+        "5",
+        "--n-gpu-layers",
+        "0",
+        "--act-dtype",
+        "f32",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let _s2 = procs.spawn("stage2-cloaked", &args2);
-    procs.wait_stage(s1, p1, k1.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(s1, p1, k1.id, Duration::from_secs(120))
+        .await;
     wait_listed(&probe, &hub_addr, hub_key.id, 2, &procs).await;
 
     // The hub's JSON view says which node is cloaked and where it is reached.
@@ -825,16 +904,36 @@ async fn cloaked_stage_through_relay() {
     let via = cloaked["addrs"][0].as_str().unwrap().to_string();
     assert!(via.starts_with("127.0.0.1:"), "{via}");
     let via_port: u16 = via.rsplit(':').next().unwrap().parse().unwrap();
-    assert_ne!(via_port, relay_port, "the relay allocated a port of its own for the node");
+    assert_ne!(
+        via_port, relay_port,
+        "the relay allocated a port of its own for the node"
+    );
 
     let pc = free_port();
     let cache = std::env::temp_dir().join(format!("dfin-e2e-cloak-{}.cache", std::process::id()));
     let _ = std::fs::remove_file(&cache);
     let args: Vec<String> = [
-        "client", "--model", &model, "--head", "0:2", "--tail", "6:end",
-        "--hub", &hub_flag, "--directory-cache", &cache.display().to_string(),
-        "--n-gpu-layers", "0", "--act-dtype", "f32", "--max-sessions", "2", "--n-ctx", "512",
-        "--listen", &format!("127.0.0.1:{pc}"),
+        "client",
+        "--model",
+        &model,
+        "--head",
+        "0:2",
+        "--tail",
+        "6:end",
+        "--hub",
+        &hub_flag,
+        "--directory-cache",
+        &cache.display().to_string(),
+        "--n-gpu-layers",
+        "0",
+        "--act-dtype",
+        "f32",
+        "--max-sessions",
+        "2",
+        "--n-ctx",
+        "512",
+        "--listen",
+        &format!("127.0.0.1:{pc}"),
     ]
     .iter()
     .map(|s| s.to_string())
@@ -844,9 +943,18 @@ async fn cloaked_stage_through_relay() {
     procs.wait_health(ci, &base, Duration::from_secs(120)).await;
     exercise(&procs, &base, &expected).await;
 
-    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    let status: Value = reqwest::get(format!("{base}/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(status["route"].as_array().unwrap().len(), 4, "{status:#}");
-    assert_eq!(status["route"][2]["node_id"], k2.id.to_string(), "{status:#}");
+    assert_eq!(
+        status["route"][2]["node_id"],
+        k2.id.to_string(),
+        "{status:#}"
+    );
     assert_eq!(status["route"][2]["addr"], via, "{status:#}");
     let _ = std::fs::remove_file(&cache);
 }
@@ -863,37 +971,64 @@ async fn stage_fetches_its_shards_from_a_peer() {
     let shards = model_path().parent().unwrap().join("tiny-shards");
     let manifest = shards.join("tiny-llama-f32.manifest.json");
     if !manifest.exists() {
-        eprintln!("SKIP: {} not found (run tools/shard_gguf.py)", manifest.display());
+        eprintln!(
+            "SKIP: {} not found (run tools/shard_gguf.py)",
+            manifest.display()
+        );
         return;
     }
     let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
-    let probe = Endpoint::client(NodeKey::generate()).unwrap();
+    let probe = Endpoint::direct_client(NodeKey::generate()).unwrap();
     let mut procs = Procs::default();
 
     let hub_port = free_udp_port();
     let hub_key = StageKey::new("hub");
     let hub_addr = format!("127.0.0.1:{hub_port}");
-    let hub_args: Vec<String> = ["hub", "--listen", &hub_addr, "--identity", &hub_key.path.display().to_string()]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let hub_args: Vec<String> = [
+        "hub",
+        "--listen",
+        &hub_addr,
+        "--identity",
+        &hub_key.path.display().to_string(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let hi = procs.spawn("hub", &hub_args);
-    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120))
+        .await;
     let hub_flag = format!("{hub_addr}/{}", hub_key.id);
 
     // Stage A holds every shard.
     let (k1, k2) = (StageKey::new("s1"), StageKey::new("s2"));
     let (p1, p2) = (free_udp_port(), free_udp_port());
     let args1: Vec<String> = [
-        "stage", "--model", &manifest.display().to_string(), "--layers", "2:4",
-        "--listen", &format!("127.0.0.1:{p1}"), "--identity", &k1.path.display().to_string(),
-        "--hub", &hub_flag, "--announce-every", "5", "--n-gpu-layers", "0", "--act-dtype", "f32",
+        "stage",
+        "--model",
+        &manifest.display().to_string(),
+        "--layers",
+        "2:4",
+        "--listen",
+        &format!("127.0.0.1:{p1}"),
+        "--identity",
+        &k1.path.display().to_string(),
+        "--hub",
+        &hub_flag,
+        "--announce-every",
+        "5",
+        "--n-gpu-layers",
+        "0",
+        "--act-dtype",
+        "f32",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let s1 = procs.spawn("stage1-full", &args1);
-    procs.wait_stage(s1, p1, k1.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(s1, p1, k1.id, Duration::from_secs(120))
+        .await;
     wait_listed(&probe, &hub_addr, hub_key.id, 1, &procs).await;
 
     // Stage B starts with the manifest alone and fetches layers 4 and 5 from A.
@@ -902,16 +1037,37 @@ async fn stage_fetches_its_shards_from_a_peer() {
     std::fs::create_dir_all(&bdir).unwrap();
     std::fs::copy(&manifest, bdir.join("tiny-llama-f32.manifest.json")).unwrap();
     let args2: Vec<String> = [
-        "stage", "--model", &bdir.join("tiny-llama-f32.manifest.json").display().to_string(),
-        "--layers", "4:6", "--fetch", "--fetch-wait", "90",
-        "--listen", &format!("127.0.0.1:{p2}"), "--identity", &k2.path.display().to_string(),
-        "--hub", &hub_flag, "--announce-every", "5", "--n-gpu-layers", "0", "--act-dtype", "f32",
+        "stage",
+        "--model",
+        &bdir
+            .join("tiny-llama-f32.manifest.json")
+            .display()
+            .to_string(),
+        "--layers",
+        "4:6",
+        "--fetch",
+        "--fetch-wait",
+        "90",
+        "--listen",
+        &format!("127.0.0.1:{p2}"),
+        "--identity",
+        &k2.path.display().to_string(),
+        "--hub",
+        &hub_flag,
+        "--announce-every",
+        "5",
+        "--n-gpu-layers",
+        "0",
+        "--act-dtype",
+        "f32",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let s2 = procs.spawn("stage2-fetched", &args2);
-    procs.wait_stage(s2, p2, k2.id, Duration::from_secs(180)).await;
+    procs
+        .wait_stage(s2, p2, k2.id, Duration::from_secs(180))
+        .await;
     wait_listed(&probe, &hub_addr, hub_key.id, 2, &procs).await;
     let mut files: Vec<String> = std::fs::read_dir(&bdir)
         .unwrap()
@@ -933,10 +1089,27 @@ async fn stage_fetches_its_shards_from_a_peer() {
     // The client's head and tail come from the shard set as well.
     let pc = free_port();
     let args: Vec<String> = [
-        "client", "--model", &manifest.display().to_string(), "--head", "0:2", "--tail", "6:end",
-        "--hub", &hub_flag, "--directory-cache", &bdir.join("dir.cache").display().to_string(),
-        "--n-gpu-layers", "0", "--act-dtype", "f32", "--max-sessions", "2", "--n-ctx", "512",
-        "--listen", &format!("127.0.0.1:{pc}"),
+        "client",
+        "--model",
+        &manifest.display().to_string(),
+        "--head",
+        "0:2",
+        "--tail",
+        "6:end",
+        "--hub",
+        &hub_flag,
+        "--directory-cache",
+        &bdir.join("dir.cache").display().to_string(),
+        "--n-gpu-layers",
+        "0",
+        "--act-dtype",
+        "f32",
+        "--max-sessions",
+        "2",
+        "--n-ctx",
+        "512",
+        "--listen",
+        &format!("127.0.0.1:{pc}"),
     ]
     .iter()
     .map(|s| s.to_string())
@@ -945,9 +1118,18 @@ async fn stage_fetches_its_shards_from_a_peer() {
     let base = format!("http://127.0.0.1:{pc}");
     procs.wait_health(ci, &base, Duration::from_secs(120)).await;
     exercise(&procs, &base, &expected).await;
-    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    let status: Value = reqwest::get(format!("{base}/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(status["route"].as_array().unwrap().len(), 4, "{status:#}");
-    assert_eq!(status["route"][2]["node_id"], k2.id.to_string(), "{status:#}");
+    assert_eq!(
+        status["route"][2]["node_id"],
+        k2.id.to_string(),
+        "{status:#}"
+    );
 
     // `dfin fetch` alone: the head's shards (first, embedding, layers 0 and 1).
     let fdir = std::env::temp_dir().join(format!("dfin-e2e-shards-f-{}", std::process::id()));
@@ -955,13 +1137,28 @@ async fn stage_fetches_its_shards_from_a_peer() {
     std::fs::create_dir_all(&fdir).unwrap();
     std::fs::copy(&manifest, fdir.join("tiny-llama-f32.manifest.json")).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_dfin"))
+        .args(["--network", "direct"])
         .args([
-            "fetch", "--manifest", &fdir.join("tiny-llama-f32.manifest.json").display().to_string(),
-            "--layers", "0:2", "--hub", &hub_flag, "--wait", "60",
+            "fetch",
+            "--manifest",
+            &fdir
+                .join("tiny-llama-f32.manifest.json")
+                .display()
+                .to_string(),
+            "--layers",
+            "0:2",
+            "--hub",
+            &hub_flag,
+            "--wait",
+            "60",
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "dfin fetch failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "dfin fetch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let mut files: Vec<String> = std::fs::read_dir(&fdir)
         .unwrap()
         .flatten()
@@ -970,7 +1167,10 @@ async fn stage_fetches_its_shards_from_a_peer() {
         .collect();
     files.sort();
     assert_eq!(files.len(), 4, "{files:?}");
-    assert!(files.contains(&"tiny-llama-f32-00002-of-00011.gguf".to_string()), "{files:?}");
+    assert!(
+        files.contains(&"tiny-llama-f32-00002-of-00011.gguf".to_string()),
+        "{files:?}"
+    );
     let _ = std::fs::remove_dir_all(&bdir);
     let _ = std::fs::remove_dir_all(&fdir);
 }
@@ -986,7 +1186,7 @@ async fn region_fence_from_two_vantage_points() {
     }
     let expected = tokio::task::spawn_blocking(reference_text).await.unwrap();
     let model = model_path().display().to_string();
-    let probe = Endpoint::client(NodeKey::generate()).unwrap();
+    let probe = Endpoint::direct_client(NodeKey::generate()).unwrap();
     let mut procs = Procs::default();
 
     // Two probes, allowed to answer the hub only.
@@ -994,58 +1194,100 @@ async fn region_fence_from_two_vantage_points() {
     let (pu_port, pe_port) = (free_udp_port(), free_udp_port());
     let (pu_key, pe_key) = (StageKey::new("probe-us"), StageKey::new("probe-eu"));
     let pu_args: Vec<String> = [
-        "probe", "--listen", &format!("127.0.0.1:{pu_port}"),
-        "--identity", &pu_key.path.display().to_string(),
-        "--region", "us", "--allow", &hub_key.id.to_string(),
+        "probe",
+        "--listen",
+        &format!("127.0.0.1:{pu_port}"),
+        "--identity",
+        &pu_key.path.display().to_string(),
+        "--region",
+        "us",
+        "--allow",
+        &hub_key.id.to_string(),
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let pe_args: Vec<String> = [
-        "probe", "--listen", &format!("127.0.0.1:{pe_port}"),
-        "--identity", &pe_key.path.display().to_string(),
-        "--region", "eu", "--allow", &hub_key.id.to_string(),
-        "--add-delay-ms", "100",
+        "probe",
+        "--listen",
+        &format!("127.0.0.1:{pe_port}"),
+        "--identity",
+        &pe_key.path.display().to_string(),
+        "--region",
+        "eu",
+        "--allow",
+        &hub_key.id.to_string(),
+        "--add-delay-ms",
+        "100",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let pu = procs.spawn("probe-us", &pu_args);
     let pe = procs.spawn("probe-eu", &pe_args);
-    procs.wait_stage(pu, pu_port, pu_key.id, Duration::from_secs(60)).await;
-    procs.wait_stage(pe, pe_port, pe_key.id, Duration::from_secs(60)).await;
+    procs
+        .wait_stage(pu, pu_port, pu_key.id, Duration::from_secs(60))
+        .await;
+    procs
+        .wait_stage(pe, pe_port, pe_key.id, Duration::from_secs(60))
+        .await;
 
     // The hub stands in "us" too, so "us" has two vantage points and "eu" one.
     let hub_port = free_udp_port();
     let hub_http = free_port();
     let hub_addr = format!("127.0.0.1:{hub_port}");
     let hub_args: Vec<String> = [
-        "hub", "--listen", &hub_addr, "--identity", &hub_key.path.display().to_string(),
-        "--http", &format!("127.0.0.1:{hub_http}"), "--region", "us",
-        "--probe", &format!("127.0.0.1:{pu_port}/{}", pu_key.id),
-        "--probe", &format!("127.0.0.1:{pe_port}/{}", pe_key.id),
+        "hub",
+        "--listen",
+        &hub_addr,
+        "--identity",
+        &hub_key.path.display().to_string(),
+        "--http",
+        &format!("127.0.0.1:{hub_http}"),
+        "--region",
+        "us",
+        "--probe",
+        &format!("127.0.0.1:{pu_port}/{}", pu_key.id),
+        "--probe",
+        &format!("127.0.0.1:{pe_port}/{}", pe_key.id),
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let hi = procs.spawn("hub", &hub_args);
-    procs.wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(hi, hub_port, hub_key.id, Duration::from_secs(120))
+        .await;
     let hub_flag = format!("{hub_addr}/{}", hub_key.id);
 
     let k1 = StageKey::new("s1");
     let p1 = free_udp_port();
     let args1: Vec<String> = [
-        "stage", "--model", &model, "--layers", "2:6",
-        "--listen", &format!("127.0.0.1:{p1}"),
-        "--identity", &k1.path.display().to_string(),
-        "--hub", &hub_flag, "--announce-every", "5",
-        "--n-gpu-layers", "0", "--act-dtype", "f32",
+        "stage",
+        "--model",
+        &model,
+        "--layers",
+        "2:6",
+        "--listen",
+        &format!("127.0.0.1:{p1}"),
+        "--identity",
+        &k1.path.display().to_string(),
+        "--hub",
+        &hub_flag,
+        "--announce-every",
+        "5",
+        "--n-gpu-layers",
+        "0",
+        "--act-dtype",
+        "f32",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
     let s1 = procs.spawn("stage1", &args1);
-    procs.wait_stage(s1, p1, k1.id, Duration::from_secs(120)).await;
+    procs
+        .wait_stage(s1, p1, k1.id, Duration::from_secs(120))
+        .await;
     wait_listed(&probe, &hub_addr, hub_key.id, 1, &procs).await;
 
     // The hub's JSON view carries one measurement per vantage point.
@@ -1057,7 +1299,9 @@ async fn region_fence_from_two_vantage_points() {
         .unwrap();
     let node = &listing["nodes"][0];
     assert_eq!(node["node_id"], k1.id.to_string(), "{listing:#}");
-    let probes = node["probes"].as_array().unwrap_or_else(|| panic!("{listing:#}"));
+    let probes = node["probes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{listing:#}"));
     assert_eq!(probes.len(), 3, "{listing:#}");
     let rtt = |region: &str, who: &str| -> f32 {
         probes
@@ -1077,11 +1321,29 @@ async fn region_fence_from_two_vantage_points() {
     let _ = std::fs::remove_file(&cache);
     let client_args = |port: u16, fence: &str| -> Vec<String> {
         [
-            "client", "--model", &model, "--head", "0:2", "--tail", "6:end",
-            "--hub", &hub_flag, "--directory-cache", &cache.display().to_string(),
-            "--region", fence,
-            "--n-gpu-layers", "0", "--act-dtype", "f32", "--max-sessions", "2", "--n-ctx", "512",
-            "--listen", &format!("127.0.0.1:{port}"),
+            "client",
+            "--model",
+            &model,
+            "--head",
+            "0:2",
+            "--tail",
+            "6:end",
+            "--hub",
+            &hub_flag,
+            "--directory-cache",
+            &cache.display().to_string(),
+            "--region",
+            fence,
+            "--n-gpu-layers",
+            "0",
+            "--act-dtype",
+            "f32",
+            "--max-sessions",
+            "2",
+            "--n-ctx",
+            "512",
+            "--listen",
+            &format!("127.0.0.1:{port}"),
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1091,7 +1353,12 @@ async fn region_fence_from_two_vantage_points() {
     let base = format!("http://127.0.0.1:{pc}");
     procs.wait_health(ci, &base, Duration::from_secs(120)).await;
     exercise(&procs, &base, &expected).await;
-    let status: Value = reqwest::get(format!("{base}/status")).await.unwrap().json().await.unwrap();
+    let status: Value = reqwest::get(format!("{base}/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(status["route"].as_array().unwrap().len(), 3, "{status:#}");
     assert_eq!(status["route"][1]["fenced"], "us", "{status:#}");
     assert_eq!(status["directory"]["fence"], "us:50", "{status:#}");

@@ -49,7 +49,9 @@ impl std::str::FromStr for ActDtype {
         match s.to_ascii_lowercase().as_str() {
             "f32" => Ok(ActDtype::F32),
             "f16" => Ok(ActDtype::F16),
-            other => Err(format!("unknown activation dtype {other:?} (expected f32 or f16)")),
+            other => Err(format!(
+                "unknown activation dtype {other:?} (expected f32 or f16)"
+            )),
         }
     }
 }
@@ -240,23 +242,38 @@ pub enum Request {
         p1: i32,
     },
     /// Free all state for a session along the route.
-    SessionClose { route: u64, session: u64 },
+    SessionClose {
+        route: u64,
+        session: u64,
+    },
     /// Tear the route down along the chain.
-    RouteClose { route: u64 },
+    RouteClose {
+        route: u64,
+    },
     Ping,
     /// Client to relay: pipe my streams to `first_hop` under `token`.
-    RelayOpen { token: [u8; 16], first_hop: NextHop },
+    RelayOpen {
+        token: [u8; 16],
+        first_hop: NextHop,
+    },
     /// Last hop to relay: pipe my one-way streams to the client holding `token`.
-    RelayAttach { token: [u8; 16] },
+    RelayAttach {
+        token: [u8; 16],
+    },
     /// Cloaked node to relay: bind a public port for me and tunnel its datagrams on this
     /// stream. The reply is `RelayListening`; the stream then carries packet frames.
     RelayListen,
     /// Node to hub: list me. The hub verifies the signature and dials the first address.
-    Announce { record: SignedRecord },
+    Announce {
+        record: SignedRecord,
+    },
     /// Anyone to hub: the current signed directory.
     DirectoryGet,
     /// Hub to probe: ping `addr` (pinned to `node_id`) and report the round trip.
-    Probe { addr: String, node_id: [u8; 32] },
+    Probe {
+        addr: String,
+        node_id: [u8; 32],
+    },
     /// Fetch `len` bytes at `offset` of shard `split` of the model with id `model_id`
     /// from a node that holds it. Replies `Shard`.
     ShardGet {
@@ -294,7 +311,9 @@ pub enum Response {
         node_id: [u8; 32],
     },
     /// The route is set up; `hops` nodes acknowledged.
-    RouteOk { hops: u32 },
+    RouteOk {
+        hops: u32,
+    },
     Ack,
     ForwardOk {
         session: u64,
@@ -304,17 +323,46 @@ pub enum Response {
     },
     Pong,
     /// The public `host:port` the relay forwards to the cloaked node.
-    RelayListening { addr: String },
+    RelayListening {
+        addr: String,
+    },
     /// A probe's answer: best-of-three round trip and the probe's region label.
-    Probed { rtt_ms: f32, region: String },
-    Directory { directory: SignedDirectory },
+    Probed {
+        rtt_ms: f32,
+        region: String,
+    },
+    Directory {
+        directory: SignedDirectory,
+    },
     /// A piece of a shard file; `total` is the file's full length.
     Shard {
         total: u64,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    Error { code: ErrorCode, message: String },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
+}
+
+impl Response {
+    /// A bounded diagnostic label that never includes model states, addresses,
+    /// directory contents, shard data, or peer-controlled error text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::HelloOk { .. } => "HelloOk",
+            Self::RouteOk { .. } => "RouteOk",
+            Self::Ack => "Ack",
+            Self::ForwardOk { .. } => "ForwardOk",
+            Self::Pong => "Pong",
+            Self::RelayListening { .. } => "RelayListening",
+            Self::Probed { .. } => "Probed",
+            Self::Directory { .. } => "Directory",
+            Self::Shard { .. } => "Shard",
+            Self::Error { .. } => "Error",
+        }
+    }
 }
 
 /// A result delivered to a return target (direct or relay mode) on a one-way stream.
@@ -353,8 +401,9 @@ pub struct NodeRecord {
     pub region: String,
     /// Hardware attestation; always false until phase 2.
     pub attested: bool,
-    /// The addresses belong to relays; the node itself accepts no inbound connections
-    /// and cannot be placed by timing.
+    /// Addresses are onion services or relay tunnels, not the node's direct listener.
+    /// Geographic probes are not meaningful for these addresses. This flag is not
+    /// proof of anonymity or resistance to traffic correlation.
     pub cloaked: bool,
     /// Unix seconds when the record was made, and how long it is valid.
     pub issued_at: u64,
@@ -429,9 +478,7 @@ pub fn forward_frame_limit(n_tokens: u32, n_embd: u32) -> u32 {
     let payload = (n_tokens as u64)
         .saturating_mul(n_embd as u64)
         .saturating_mul(4);
-    payload
-        .saturating_add(65536)
-        .min(MAX_FRAME_BYTES as u64) as u32
+    payload.saturating_add(65536).min(MAX_FRAME_BYTES as u64) as u32
 }
 
 /// Write one length-prefixed postcard frame.
@@ -440,9 +487,13 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let body = postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let body =
+        postcard::to_stdvec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if body.len() > MAX_FRAME_BYTES as usize {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let len = (body.len() as u32).to_le_bytes();
     w.write_all(&len).await?;
@@ -475,9 +526,38 @@ where
             format!("frame of {len} bytes exceeds the {max} byte limit"),
         ));
     }
-    let mut body = vec![0u8; len as usize];
-    r.read_exact(&mut body).await?;
+    let body = read_frame_body(r, len).await?;
     postcard::from_bytes(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Read an already length-checked frame body without allocating its advertised
+/// length up front. The caller applies its smaller message-specific limit first.
+/// A header-only peer costs one small read buffer; storage grows with received
+/// payload. Reads consume exactly `len` bytes, preserving subsequent frames.
+pub async fn read_frame_body<R>(r: &mut R, len: u32) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 16 << 10];
+    while body.len() < len as usize {
+        let n = chunk.len().min(len as usize - body.len());
+        r.read_exact(&mut chunk[..n]).await?;
+        body.try_reserve(n).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "could not allocate frame buffer",
+            )
+        })?;
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok(body)
 }
 
 /// Cheap identity for a GGUF file so the client and every stage can confirm they
@@ -507,6 +587,40 @@ pub fn model_fingerprint(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn header_only_peer_does_not_receive_a_full_frame_sized_buffer() {
+        struct HeaderOnly {
+            header: std::io::Cursor<Vec<u8>>,
+            body_buffer: usize,
+        }
+        impl AsyncRead for HeaderOnly {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                if self.header.position() < self.header.get_ref().len() as u64 {
+                    return std::pin::Pin::new(&mut self.header).poll_read(cx, buf);
+                }
+                self.body_buffer = buf.remaining();
+                // End after just the header. The size of the first requested
+                // body buffer reveals whether allocation preceded any payload.
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut reader = HeaderOnly {
+            header: std::io::Cursor::new((8u32 << 20).to_le_bytes().to_vec()),
+            body_buffer: 0,
+        };
+        let result = read_frame_max::<_, Request>(&mut reader, 8 << 20).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            reader.body_buffer <= 64 << 10,
+            "reserved {} bytes before receiving any payload",
+            reader.body_buffer
+        );
+    }
 
     #[test]
     fn activations_roundtrip_f32() {
@@ -541,13 +655,46 @@ mod tests {
         let back: Request = read_frame(&mut cur).await.unwrap();
         match back {
             Request::Forward {
-                session, seq, pos0, act, ..
+                session,
+                seq,
+                pos0,
+                act,
+                ..
             } => {
                 assert_eq!((session, seq, pos0), (7, 3, 10));
                 assert_eq!(act.n_tokens, 2);
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn large_frame_roundtrip_preserves_the_next_frame() {
+        let req = Request::Forward {
+            route: 1,
+            session: 2,
+            seq: 3,
+            pos0: 0,
+            act: Activations::from_f32(&vec![0.5; 32769], 1, 32769, ActDtype::F32),
+            hops: vec![],
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &req).await.unwrap();
+        write_frame(&mut bytes, &Request::Ping).await.unwrap();
+        let mut reader = std::io::Cursor::new(bytes);
+        let back: Request = read_frame(&mut reader).await.unwrap();
+        assert_eq!(
+            postcard::to_stdvec(&back).unwrap(),
+            postcard::to_stdvec(&req).unwrap()
+        );
+        assert!(matches!(
+            read_frame::<_, Request>(&mut reader).await.unwrap(),
+            Request::Ping
+        ));
+        let truncated = read_frame_body(&mut std::io::Cursor::new(vec![0; 17000]), 18000)
+            .await
+            .unwrap_err();
+        assert_eq!(truncated.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

@@ -6,12 +6,11 @@
 //! directory do not all pile onto one node.
 
 use crate::config::{LayerRange, RegionFence, StageEndpoint};
-use dfin_net::directory::{verify_directory, verify_record};
+use dfin_net::directory::{validate_record, verify_directory, verify_record};
 use dfin_net::transport::CONTROL_TIMEOUT;
 use dfin_net::{Endpoint, NodeId};
 use dfin_proto::{
     Directory, NextHop, NodeRecord, Request, Response, SignedDirectory, MAX_DIRECTORY_BYTES,
-    PROTOCOL_VERSION,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -45,6 +44,13 @@ pub async fn fetch_async(
     hub: &NextHop,
 ) -> Result<(SignedDirectory, Directory), String> {
     let hub_id = NodeId(hub.node_id);
+    // A hub must not learn the client identity used for inference or shard fetching.
+    let isolated = if endpoint.is_private() {
+        Some(endpoint.isolated_client().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let endpoint = isolated.as_ref().unwrap_or(endpoint);
     let conn = endpoint
         .connect(&hub.addr, hub_id)
         .await
@@ -59,7 +65,13 @@ pub async fn fetch_async(
         Response::Error { code, message } => {
             return Err(format!("hub {} ({code:?}): {message}", hub.addr))
         }
-        other => return Err(format!("hub {}: unexpected reply {other:?}", hub.addr)),
+        other => {
+            return Err(format!(
+                "hub {}: unexpected reply {}",
+                hub.addr,
+                other.kind()
+            ))
+        }
     };
     let dir = verify_directory(&signed, &hub_id)
         .map_err(|e| format!("hub {}: directory does not verify: {e}", hub.addr))?;
@@ -78,6 +90,22 @@ pub fn save_cache(path: &Path, signed: &SignedDirectory) {
             tracing::warn!("cannot write directory cache {}: {e}", path.display());
         }
     }
+}
+
+/// Filter even signed/cache-sourced records: a signature does not make a direct target private.
+pub fn onion_only(dir: &mut Directory) {
+    dir.entries.retain(|entry| {
+        verify_record(&entry.record).is_ok_and(|r| {
+            r.cloaked
+                && !r.attested
+                && r.region.is_empty()
+                && r.backend.is_empty()
+                && !r.addrs.is_empty()
+                && r.addrs
+                    .iter()
+                    .all(|a| dfin_net::privacy::onion_target(a).is_ok())
+        })
+    });
 }
 
 /// A verified, unexpired record that serves the right model.
@@ -116,12 +144,9 @@ fn candidates(
         let Ok(record) = verify_record(&e.record) else {
             continue;
         };
-        if record.protocol != PROTOCOL_VERSION
+        if validate_record(&record, now).is_err()
             || record.model_fingerprint != fingerprint
             || record.n_embd != n_embd
-            || record.expires_at() <= now
-            || record.addrs.is_empty()
-            || record.layer_end <= record.layer_begin
         {
             continue;
         }
@@ -202,9 +227,7 @@ pub fn select_route(
                 };
                 let better = match best.get(&r.layer_end) {
                     None => true,
-                    Some(b) => {
-                        (next.hops.len(), next.rtt_sum) < (b.hops.len(), b.rtt_sum)
-                    }
+                    Some(b) => (next.hops.len(), next.rtt_sum) < (b.hops.len(), b.rtt_sum),
                 };
                 if better {
                     best.insert(r.layer_end, next);
@@ -251,7 +274,7 @@ mod tests {
     use super::*;
     use dfin_net::directory::sign_record;
     use dfin_net::NodeKey;
-    use dfin_proto::{ActDtype, DirectoryEntry};
+    use dfin_proto::{ActDtype, DirectoryEntry, PROTOCOL_VERSION};
 
     fn entry(key: &NodeKey, begin: i32, end: i32, rtt: f32, fp: &str) -> DirectoryEntry {
         let record = NodeRecord {
@@ -294,7 +317,13 @@ mod tests {
         e
     }
 
-    fn sel(d: &Directory, begin: i32, end: i32, exclude: &HashSet<NodeId>, fence: Option<&RegionFence>) -> Option<Vec<StageEndpoint>> {
+    fn sel(
+        d: &Directory,
+        begin: i32,
+        end: i32,
+        exclude: &HashSet<NodeId>,
+        fence: Option<&RegionFence>,
+    ) -> Option<Vec<StageEndpoint>> {
         select_route(d, 1010, "fp", 64, begin, end, exclude, fence).route
     }
 
@@ -304,6 +333,100 @@ mod tests {
             issued_at: 1000,
             entries,
         }
+    }
+
+    #[test]
+    fn private_selection_rejects_signed_direct_and_mixed_records() {
+        let key = NodeKey::generate();
+        let direct = entry(&key, 2, 6, 1.0, "fp");
+        let mut record = verify_record(&direct.record).unwrap();
+        record.addrs = vec![format!("{}.onion:7001", "a".repeat(56))];
+        record.cloaked = true;
+        record.backend.clear();
+        let mut onion = direct.clone();
+        onion.record = sign_record(&key, &record).unwrap();
+        record.addrs.push("127.0.0.1:7001".into());
+        let mut mixed = direct.clone();
+        mixed.record = sign_record(&key, &record).unwrap();
+        let mut directory = dir(vec![direct, onion, mixed]);
+        onion_only(&mut directory);
+        assert_eq!(directory.entries.len(), 1);
+        assert!(sel(&directory, 2, 6, &HashSet::new(), None).unwrap()[0]
+            .addr
+            .ends_with(".onion:7001"));
+    }
+
+    #[test]
+    fn signed_cached_records_must_have_bounded_lifetimes_and_valid_fields() {
+        use dfin_net::directory::sign_directory;
+        use dfin_proto::{MAX_CLOCK_SKEW_SECS, MAX_RECORD_TTL_SECS};
+
+        let node = NodeKey::generate();
+        let hub = NodeKey::generate();
+        let original = entry(&node, 2, 6, 1.0, "fp");
+        let mutations: &[(&str, fn(&mut NodeRecord))] = &[
+            ("future", |r| r.issued_at = 1010 + MAX_CLOCK_SKEW_SECS + 1),
+            ("overflow", |r| r.issued_at = u64::MAX),
+            ("excessive lifetime", |r| {
+                r.ttl_secs = MAX_RECORD_TTL_SECS + 1
+            }),
+            ("zero lifetime", |r| {
+                r.issued_at = 1011;
+                r.ttl_secs = 0;
+            }),
+            ("expired", |r| {
+                r.issued_at = 1000;
+                r.ttl_secs = 10;
+            }),
+            ("range outside model", |r| r.n_layer = 5),
+            ("too many addresses", |r| {
+                r.addrs = vec!["10.0.0.1:7001".into(); 9]
+            }),
+            ("oversized address", |r| r.addrs = vec!["a".repeat(129)]),
+            ("oversized description", |r| r.model_name = "m".repeat(257)),
+        ];
+        let path =
+            std::env::temp_dir().join(format!("dfin-cache-test-{:016x}", rand::random::<u64>()));
+        let hub_hop = NextHop {
+            addr: "unused".into(),
+            node_id: hub.id().0,
+        };
+        for (case, mutate) in mutations {
+            let mut record = verify_record(&original.record).unwrap();
+            mutate(&mut record);
+            let mut entry = original.clone();
+            entry.record = sign_record(&node, &record).unwrap();
+            let mut directory = dir(vec![entry]);
+            directory.hub_id = hub.id().0;
+            save_cache(&path, &sign_directory(&hub, &directory).unwrap());
+            let cached = load_cache(&path, &hub_hop).expect("authentic hub signature");
+            std::fs::remove_file(&path).unwrap();
+            let selected = select_route(&cached, 1010, "fp", 64, 2, 6, &HashSet::new(), None);
+            assert!(
+                selected.route.is_none(),
+                "accepted signed cached record: {case}"
+            );
+            assert_eq!(selected.usable, 0, "{case}");
+        }
+
+        // Consumers can use records older than the announcement clock-skew limit
+        // while their bounded TTL remains valid, including during a hub outage.
+        let mut valid = original.clone();
+        let mut record = verify_record(&valid.record).unwrap();
+        record.ttl_secs = MAX_RECORD_TTL_SECS;
+        valid.record = sign_record(&node, &record).unwrap();
+        assert!(select_route(
+            &dir(vec![valid]),
+            3010,
+            "fp",
+            64,
+            2,
+            6,
+            &HashSet::new(),
+            None
+        )
+        .route
+        .is_some());
     }
 
     #[test]
@@ -336,7 +459,11 @@ mod tests {
         assert_eq!((s.listed, s.usable, s.fenced_out), (6, 4, 0));
         let route = s.route.unwrap();
         assert_eq!(route.len(), 1);
-        assert_eq!(route[0].node_id, c.id(), "one hop beats two, lower rtt beats higher");
+        assert_eq!(
+            route[0].node_id,
+            c.id(),
+            "one hop beats two, lower rtt beats higher"
+        );
 
         let exclude: HashSet<NodeId> = [c.id()].into_iter().collect();
         assert_eq!(sel(&d_, 2, 6, &exclude, None).unwrap()[0].node_id, d.id());
@@ -368,13 +495,19 @@ mod tests {
         )
         .unwrap();
         let d_ = dir(vec![
-            probed(entry(&near, 2, 6, 5.0, "fp"), &[("us", 20.0), ("us", 35.0), ("eu", 90.0)]),
+            probed(
+                entry(&near, 2, 6, 5.0, "fp"),
+                &[("us", 20.0), ("us", 35.0), ("eu", 90.0)],
+            ),
             probed(entry(&far, 2, 6, 1.0, "fp"), &[("us", 10.0), ("us", 70.0)]),
             entry(&unknown, 2, 6, 0.5, "fp"),
             probed(cl, &[("us", 1.0)]),
         ]);
         // No fence: the lowest hub round trip wins (the cloaked one).
-        assert_eq!(sel(&d_, 2, 6, &HashSet::new(), None).unwrap()[0].node_id, cloaked.id());
+        assert_eq!(
+            sel(&d_, 2, 6, &HashSet::new(), None).unwrap()[0].node_id,
+            cloaked.id()
+        );
         // us:50 admits only the near node: far fails its second probe, unknown has none,
         // cloaked is never inside a fence.
         let fence: RegionFence = "us:50".parse().unwrap();
@@ -385,7 +518,10 @@ mod tests {
         assert_eq!(s.fenced_out, 3);
         // us:80 admits far as well, and it has the lower hub round trip.
         let fence: RegionFence = "us:80".parse().unwrap();
-        assert_eq!(sel(&d_, 2, 6, &HashSet::new(), Some(&fence)).unwrap()[0].node_id, far.id());
+        assert_eq!(
+            sel(&d_, 2, 6, &HashSet::new(), Some(&fence)).unwrap()[0].node_id,
+            far.id()
+        );
         // eu:50 admits nobody.
         let fence: RegionFence = "eu:50".parse().unwrap();
         assert!(sel(&d_, 2, 6, &HashSet::new(), Some(&fence)).is_none());
@@ -469,12 +605,18 @@ mod tests {
             assert_eq!(s.listed, d_.entries.len());
             assert!(s.fenced_out <= s.usable && s.usable <= s.listed);
             let Some(route) = s.route else { continue };
-            assert!(begin == end || !route.is_empty(), "round {round}: empty route");
+            assert!(
+                begin == end || !route.is_empty(),
+                "round {round}: empty route"
+            );
             let mut cur = begin;
             for hop in &route {
                 assert_eq!(hop.layers.begin, cur, "round {round}: gap in the chain");
                 assert!(hop.layers.end > hop.layers.begin, "round {round}");
-                assert!(!hop.addr.is_empty(), "round {round}: hop without an address");
+                assert!(
+                    !hop.addr.is_empty(),
+                    "round {round}: hop without an address"
+                );
                 if let Some(f) = &fence {
                     assert!(!hop.cloaked, "round {round}: cloaked hop inside a fence");
                     assert_eq!(hop.fenced.as_deref(), Some(f.region.as_str()));

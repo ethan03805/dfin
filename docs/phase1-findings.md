@@ -22,7 +22,9 @@ Running notes for design v0.2 phase 1, the encrypted chain. Protocol contract:
   or through a relay.
 - **`dfin relay`.** A stream pipe keyed by a client-chosen token. The client reaches the
   first hop through it and the last hop delivers results to it, so no stage sees the
-  client's address. The relay sees addresses and ciphertext.
+  client's address. **Privacy correction, 7 November:** the application relay terminates
+  transport encryption and can inspect activation frames. Only sealed route instructions
+  remain encrypted to the stages; the earlier ciphertext-only description was incorrect.
 - **Launchers and tests.** `dfin pod` generates a key per stage and probes readiness over
   QUIC (`--relay` adds a relay); `dfin bench --return` and `--relay` select the mode.
   Tests: transport and sealing (8), protocol with one stage and a two-stage chain in

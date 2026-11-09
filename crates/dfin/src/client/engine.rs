@@ -5,9 +5,9 @@
 //! on a `tokio::sync::mpsc` channel (`blocking_recv`) and events go back on a
 //! per-job channel (`blocking_send`).
 
-use super::sampling::{Sampler, SamplingParams};
 use super::directory::{self, DirectoryInfo};
 use super::route::{HopCounters, ReturnPolicy, Route, RouteCounters, RouteError};
+use super::sampling::{Sampler, SamplingParams};
 use super::text::{StopMatcher, Utf8Accumulator};
 use crate::config::{LayerRange, RegionFence, RouteConfig, StageEndpoint, StageEndpointToml};
 use anyhow::Context as _;
@@ -50,6 +50,16 @@ pub struct Job {
     pub prompt: PromptInput,
     pub params: GenParams,
     pub events: mpsc::Sender<Event>,
+}
+
+impl Job {
+    fn check_cancelled(&self) -> Result<(), EngineErr> {
+        if self.events.is_closed() {
+            Err(EngineErr::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -132,6 +142,7 @@ pub enum Event {
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
+    pub network: crate::network::Network,
     /// The GGUF to load (a single file or the first split of a shard set).
     pub model_path: PathBuf,
     /// Model identity for `Hello` and the directory: a shard set's model id, or the
@@ -179,6 +190,7 @@ pub struct RouteEntry {
 /// Facts fixed at startup, for `/status`.
 #[derive(Clone, Debug)]
 pub struct StaticInfo {
+    pub private_network: bool,
     pub model_path: PathBuf,
     pub n_layer: i32,
     pub n_embd: i32,
@@ -287,9 +299,23 @@ impl Resolver {
         rt: &tokio::runtime::Handle,
         endpoint: &Endpoint,
         exclude: &HashSet<NodeId>,
+        caller: Option<&mpsc::Sender<Event>>,
     ) -> Result<Vec<StageEndpoint>, String> {
         let now = crate::hub::unix_now();
-        let (dir, from_cache) = match directory::fetch(rt, endpoint, &self.hub) {
+        let fetched = match caller {
+            Some(events) => rt.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = events.closed() => Err("request cancelled".into()),
+                    result = directory::fetch_async(endpoint, &self.hub) => result,
+                }
+            }),
+            None => directory::fetch(rt, endpoint, &self.hub),
+        };
+        if caller.is_some_and(|events| events.is_closed()) {
+            return Err("request cancelled".into());
+        }
+        let (mut dir, from_cache) = match fetched {
             Ok((signed, dir)) => {
                 if let Some(c) = &self.cache {
                     directory::save_cache(c, &signed);
@@ -298,12 +324,19 @@ impl Resolver {
             }
             Err(e) => {
                 tracing::warn!("{e}; trying the cached directory");
-                match self.cache.as_ref().and_then(|c| directory::load_cache(c, &self.hub)) {
+                match self
+                    .cache
+                    .as_ref()
+                    .and_then(|c| directory::load_cache(c, &self.hub))
+                {
                     Some(dir) => (dir, true),
                     None => return Err(e),
                 }
             }
         };
+        if endpoint.is_private() {
+            directory::onion_only(&mut dir);
+        }
         let sel = directory::select_route(
             &dir,
             now,
@@ -321,7 +354,10 @@ impl Resolver {
             from_cache,
             nodes_listed: listed,
             nodes_usable: usable,
-            fence: self.fence.as_ref().map(|f| format!("{}:{}", f.region, f.max_rtt_ms)),
+            fence: self
+                .fence
+                .as_ref()
+                .map(|f| format!("{}:{}", f.region, f.max_rtt_ms)),
             nodes_fenced_out: fenced_out,
         };
         let route = sel.route.ok_or_else(|| {
@@ -384,7 +420,10 @@ pub async fn spawn(
     let (job_tx, job_rx) = mpsc::channel::<Job>(queue.max(1));
     let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<StaticInfo>>();
     // One ephemeral client key per daemon start; stages see this instead of an account.
-    let endpoint = Endpoint::client(NodeKey::generate()).context("creating QUIC endpoint")?;
+    let endpoint = cfg
+        .network
+        .client(NodeKey::generate())
+        .context("creating network endpoint")?;
     let rt = tokio::runtime::Handle::current();
     std::thread::Builder::new()
         .name("dfin-engine".into())
@@ -456,7 +495,7 @@ impl Engine {
                 info: DirectoryInfo::default(),
             };
             let stages = res
-                .resolve(&rt, &endpoint, &HashSet::new())
+                .resolve(&rt, &endpoint, &HashSet::new(), None)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             (stages, Some(res))
         } else {
@@ -545,7 +584,12 @@ impl Engine {
         let head_out = head.n_embd_out();
         let tail_in = tail.n_embd_inp();
         if head_out != n_embd as usize || tail_in != n_embd as usize {
-            tracing::info!(head_out, tail_in, n_embd, "stage state is wider than n_embd");
+            tracing::info!(
+                head_out,
+                tail_in,
+                n_embd,
+                "stage state is wider than n_embd"
+            );
         }
         tracing::info!(
             n_ctx = head.n_ctx(),
@@ -579,7 +623,7 @@ impl Engine {
                 tail_in as u32,
                 prefill_chunk as u32,
             );
-            connect_with_backoff(&mut route, Duration::from_secs(60))
+            connect_with_backoff(&mut route, Duration::from_secs(60), &rt, None)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             Some(route)
         };
@@ -597,6 +641,7 @@ impl Engine {
         let route_info = route_entries(cfg.head, tail_range, route.as_ref());
 
         let info = StaticInfo {
+            private_network: endpoint.is_private(),
             model_path: cfg.model_path.clone(),
             n_layer,
             n_embd,
@@ -645,17 +690,56 @@ impl Engine {
 
     fn run(mut self, mut jobs: mpsc::Receiver<Job>) {
         while let Some(job) = jobs.blocking_recv() {
+            // A queued request may have lost its caller before the engine gets it.
+            // Do not tokenize it or create any observable network activity.
+            if job.events.is_closed() {
+                continue;
+            }
             let events = job.events.clone();
             self.stats.lock().requests += 1;
             if let Err(e) = self.process(job) {
-                if let Some(api) = e.into_api() {
+                if let Some(api) = e.into_api().filter(|_| !events.is_closed()) {
                     tracing::warn!(status = api.status, "request failed: {}", api.message);
                     let _ = events.blocking_send(Event::Error(api));
                 }
             }
+            self.finish_private_request();
             self.publish_stats();
         }
         tracing::info!("job queue closed; engine thread exiting");
+    }
+
+    /// Privacy contexts are HTTP requests, not daemon lifetimes. Remote routes and
+    /// local prefix caches are released on success, error, and cancellation alike.
+    fn finish_private_request(&mut self) {
+        if !self.endpoint.is_private() {
+            return;
+        }
+        if let Some(route) = &mut self.route {
+            route.disconnect();
+        }
+        self.endpoint.close();
+        for idx in 0..self.sessions.len() {
+            self.reset_session(idx);
+        }
+    }
+
+    fn start_private_request(&mut self) -> Result<(), EngineErr> {
+        if !self.endpoint.is_private() {
+            return Ok(());
+        }
+        let fresh = self
+            .endpoint
+            .isolated_client()
+            .map_err(|e| EngineErr::Other(e.to_string()))?;
+        self.endpoint.close();
+        self.endpoint = fresh;
+        // A daemon-wide counter would link otherwise fresh identities across requests.
+        self.seq = 0;
+        if let Some(route) = &mut self.route {
+            route.replace_endpoint(self.endpoint.clone());
+        }
+        Ok(())
     }
 
     fn publish_stats(&self) {
@@ -675,7 +759,10 @@ impl Engine {
     /// Rebuild the route if it dropped. With a hub, ask the directory again and prefer a
     /// chain that avoids the nodes of the broken route. The stages' session state is then
     /// unknown, so every cached session is dropped.
-    fn ensure_connected(&mut self) -> Result<(), EngineErr> {
+    fn ensure_connected(&mut self, events: &mpsc::Sender<Event>) -> Result<(), EngineErr> {
+        if events.is_closed() {
+            return Err(EngineErr::Cancelled);
+        }
         let Some(route) = &mut self.route else {
             return Ok(());
         };
@@ -686,7 +773,7 @@ impl Engine {
         let rebuilds = route.counters.rebuilds + 1;
         if let Some(res) = &mut self.resolver {
             let exclude: HashSet<NodeId> = route.hops.iter().map(|h| h.node_id).collect();
-            match res.resolve(&self.rt, &self.endpoint, &exclude) {
+            match res.resolve(&self.rt, &self.endpoint, &exclude, Some(events)) {
                 Ok(stages) if stages != route.hops => {
                     let mut fresh = Route::new(
                         stages,
@@ -699,22 +786,30 @@ impl Engine {
                         self.tail_in as u32,
                         self.prefill_chunk as u32,
                     );
-                    connect_with_backoff(&mut fresh, Duration::from_secs(5))?;
+                    connect_with_backoff(
+                        &mut fresh,
+                        Duration::from_secs(5),
+                        &self.rt,
+                        Some(events),
+                    )?;
                     fresh.counters.rebuilds = rebuilds;
                     *route = fresh;
                 }
                 Ok(_) => {
-                    connect_with_backoff(route, Duration::from_secs(5))?;
+                    connect_with_backoff(route, Duration::from_secs(5), &self.rt, Some(events))?;
                     route.counters.rebuilds = rebuilds;
                 }
                 Err(e) => {
+                    if events.is_closed() {
+                        return Err(EngineErr::Cancelled);
+                    }
                     tracing::warn!("{e}; retrying the previous route");
-                    connect_with_backoff(route, Duration::from_secs(5))?;
+                    connect_with_backoff(route, Duration::from_secs(5), &self.rt, Some(events))?;
                     route.counters.rebuilds = rebuilds;
                 }
             }
         } else {
-            connect_with_backoff(route, Duration::from_secs(5))?;
+            connect_with_backoff(route, Duration::from_secs(5), &self.rt, Some(events))?;
             route.counters.rebuilds = rebuilds;
         }
         {
@@ -854,6 +949,7 @@ impl Engine {
     }
 
     fn process(&mut self, job: Job) -> Result<(), EngineErr> {
+        job.check_cancelled()?;
         let prompt = match self.tokenize(&job.prompt) {
             Ok(t) => t,
             Err(e) => {
@@ -878,7 +974,21 @@ impl Engine {
         if self.sessions.iter().all(|s| s.busy) {
             return reject(ApiError::overloaded("all sessions busy"));
         }
-        self.ensure_connected()?;
+        job.check_cancelled()?;
+        self.start_private_request()?;
+        // A private endpoint belongs to this request alone. Closing it interrupts
+        // SOCKS, TLS, setup, and a stalled forward immediately when the HTTP caller
+        // disappears. Abort the watcher on completion so it cannot outlive the job.
+        let _cancel_route = self.endpoint.is_private().then(|| {
+            let endpoint = self.endpoint.clone();
+            let events = job.events.clone();
+            tokio_util::task::AbortOnDropHandle::new(self.rt.spawn(async move {
+                events.closed().await;
+                endpoint.close();
+            }))
+        });
+        self.ensure_connected(&job.events)?;
+        job.check_cancelled()?;
         let max_tokens = (job.params.max_tokens as usize).min(self.per_session_ctx - prompt.len());
 
         let Some((idx, common)) = self.acquire_session(&prompt)? else {
@@ -928,6 +1038,7 @@ impl Engine {
         let mut logits = None;
         let t_prefill = Instant::now();
         for (ci, chunk) in suffix.chunks(self.prefill_chunk).enumerate() {
+            job.check_cancelled()?;
             let last = ci + 1 == n_chunks;
             let out = self.forward(id, slot, pos as i32, chunk, last)?;
             self.sessions[idx].tokens.extend_from_slice(chunk);
@@ -964,6 +1075,7 @@ impl Engine {
         let mut stopped_by_string = false;
 
         while completion < max_tokens {
+            job.check_cancelled()?;
             let t_step = Instant::now();
             let tok = sampler.sample(&logits) as Token;
             if vocab.is_eog(tok) {
@@ -1150,10 +1262,18 @@ fn route_entries(head: LayerRange, tail: LayerRange, route: Option<&Route>) -> V
 
 /// Set the route up, retrying transport failures with exponential backoff until
 /// `budget` elapses. Protocol-level rejections (wrong model, wrong layers) are not retried.
-fn connect_with_backoff(route: &mut Route, budget: Duration) -> Result<(), RouteError> {
+fn connect_with_backoff(
+    route: &mut Route,
+    budget: Duration,
+    rt: &tokio::runtime::Handle,
+    caller: Option<&mpsc::Sender<Event>>,
+) -> Result<(), RouteError> {
     let deadline = Instant::now() + budget;
     let mut delay = Duration::from_millis(250);
     loop {
+        if caller.is_some_and(|events| events.is_closed()) {
+            return Err(dfin_net::NetError::Closed("request cancelled".into()).into());
+        }
         match route.connect() {
             Ok(()) => return Ok(()),
             Err(e @ RouteError::Protocol(_)) => return Err(e),
@@ -1163,7 +1283,16 @@ fn connect_with_backoff(route: &mut Route, budget: Duration) -> Result<(), Route
                     return Err(e);
                 }
                 tracing::debug!("{e}; retrying in {delay:?}");
-                std::thread::sleep(delay);
+                rt.block_on(async {
+                    if let Some(events) = caller {
+                        tokio::select! {
+                            _ = events.closed() => {},
+                            _ = tokio::time::sleep(delay) => {},
+                        }
+                    } else {
+                        tokio::time::sleep(delay).await;
+                    }
+                });
                 delay = (delay * 2).min(Duration::from_secs(4));
             }
         }

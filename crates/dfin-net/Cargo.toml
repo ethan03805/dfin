@@ -1,8 +1,9 @@
 [package]
 name = "dfin-net"
-description = "Node identities and the authenticated QUIC transport between dfin clients, stages and relays"
+description = "Node identities and authenticated Tor/TLS and explicit direct QUIC transports for dfin"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -16,6 +17,11 @@ rand.workspace = true
 serde.workspace = true
 postcard.workspace = true
 sha2.workspace = true
+futures.workspace = true
+tokio-util = { workspace = true, features = ["compat", "rt"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+yamux = "0.14.1"
+tor-socksproto = { version = "0.48", default-features = false, features = ["client-handshake"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

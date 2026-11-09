@@ -3,6 +3,7 @@ name = "dfin-fuzz"
 description = "Fuzz targets for everything dfin decodes from a peer: each must return, never panic, on any input"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

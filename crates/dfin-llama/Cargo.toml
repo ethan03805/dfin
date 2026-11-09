@@ -3,6 +3,7 @@ name = "dfin-llama"
 description = "Safe wrapper over the layer-range patched libllama: models, partial models, contexts, batches"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

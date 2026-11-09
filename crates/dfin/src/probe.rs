@@ -60,7 +60,7 @@ pub async fn run(args: ProbeArgs) -> anyhow::Result<()> {
         .next()
         .with_context(|| format!("{} resolved to nothing", args.listen))?;
     let endpoint =
-        Endpoint::server(key, listen).with_context(|| format!("listening on {listen}"))?;
+        Endpoint::direct_server(key, listen).with_context(|| format!("listening on {listen}"))?;
     info!(
         "probe ready on {} node {} region {:?}",
         endpoint.local_addr()?,
@@ -130,7 +130,9 @@ impl Probe {
                 };
                 let resp = match req {
                     Request::Ping => Response::Pong,
-                    Request::Probe { addr, node_id } => probe.handle(peer, &addr, NodeId(node_id)).await,
+                    Request::Probe { addr, node_id } => {
+                        probe.handle(peer, &addr, NodeId(node_id)).await
+                    }
                     _ => error(ErrorCode::BadRequest, "this node is a probe"),
                 };
                 if let Err(e) = reply(&mut send, &resp).await {

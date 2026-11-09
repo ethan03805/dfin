@@ -33,14 +33,21 @@ pub struct Shared {
 pub type AppState = Arc<Shared>;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let private = state.info.private_network;
+    let router = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/status", get(status))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state)
+        .with_state(state);
+    if private {
+        router.layer(axum::middleware::from_fn(
+            crate::network::local_request_only,
+        ))
+    } else {
+        router.layer(tower_http::cors::CorsLayer::permissive())
+    }
 }
 
 pub fn unix_now() -> u64 {
@@ -118,6 +125,15 @@ async fn status(State(st): State<AppState>) -> Json<Value> {
     };
     Json(json!({
         "model": st.model_name,
+        "privacy": {
+            "network": if st.info.private_network { "tor" } else { "direct" },
+            "direct_fallback": false,
+            "request_identity_rotation": st.info.private_network,
+            "cross_request_prefix_cache": !st.info.private_network,
+            "content_confidential_from_nodes": false,
+            "relay_can_read_model_states": st.info.return_mode == "relay" && !stage_entries.is_empty(),
+            "attestation_verified": false,
+        },
         "model_path": st.info.model_path.display().to_string(),
         "n_layer": st.info.n_layer,
         "n_embd": st.info.n_embd,
@@ -175,7 +191,6 @@ struct StreamOptions {
 #[derive(Deserialize)]
 struct CommonFields {
     #[serde(default)]
-    #[allow(dead_code)]
     model: Option<String>,
     max_tokens: Option<u32>,
     max_completion_tokens: Option<u32>,
@@ -230,19 +245,46 @@ const KNOWN_COMMON: &[&str] = &[
     "stream_options",
 ];
 
-/// Warn once per process for each request field we accept but ignore
-/// (`tools`, `tool_choice`, `response_format`, `logprobs`, `n`, penalties, `user`, ...).
-/// Tool-call parsing is a Phase 0 TODO.
+const UNSUPPORTED_COMMON: &[&str] = &[
+    "tools",
+    "tool_choice",
+    "response_format",
+    "logprobs",
+    "n",
+    "presence_penalty",
+    "frequency_penalty",
+    "user",
+];
+
+/// Return only static labels: arbitrary field names may carry private metadata,
+/// control characters, or unlimited distinct strings. Do not retain or log them.
+fn ignored_field_label(field: &str) -> Option<&'static str> {
+    if KNOWN_COMMON.contains(&field) || field == "prompt" || field == "messages" {
+        return None;
+    }
+    Some(
+        UNSUPPORTED_COMMON
+            .iter()
+            .copied()
+            .find(|known| *known == field)
+            .unwrap_or("unrecognized (name omitted)"),
+    )
+}
+
+/// Warn once for each recognized unsupported option and once for all other names.
 fn warn_ignored(extra: &Map<String, Value>) {
-    static WARNED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    static WARNED: OnceLock<std::sync::Mutex<HashSet<&'static str>>> = OnceLock::new();
     let set = WARNED.get_or_init(Default::default);
     let mut set = set.lock().unwrap_or_else(|e| e.into_inner());
     for k in extra.keys() {
-        if KNOWN_COMMON.contains(&k.as_str()) || k == "prompt" || k == "messages" {
+        let Some(label) = ignored_field_label(k) else {
             continue;
-        }
-        if set.insert(k.clone()) {
-            tracing::warn!("ignoring unsupported request field `{k}` (logged once)");
+        };
+        if set.insert(label) {
+            tracing::warn!(
+                field = label,
+                "ignoring unsupported request field (logged once)"
+            );
         }
     }
 }
@@ -366,6 +408,15 @@ async fn run_generation(
     prompt: PromptInput,
     common: &CommonFields,
 ) -> Response {
+    if let Some(model) = &common.model {
+        if model != &st.model_name {
+            return ApiError::bad_request(format!(
+                "only model {:?} is served; attested or other trust tiers are not implemented",
+                st.model_name
+            ))
+            .into_response();
+        }
+    }
     let params = match gen_params(common) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -396,9 +447,8 @@ async fn run_generation(
     match rx.recv().await {
         Some(Event::Started { .. }) => {}
         Some(Event::Error(e)) => return e.into_response(),
-        Some(other) => {
-            return ApiError::internal(format!("unexpected first engine event {other:?}"))
-                .into_response();
+        Some(_) => {
+            return ApiError::internal("unexpected first engine event").into_response();
         }
         None => return ApiError::internal("engine dropped the request").into_response(),
     }
@@ -529,6 +579,52 @@ fn final_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignored_request_field_names_do_not_enter_logs() {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        let mut extra = Map::new();
+        extra.insert("private-field-canary\n\u{1b}[31m".into(), Value::Null);
+        tracing::subscriber::with_default(subscriber, || warn_ignored(&extra));
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            !log.contains("private-field-canary"),
+            "request-controlled field name entered logs: {log:?}"
+        );
+        assert!(
+            !log.contains('\u{1b}'),
+            "request-controlled terminal escape entered logs"
+        );
+    }
+
+    #[test]
+    fn arbitrary_ignored_fields_share_one_static_warning_label() {
+        let labels: HashSet<_> = (0..10_000)
+            .filter_map(|i| ignored_field_label(&format!("private-field-{i}")))
+            .collect();
+        assert_eq!(labels, HashSet::from(["unrecognized (name omitted)"]));
+        assert_eq!(ignored_field_label("tools"), Some("tools"));
+        for supported in ["model", "messages", "prompt", "temperature"] {
+            assert!(ignored_field_label(supported).is_none());
+        }
+    }
 
     #[test]
     fn content_parts_concatenate_text() {

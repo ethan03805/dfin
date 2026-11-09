@@ -186,16 +186,21 @@ impl Route {
 
     /// `Hello` with one hop; `want` is the row width this client expects it to take (first
     /// hop) or to produce (last hop), checked against what it reports.
-    fn hello(&self, conn: &Connection, hop: &StageEndpoint, want: Option<(bool, u32)>) -> Result<String, RouteError> {
+    fn hello(
+        &self,
+        conn: &Connection,
+        hop: &StageEndpoint,
+        want: Option<(bool, u32)>,
+    ) -> Result<String, RouteError> {
         let req = Request::Hello {
             version: PROTOCOL_VERSION,
             model_fingerprint: self.fingerprint.clone(),
             layer_begin: hop.layers.begin,
             layer_end: hop.layers.end,
         };
-        let resp: Response = self
-            .rt
-            .block_on(conn.call(&req, MAX_CONTROL_FRAME, CONTROL_TIMEOUT))?;
+        let resp: Response =
+            self.rt
+                .block_on(conn.call(&req, MAX_CONTROL_FRAME, CONTROL_TIMEOUT))?;
         match resp {
             Response::HelloOk {
                 layer_begin,
@@ -250,8 +255,9 @@ impl Route {
                 format!("hello rejected: {message}"),
             )),
             other => Err(RouteError::Protocol(format!(
-                "stage {}: unexpected hello reply {other:?}",
-                hop.addr
+                "stage {}: unexpected hello reply {}",
+                hop.addr,
+                other.kind()
             ))),
         }
     }
@@ -318,9 +324,9 @@ impl Route {
                         node_id: *self.hops[0].node_id.as_bytes(),
                     },
                 };
-                let r: Response = self
-                    .rt
-                    .block_on(c.call(&open, MAX_CONTROL_FRAME, SETUP_TIMEOUT))?;
+                let r: Response =
+                    self.rt
+                        .block_on(c.call(&open, MAX_CONTROL_FRAME, SETUP_TIMEOUT))?;
                 match r {
                     Response::Ack => {}
                     Response::Error { code, message } => {
@@ -328,16 +334,18 @@ impl Route {
                     }
                     other => {
                         return Err(RouteError::Protocol(format!(
-                            "relay {}: unexpected reply {other:?}",
-                            relay.addr
+                            "relay {}: unexpected reply {}",
+                            relay.addr,
+                            other.kind()
                         )))
                     }
                 }
                 c
             }
-            _ => self
-                .rt
-                .block_on(self.endpoint.connect(&self.hops[0].addr, self.hops[0].node_id))?,
+            _ => self.rt.block_on(
+                self.endpoint
+                    .connect(&self.hops[0].addr, self.hops[0].node_id),
+            )?,
         };
         self.backends[0] = self.hello(&first, &self.hops[0], Some((true, self.width_in)))?;
         let last = match &self.policy {
@@ -346,7 +354,9 @@ impl Route {
             ReturnPolicy::Direct if n == 1 => Some(first.clone()),
             ReturnPolicy::Direct => {
                 let hop = &self.hops[n - 1];
-                let c = self.rt.block_on(self.endpoint.connect(&hop.addr, hop.node_id))?;
+                let c = self
+                    .rt
+                    .block_on(self.endpoint.connect(&hop.addr, hop.node_id))?;
                 self.backends[n - 1] = self.hello(&c, hop, Some((false, self.width_out)))?;
                 Some(c)
             }
@@ -374,7 +384,8 @@ impl Route {
             }
             other => {
                 return Err(RouteError::Protocol(format!(
-                    "unexpected route setup reply {other:?}"
+                    "unexpected route setup reply {}",
+                    other.kind()
                 )))
             }
         }
@@ -441,6 +452,12 @@ impl Route {
             self.counters.ping_ms = best;
             tracing::info!(addr = %self.hops[0].addr, ping_ms = format!("{best:.2}"), "first hop ping");
         }
+    }
+
+    /// Begin a new identity context; no existing connection survives the change.
+    pub fn replace_endpoint(&mut self, endpoint: Endpoint) {
+        self.disconnect();
+        self.endpoint = endpoint;
     }
 
     /// Tear the route down, best effort, and forget the connections.
@@ -543,7 +560,9 @@ impl Route {
                 let fut = async {
                     let (mut send, mut recv) = first.open_bi().await?;
                     write_frame(&mut send, &req).await?;
-                    send.finish().map_err(NetError::from)?;
+                    tokio::io::AsyncWriteExt::shutdown(&mut send)
+                        .await
+                        .map_err(NetError::from)?;
                     let mut ack_pending = true;
                     loop {
                         tokio::select! {
@@ -594,7 +613,8 @@ impl Route {
             }
             Response::Error { code, message } => Err(stage_err(&first_addr, code, message)),
             other => Err(RouteError::Protocol(format!(
-                "unexpected forward reply {other:?}"
+                "unexpected forward reply {}",
+                other.kind()
             ))),
         }
     }
@@ -612,7 +632,10 @@ impl Route {
         match r? {
             Response::Ack => Ok(()),
             Response::Error { code, message } => Err(stage_err(&self.hops[0].addr, code, message)),
-            other => Err(RouteError::Protocol(format!("unexpected reply {other:?}"))),
+            other => Err(RouteError::Protocol(format!(
+                "unexpected reply {}",
+                other.kind()
+            ))),
         }
     }
 
@@ -630,7 +653,6 @@ impl Route {
         let route = self.route_id;
         self.control(Request::SessionClose { route, session })
     }
-
 }
 
 impl Drop for Route {

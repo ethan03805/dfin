@@ -22,7 +22,7 @@ ping -n 10 "$HOST" 2>/dev/null | tail -2 || ping -c 10 "$HOST" | tail -2
 
 echo "### local stage $N:$LAST"
 KEY=lan-stage.key
-"$B" stage --model "$MODEL" --layers "$N:$LAST" --listen 127.0.0.1:7002 --identity "$KEY" --n-gpu-layers -1 --cpu-tensors exps ${STAGE_ARGS:-} \
+"$B" --network direct stage --model "$MODEL" --layers "$N:$LAST" --listen 127.0.0.1:7002 --identity "$KEY" --n-gpu-layers -1 --cpu-tensors exps ${STAGE_ARGS:-} \
     --n-ctx 8192 --n-seq-max 2 --act-dtype f16 --log info > lan-stage.log 2>&1 &
 STAGEPID=$!
 for i in $(seq 1 300); do grep -q "stage ready" lan-stage.log 2>/dev/null && break; sleep 1; done
@@ -32,7 +32,7 @@ LOCAL_ID=$(strip < lan-stage.log | sed -n 's/.*node id \([0-9a-f]\{64\}\).*/\1/p
 RET_ARGS="--return ${RETURN:-direct}"
 [ -n "${RELAY:-}" ] && RET_ARGS="--relay $RELAY"
 echo "### client: head 0:1 -> $REMOTE=1:$N -> 127.0.0.1:7002/$LOCAL_ID=$N:$LAST -> tail $LAST:end ($RET_ARGS)"
-"$B" client --model "$MODEL" --head 0:1 --tail "$LAST:end" --stage "$REMOTE=1:$N" --stage "127.0.0.1:7002/$LOCAL_ID=$N:$LAST" $RET_ARGS \
+"$B" --network direct client --model "$MODEL" --head 0:1 --tail "$LAST:end" --stage "$REMOTE=1:$N" --stage "127.0.0.1:7002/$LOCAL_ID=$N:$LAST" $RET_ARGS \
     --listen $API --n-gpu-layers -1 --cpu-tensors exps --max-sessions 2 --n-ctx 8192 --act-dtype f16 --log info > lan-client.log 2>&1 &
 CLIENTPID=$!
 for i in $(seq 1 180); do curl.exe -s "http://$API/health" >/dev/null 2>&1 && break; sleep 1; done
@@ -48,7 +48,7 @@ if [ "${QUICK:-0}" = "1" ]; then
     exit 0
 fi
 echo "### bench: local monolithic, local in-process split, remote pipeline"
-"$B" bench --model "$MODEL" --split "1,$N,$LAST" --prompt-tokens "$PROMPT" --gen-tokens "$GEN" --n-gpu-layers -1 --cpu-tensors exps \
+"$B" --network direct bench --model "$MODEL" --split "1,$N,$LAST" --prompt-tokens "$PROMPT" --gen-tokens "$GEN" --n-gpu-layers -1 --cpu-tensors exps \
     --act-dtype f16 --api-url "http://$API" --log warn 2>&1 | strip | grep -E "^\| |^model:|^layer-range"
 
 echo "### a longer generation through the LAN pipeline (128 tokens)"

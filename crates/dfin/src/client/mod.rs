@@ -7,7 +7,7 @@
 //! * [`engine`]: the dedicated engine thread (llama contexts, stage connections,
 //!   sessions with prefix caching, the generation loop).
 //! * [`http`]: axum handlers that submit jobs to the engine and relay its events.
-//! * [`route`]: the chain of stages, set up and driven over the QUIC transport.
+//! * [`route`]: the chain of stages over Tor/TLS or explicit direct QUIC.
 //! * [`sampling`], [`text`]: sampler, UTF-8 accumulation and stop strings.
 
 pub mod directory;
@@ -19,11 +19,11 @@ mod text;
 
 use crate::config::{LayerRange, RouteConfig, StageEndpoint};
 use anyhow::Context as _;
-pub use route::ReturnPolicy;
 use clap::Args;
 use dfin_llama::{FlashAttn, KvType};
 use dfin_proto::ActDtype;
 use parking_lot::Mutex;
+pub use route::ReturnPolicy;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -149,7 +149,15 @@ fn parse_flash_attn(s: &str) -> Result<FlashAttn, String> {
     }
 }
 
-pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
+pub async fn run(args: ClientArgs, network: crate::network::Network) -> anyhow::Result<()> {
+    network.listener(&args.listen)?;
+    anyhow::ensure!(
+        !network.private() || args.region.is_none(),
+        "region fences are unavailable in strict anonymity mode"
+    );
+    for target in args.hub.iter().chain(args.relay.iter()) {
+        network.target(&target.addr)?;
+    }
     let (model_path, head, tail, stages) = match &args.route {
         Some(path) => {
             let cfg = RouteConfig::from_toml_file(path)?;
@@ -170,17 +178,24 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
             args.stages.clone(),
         ),
     };
+    for stage in &stages {
+        network.target(&stage.addr)?;
+    }
     let resolved = crate::shards::resolve_model(&model_path)?;
-    let model_name = args.model_name.clone().unwrap_or_else(|| match &resolved.manifest {
-        Some(m) => m.model_name.clone(),
-        None => model_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "dfin".into()),
-    });
+    let model_name = args
+        .model_name
+        .clone()
+        .unwrap_or_else(|| match &resolved.manifest {
+            Some(m) => m.model_name.clone(),
+            None => model_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "dfin".into()),
+        });
     let model_path = resolved.gguf.clone();
 
     let cfg = engine::EngineConfig {
+        network,
         model_path,
         fingerprint: resolved.fingerprint.clone(),
         head,
@@ -207,6 +222,9 @@ pub async fn run(args: ClientArgs) -> anyhow::Result<()> {
     };
     let stats = Arc::new(Mutex::new(engine::Stats::default()));
     let (jobs, info) = engine::spawn(cfg, stats.clone(), args.queue).await?;
+    if info.return_mode == "relay" && info.route.iter().any(|r| r.kind == "stage") {
+        tracing::warn!("the selected dfin relay can inspect model states; Tor hides network addresses, not those states from the relay");
+    }
     tracing::info!(
         model = %model_name,
         route = %info.route.iter().map(|r| r.layers.clone()).collect::<Vec<_>>().join(" -> "),

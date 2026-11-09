@@ -2,15 +2,18 @@
 
 Pipeline-parallel inference of large open models across several machines, with the
 privacy-relevant pieces (token embedding, first layers, last layer, LM head) running on
-the user's own machine, over an encrypted chain in which no node learns who is asking or
-the whole route. The aim is a network of strangers' hardware that keeps serving frontier
+the user's own machine, over an authenticated chain with sealed per-hop routes.
+Tor is the default transport; inference nodes still receive potentially revealing model states.
+The aim is a network of strangers' hardware that keeps serving frontier
 open-weight models if hosted endpoints for them disappear.
 
 **What exists and what does not: [STATUS.md](STATUS.md).** In short: one LAN pod works
 and has been measured on a real model across two machines; the encrypted chain (node
 keys, QUIC, relays, a signed directory, cloaked nodes, weight shards, region fencing,
 fuzzed decoders) is built and tested, with failover of a live session still to do; trust,
-money and scale have not started.
+money and scale have not started. **Strict anonymity setup and limits:
+[docs/anonymity.md](docs/anonymity.md).** Existing LAN examples below require explicit
+`--network direct`, which disables anonymity.
 
 Design: [docs/design-v0.2.md](docs/design-v0.2.md) (threat model, trust tiers, attested
 and open nodes, anonymity, money, phases), with the model physics in
@@ -26,7 +29,7 @@ and open nodes, anonymity, money, phases), with the model physics in
 | `crates/dfin-llama-sys` | Raw bindings to the patched libllama (bindgen, prebuilt DLLs) |
 | `crates/dfin-llama` | Safe wrapper: `Model` (full or partial), `Context`, tokenizer, chat templates |
 | `crates/dfin-proto` | Wire protocol: postcard frames, f32/f16 activations, routes, sealed hop records |
-| `crates/dfin-net` | Node identities, QUIC with certificates bound to node keys, sealed boxes |
+| `crates/dfin-net` | Node identities, strict Tor/TLS/yamux, explicit direct QUIC, sealed boxes |
 | `crates/dfin` | The `dfin` binary: `stage`, `client`, `relay`, `hub`, `probe`, `fetch`, `pod`, `bench` |
 | `crates/dfin-fuzz` | Fuzz targets for every wire decoder, run as ordinary tests everywhere and under libFuzzer through `fuzz/` |
 | `tools/` | Synthetic test-model generators (random weights, valid structure) and the shard tool |
@@ -39,18 +42,18 @@ and open nodes, anonymity, money, phases), with the model physics in
 agent framework (OpenCode, Hermes, curl)
         │  OpenAI API, localhost
         ▼
- dfin client ── head: embedding + layers [0,a)      (user's machine)
-        │  hidden states, f16, QUIC with pinned node keys
-        │  (optionally through a dfin relay, so no stage sees the client's address)
+ dfin --network direct client ── head: embedding + layers [0,a)      (user's machine)
+        │  hidden states, f16, Tor + TLS with pinned node keys
+        │  (optionally through another dfin --network direct relay)
         ▼
- dfin stage  ── layers [a,b)                         (node)
+ dfin --network direct stage  ── layers [a,b)                         (node)
         │  stage dials the next stage; each knows only its neighbours
         ▼
- dfin stage  ── layers [b,c)                         (node)
+ dfin --network direct stage  ── layers [b,c)                         (node)
         │  result straight back to the client, or via the relay, or back along the chain
         ▼
- dfin client ── tail: layers [c,n) + norm + LM head  (user's machine)
-                sampling, prefix cache, streaming
+ dfin --network direct client ── tail: layers [c,n) + norm + LM head  (user's machine)
+                sampling, streaming (prefix reuse only in explicit direct mode)
 ```
 
 Every node has an Ed25519 key; its public key is the node id, which clients pin when
@@ -77,7 +80,7 @@ fetch fails, run `git submodule update --init` without `--shallow-submodules`.
 ## Build (macOS and Linux)
 
 Prerequisites: a C++ toolchain (`xcode-select --install` on macOS; gcc or clang on
-Linux), CMake 3.21+, Rust 1.85+ (`rustup`). On Apple Silicon the Metal backend is on
+Linux), CMake 3.21+, Rust 1.92+ (`rustup`). On Apple Silicon the Metal backend is on
 by default; on Linux pass `GGML_VULKAN=ON` or `GGML_CUDA=ON` to the script for a GPU.
 
 ```bash
@@ -112,7 +115,7 @@ on the submodule commit and the patch, so only changes to either rebuild it.
 
 ## Build (Windows)
 
-Prerequisites: Visual Studio 2022 with C++ tools, CMake, Rust 1.85+, Python 3.10+,
+Prerequisites: Visual Studio 2022 with C++ tools, CMake, Rust 1.92+, Python 3.10+,
 and the Vulkan SDK for AMD/Intel/NVIDIA GPUs through Vulkan. Keep the checkout on a
 short path: MSVC breaks beyond 260-character paths. A `subst` drive works:
 
@@ -166,7 +169,7 @@ CI runs every target for a short time on each push; anything it finds lands in
 
 ```powershell
 # head = layers 0:2 on the client, one stage 2:5, tail 5:8 on the client
-dfin pod --model models\tiny-llama-f32.gguf --split 2,5 --listen 127.0.0.1:8080
+dfin --network direct pod --model models\tiny-llama-f32.gguf --split 2,5 --listen 127.0.0.1:8080
 ```
 
 Or by hand, one process per machine. Each stage prints its node id at startup (the key
@@ -174,9 +177,9 @@ lives in `--identity`, default `dfin-stage.key`, created on first run); the clie
 every stage as `host:port/<node id>=a:b` and refuses any other key:
 
 ```powershell
-dfin stage  --model model.gguf --layers 3:40  --listen 0.0.0.0:7001 --identity node.key --n-gpu-layers -1 --cpu-tensors exps --mlock
-dfin stage  --model model.gguf --layers 40:77 --listen 0.0.0.0:7001 --identity node.key --n-gpu-layers -1 --cpu-tensors exps --mlock
-dfin client --model model.gguf --head 0:3 --tail 77:end --stage 192.168.1.10:7001/<id1>=3:40 --stage 192.168.1.11:7001/<id2>=40:77 --listen 127.0.0.1:8080
+dfin --network direct stage  --model model.gguf --layers 3:40  --listen 0.0.0.0:7001 --identity node.key --n-gpu-layers -1 --cpu-tensors exps --mlock
+dfin --network direct stage  --model model.gguf --layers 40:77 --listen 0.0.0.0:7001 --identity node.key --n-gpu-layers -1 --cpu-tensors exps --mlock
+dfin --network direct client --model model.gguf --head 0:3 --tail 77:end --stage 192.168.1.10:7001/<id1>=3:40 --stage 192.168.1.11:7001/<id2>=40:77 --listen 127.0.0.1:8080
 ```
 
 Stages are QUIC over UDP: open the UDP port, not a TCP one. The client dials only the
@@ -187,22 +190,22 @@ link crossing per stage. To hide the client's address from every stage, run a re
 name it:
 
 ```powershell
-dfin relay  --listen 0.0.0.0:7000 --identity relay.key
-dfin client ... --relay 203.0.113.5:7000/<relay id>
+dfin --network direct relay  --listen 0.0.0.0:7000 --identity relay.key
+dfin --network direct client ... --relay 203.0.113.5:7000/<relay id>
 ```
 
 The relay pipes streams between the client and the first stage and between the last stage
 and the client; it sees addresses and ciphertext, never a route record or an activation
-in a form it can use. `dfin pod --relay` and `dfin bench --relay` start one locally.
+in a form it can use. `dfin --network direct pod --relay` and `dfin --network direct bench --relay` start one locally.
 
 ### Finding stages through a hub
 
 Instead of naming every stage, run a hub and let stages announce themselves:
 
 ```powershell
-dfin hub    --listen 0.0.0.0:7100 --identity hub.key --http 127.0.0.1:7180
-dfin stage  ... --hub 203.0.113.9:7100/<hub id> --advertise 198.51.100.4:7001
-dfin client --model model.gguf --head 0:3 --tail 77:end --hub 203.0.113.9:7100/<hub id> --listen 127.0.0.1:8080
+dfin --network direct hub    --listen 0.0.0.0:7100 --identity hub.key --http 127.0.0.1:7180
+dfin --network direct stage  ... --hub 203.0.113.9:7100/<hub id> --advertise 198.51.100.4:7001
+dfin --network direct client --model model.gguf --head 0:3 --tail 77:end --hub 203.0.113.9:7100/<hub id> --listen 127.0.0.1:8080
 ```
 
 A stage signs a record of what it serves and announces it every minute; the hub checks
@@ -222,8 +225,8 @@ three shards and a client holding the whole set agree on what model it is.
 
 ```powershell
 .venv\Scripts\python.exe tools\shard_gguf.py model.gguf --out shards\ --seed https://example.org/shards
-dfin stage  --model shards\model.manifest.json --layers 40:77 --fetch --hub ... --identity node.key
-dfin fetch  --manifest shards\model.manifest.json --layers 0:3 --hub ...
+dfin --network direct stage  --model shards\model.manifest.json --layers 40:77 --fetch --hub ... --identity node.key
+dfin --network direct fetch  --manifest shards\model.manifest.json --layers 0:3 --hub ...
 ```
 
 A stage given a manifest and `--fetch` downloads the shards its layers need before
@@ -239,8 +242,8 @@ the embedding and output shards).
 An operator who does not want to expose an address runs the stage cloaked:
 
 ```powershell
-dfin relay  --listen 203.0.113.5:7000 --identity relay.key --port-range 7200-7299
-dfin stage  --model model.gguf --layers 40:77 --identity node.key --cloak 203.0.113.5:7000/<relay id> --hub ... --mlock
+dfin --network direct relay  --listen 203.0.113.5:7000 --identity relay.key --port-range 7200-7299
+dfin --network direct stage  --model model.gguf --layers 40:77 --identity node.key --cloak 203.0.113.5:7000/<relay id> --hub ... --mlock
 ```
 
 The stage dials the relay, the relay allocates a public port for it and forwards that
@@ -257,10 +260,10 @@ Where a node's network interface is can be bounded by timing from several places
 probes in the places you care about, tell the hub about them, and let clients choose:
 
 ```powershell
-dfin probe  --listen 0.0.0.0:7300 --identity probe-east.key --region us --allow <hub id>
-dfin probe  --listen 0.0.0.0:7300 --identity probe-west.key --region us --allow <hub id>
-dfin hub    ... --probe 198.51.100.7:7300/<probe-east id> --probe 203.0.113.40:7300/<probe-west id>
-dfin client ... --hub ... --region us:50
+dfin --network direct probe  --listen 0.0.0.0:7300 --identity probe-east.key --region us --allow <hub id>
+dfin --network direct probe  --listen 0.0.0.0:7300 --identity probe-west.key --region us --allow <hub id>
+dfin --network direct hub    ... --probe 198.51.100.7:7300/<probe-east id> --probe 203.0.113.40:7300/<probe-west id>
+dfin --network direct client ... --hub ... --region us:50
 ```
 
 Each probe pings every announcing node on the hub's request and reports the best round
@@ -289,7 +292,7 @@ shows the route with each stage's node id, the chain's round-trip and setup time
 return mode, per-stage compute times, and prefix-cache hits.
 
 ```powershell
-dfin bench --model models\tiny-llama-f32.gguf --split 3,6 --gen-tokens 64
+dfin --network direct bench --model models\tiny-llama-f32.gguf --split 3,6 --gen-tokens 64
 ```
 
 prints monolithic versus in-process split versus local-pod-over-TCP decode speed.

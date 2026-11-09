@@ -4,16 +4,19 @@
 
 use crate::client::directory;
 use crate::config::{parse_node_addr, LayerRange};
-use crate::shards::{have_split, sha256_file, Manifest, Split};
-use anyhow::{bail, Context as _};
+use crate::shards::{have_split, sha256_file, shard_path, Manifest, Split};
+use anyhow::bail;
 use clap::Args;
-use dfin_net::directory::verify_record;
+use dfin_net::directory::{validate_record, verify_record};
 use dfin_net::{Endpoint, NodeId, NodeKey};
-use dfin_proto::{NextHop, Request, Response, MAX_SHARD_CHUNK, PROTOCOL_VERSION};
+use dfin_proto::{NextHop, Request, Response, MAX_SHARD_CHUNK};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
+
+#[cfg(test)]
+mod privacy_tests;
 
 #[derive(Args, Debug)]
 pub struct FetchArgs {
@@ -38,7 +41,14 @@ pub struct FetchArgs {
     pub wait: u64,
 }
 
-pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
+pub async fn run(args: FetchArgs, network: crate::network::Network) -> anyhow::Result<()> {
+    if let Some(hub) = &args.hub {
+        network.target(&hub.addr)?;
+    }
+    anyhow::ensure!(
+        !network.private() || args.seeds.is_empty(),
+        "HTTP seeds are disabled in strict anonymity mode; use onion peers or offline files"
+    );
     let manifest = Manifest::load(&args.manifest)?;
     let dir = args
         .out
@@ -47,7 +57,7 @@ pub async fn run(args: FetchArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
     let (begin, end) = args.layers.map(|r| (r.begin, r.end)).unwrap_or((0, -1));
-    let endpoint = Endpoint::client(NodeKey::generate())?;
+    let endpoint = network.client(NodeKey::generate())?;
     let n = fetch_missing(
         &endpoint,
         &manifest,
@@ -101,11 +111,31 @@ pub async fn fetch_missing(
         needed.len(),
         dir.display()
     );
-    let mut all_seeds: Vec<String> = manifest.seeds.clone();
-    all_seeds.extend(seeds.iter().cloned());
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()?;
+    let (all_seeds, http) = if endpoint.is_private() {
+        anyhow::ensure!(
+            seeds.is_empty(),
+            "HTTP seeds are disabled in strict anonymity mode"
+        );
+        anyhow::ensure!(
+            hub.is_some(),
+            "strict shard fetching requires an onion hub; manifest HTTP seeds are disabled"
+        );
+        if !manifest.seeds.is_empty() {
+            info!("ignoring manifest HTTP seeds in strict anonymity mode");
+        }
+        (Vec::new(), None)
+    } else {
+        let mut all_seeds = manifest.seeds.clone();
+        all_seeds.extend(seeds.iter().cloned());
+        (
+            all_seeds,
+            Some(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(600))
+                    .build()?,
+            ),
+        )
+    };
     let deadline = Instant::now() + wait;
     let mut fetched = 0usize;
     loop {
@@ -121,7 +151,17 @@ pub async fn fetch_missing(
         };
         let mut still = Vec::new();
         for split in missing {
-            if fetch_one(endpoint, &http, manifest, dir, &split, &peers, &all_seeds).await {
+            if fetch_one(
+                endpoint,
+                http.as_ref(),
+                manifest,
+                dir,
+                &split,
+                &peers,
+                &all_seeds,
+            )
+            .await
+            {
                 fetched += 1;
             } else {
                 still.push(split);
@@ -160,12 +200,7 @@ fn peers_for(dir: &dfin_proto::Directory, model_id: &str) -> Vec<Peer> {
     dir.entries
         .iter()
         .filter_map(|e| verify_record(&e.record).ok())
-        .filter(|r| {
-            r.model_fingerprint == model_id
-                && r.protocol == PROTOCOL_VERSION
-                && r.expires_at() > now
-                && !r.addrs.is_empty()
-        })
+        .filter(|r| r.model_fingerprint == model_id && validate_record(r, now).is_ok())
         .map(|r| Peer {
             addr: r.addrs[0].clone(),
             id: NodeId(r.node_id),
@@ -178,7 +213,7 @@ fn peers_for(dir: &dfin_proto::Directory, model_id: &str) -> Vec<Peer> {
 /// Try the peers that should hold `split` first, then every other peer, then the seeds.
 async fn fetch_one(
     endpoint: &Endpoint,
-    http: &reqwest::Client,
+    http: Option<&reqwest::Client>,
     manifest: &Manifest,
     dir: &Path,
     split: &Split,
@@ -205,6 +240,9 @@ async fn fetch_one(
         }
     }
     for seed in seeds {
+        let Some(http) = http else {
+            return false;
+        };
         match from_seed(http, dir, split, seed).await {
             Ok(()) => {
                 info!(shard = %split.file, from = %seed, "fetched from a seed");
@@ -216,18 +254,87 @@ async fn fetch_one(
     false
 }
 
-/// Download to `<file>.part`, check the hash, then rename into place.
-async fn finish(dir: &Path, split: &Split, part: &Path) -> anyhow::Result<()> {
+/// Exclusive temporary file owned by one download. Cancellation and every error
+/// path remove only this file, never another attempt's partial work.
+struct PartialDownload {
+    path: PathBuf,
+    file: Option<tokio::fs::File>,
+}
+
+impl Drop for PartialDownload {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl PartialDownload {
+    async fn new(dir: &Path) -> anyhow::Result<Self> {
+        let dir = dir.to_path_buf();
+        // The blocking job returns an owning guard. Even if its awaiter is
+        // cancelled during creation, the completed job's discarded result cleans up.
+        tokio::task::spawn_blocking(move || -> std::io::Result<Self> {
+            for _ in 0..8 {
+                let path = dir.join(format!(
+                    ".dfin-download-{:032x}.part",
+                    rand::random::<u128>()
+                ));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                match options.open(&path) {
+                    Ok(file) => {
+                        return Ok(Self {
+                            path,
+                            file: Some(tokio::fs::File::from_std(file)),
+                        })
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "cannot reserve a temporary download file",
+            ))
+        })
+        .await?
+        .map_err(Into::into)
+    }
+
+    fn writer(&mut self) -> &mut tokio::fs::File {
+        self.file.as_mut().expect("download file is open")
+    }
+}
+
+struct DownloadConnection(dfin_net::Connection);
+impl Drop for DownloadConnection {
+    fn drop(&mut self) {
+        self.0.close("download ended");
+    }
+}
+
+/// Check exact size and digest, then rename the owned temporary file into place.
+async fn finish(dir: &Path, split: &Split, mut partial: PartialDownload) -> anyhow::Result<()> {
+    let destination = shard_path(dir, &split.file)?;
+    partial.writer().flush().await?;
+    drop(partial.file.take());
+    if tokio::fs::metadata(&partial.path).await?.len() != split.size {
+        bail!("size mismatch for {}", split.file);
+    }
     let got = tokio::task::spawn_blocking({
-        let part = part.to_path_buf();
+        let part = partial.path.clone();
         move || sha256_file(&part)
     })
     .await??;
     if got != split.sha256 {
-        let _ = tokio::fs::remove_file(part).await;
         bail!("hash mismatch for {}: got {got}", split.file);
     }
-    tokio::fs::rename(part, dir.join(&split.file)).await?;
+    tokio::fs::rename(&partial.path, destination).await?;
     Ok(())
 }
 
@@ -238,52 +345,45 @@ async fn from_peer(
     split: &Split,
     peer: &Peer,
 ) -> anyhow::Result<()> {
+    shard_path(dir, &split.file)?;
     let conn = endpoint.connect(&peer.addr, peer.id).await?;
-    let part = dir.join(format!("{}.part", split.file));
-    let mut file = tokio::fs::File::create(&part).await?;
+    let _connection = DownloadConnection(conn.clone());
+    let mut partial = PartialDownload::new(dir).await?;
     let mut offset = 0u64;
     let limit = MAX_SHARD_CHUNK + 65_536;
-    let result: anyhow::Result<()> = async {
-        while offset < split.size {
-            let len = (split.size - offset).min(MAX_SHARD_CHUNK as u64) as u32;
-            let r: Response = conn
-                .call(
-                    &Request::ShardGet {
-                        model_id: manifest.model_id.clone(),
-                        split: split.no,
-                        offset,
-                        len,
-                    },
-                    limit,
-                    Duration::from_secs(120),
-                )
-                .await?;
-            match r {
-                Response::Shard { total, data } => {
-                    if total != split.size {
-                        bail!("peer reports {total} bytes, manifest says {}", split.size);
-                    }
-                    if data.is_empty() {
-                        bail!("peer sent no data at offset {offset}");
-                    }
-                    file.write_all(&data).await?;
-                    offset += data.len() as u64;
+    while offset < split.size {
+        let len = (split.size - offset).min(MAX_SHARD_CHUNK as u64) as u32;
+        let r: Response = conn
+            .call(
+                &Request::ShardGet {
+                    model_id: manifest.model_id.clone(),
+                    split: split.no,
+                    offset,
+                    len,
+                },
+                limit,
+                Duration::from_secs(120),
+            )
+            .await?;
+        match r {
+            Response::Shard { total, data } => {
+                if total != split.size {
+                    bail!("peer reports {total} bytes, manifest says {}", split.size);
                 }
-                Response::Error { code, message } => bail!("{code:?}: {message}"),
-                other => bail!("unexpected reply {other:?}"),
+                if data.is_empty() {
+                    bail!("peer sent no data at offset {offset}");
+                }
+                if data.len() as u64 > len as u64 {
+                    bail!("peer exceeded the requested shard range");
+                }
+                partial.writer().write_all(&data).await?;
+                offset += data.len() as u64;
             }
+            Response::Error { code, message } => bail!("{code:?}: {message}"),
+            other => bail!("unexpected reply {}", other.kind()),
         }
-        file.flush().await?;
-        Ok(())
     }
-    .await;
-    conn.close("done");
-    drop(file);
-    if let Err(e) = result {
-        let _ = tokio::fs::remove_file(&part).await;
-        return Err(e);
-    }
-    finish(dir, split, &part).await
+    finish(dir, split, partial).await
 }
 
 async fn from_seed(
@@ -292,24 +392,22 @@ async fn from_seed(
     split: &Split,
     seed: &str,
 ) -> anyhow::Result<()> {
+    shard_path(dir, &split.file)?;
     let url = format!("{}/{}", seed.trim_end_matches('/'), split.file);
     let mut resp = http.get(&url).send().await?.error_for_status()?;
-    let part = dir.join(format!("{}.part", split.file));
-    let mut file = tokio::fs::File::create(&part).await?;
-    let result: anyhow::Result<()> = async {
-        while let Some(chunk) = resp.chunk().await? {
-            file.write_all(&chunk).await?;
+    if resp.content_length().is_some_and(|size| size != split.size) {
+        bail!("seed Content-Length does not match the manifest");
+    }
+    let mut partial = PartialDownload::new(dir).await?;
+    let mut received = 0u64;
+    while let Some(chunk) = resp.chunk().await? {
+        if chunk.len() as u64 > split.size - received {
+            bail!("seed exceeded the declared shard size");
         }
-        file.flush().await?;
-        Ok(())
+        partial.writer().write_all(&chunk).await?;
+        received += chunk.len() as u64;
     }
-    .await;
-    drop(file);
-    if let Err(e) = result {
-        let _ = tokio::fs::remove_file(&part).await;
-        return Err(e).with_context(|| format!("downloading {url}"));
-    }
-    finish(dir, split, &part).await
+    finish(dir, split, partial).await
 }
 
 /// Serve a shard range from `dir` for a `ShardGet`, or explain why not.
@@ -345,4 +443,101 @@ pub async fn serve_shard(
     let mut data = vec![0u8; len];
     f.read_exact(&mut data).await.map_err(|e| e.to_string())?;
     Ok((split.size, data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dfin_net::{directory::sign_record, NodeKey};
+    use dfin_proto::{ActDtype, Directory, DirectoryEntry, NodeRecord, PROTOCOL_VERSION};
+
+    #[tokio::test]
+    async fn manifest_cannot_expose_a_file_outside_the_model_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "dfin-shard-boundary-{:016x}",
+            rand::random::<u64>()
+        ));
+        let dir = root.join("model");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only a test canary is read; this never touches a real identity or secret.
+        let canary = b"private test data";
+        std::fs::write(root.join("private.gguf"), canary).unwrap();
+        let mut manifest = Manifest {
+            format: crate::shards::FORMAT.into(),
+            model_name: "test".into(),
+            arch: "llama".into(),
+            n_layer: 2,
+            first: "../private.gguf".into(),
+            splits: vec![Split {
+                no: 0,
+                file: "../private.gguf".into(),
+                size: canary.len() as u64,
+                sha256: "0".repeat(64),
+                kind: "meta".into(),
+                layer: None,
+                tensors: vec![],
+            }],
+            seeds: vec![],
+            model_id: String::new(),
+        };
+        manifest.model_id = manifest.compute_id();
+        let path = dir.join("test.manifest.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let loaded = Manifest::load(&path);
+        let served = serve_shard(&manifest, &dir, &manifest.model_id, 0, 0, 64).await;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(root.join("private.gguf")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        assert!(
+            served.is_err(),
+            "served a file outside the model directory: {served:?}"
+        );
+        assert!(
+            loaded.is_err(),
+            "accepted a manifest with an escaping file path"
+        );
+    }
+
+    #[test]
+    fn shard_discovery_rejects_signed_records_with_unbounded_lifetimes() {
+        let key = NodeKey::generate();
+        let now = crate::hub::unix_now();
+        let mut record = NodeRecord {
+            node_id: key.id().0,
+            addrs: vec!["127.0.0.1:7001".into()],
+            model_fingerprint: "fp".into(),
+            model_name: "tiny".into(),
+            layer_begin: 2,
+            layer_end: 6,
+            n_layer: 8,
+            n_embd: 64,
+            n_ctx_seq: 512,
+            n_seq_max: 2,
+            act_dtype: ActDtype::F16,
+            backend: String::new(),
+            region: String::new(),
+            protocol: PROTOCOL_VERSION,
+            attested: false,
+            cloaked: false,
+            issued_at: now,
+            ttl_secs: 180,
+        };
+        let directory = |record: &NodeRecord| Directory {
+            hub_id: key.id().0,
+            issued_at: now,
+            entries: vec![DirectoryEntry {
+                record: sign_record(&key, record).unwrap(),
+                hub_rtt_ms: 1.0,
+                seen_at: now,
+                probes: vec![],
+            }],
+        };
+        assert_eq!(peers_for(&directory(&record), "fp").len(), 1);
+        record.issued_at = u64::MAX;
+        assert!(peers_for(&directory(&record), "fp").is_empty());
+        record.issued_at = now;
+        record.ttl_secs = u32::MAX;
+        assert!(peers_for(&directory(&record), "fp").is_empty());
+    }
 }

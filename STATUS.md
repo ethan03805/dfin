@@ -11,6 +11,17 @@ Last updated 7 November 2026. Phase 0 (one LAN pod) is complete. Phase 1 (the
 encrypted chain) is complete except for failover of a live session. Phases 2 (trust and
 money) and 3 (scale) have not started.
 
+Strict Tor anonymity is now the default: onion-only destinations, pinned TLS identities,
+separate discovery/request keys, and no direct fallback. The initial milestone passed
+73 regular tests, wire-decoder fuzzing, and real Tor integration on Windows and Linux
+using a private nine-node Tor network. An ongoing adversarial review has since added
+cancellation, identity, HTTP admission, and relay lifetime regressions; see the
+[review and current test results](docs/privacy-review.md). This does not yet
+provide content confidentiality, verified computation, or anonymous payment credits.
+See [setup and limits](docs/anonymity.md) and [the work log](docs/anonymity-work-log.md).
+The optional application relay can read model states; ordinary Tor routes do not
+require that additional observer. Relay content confidentiality remains unimplemented.
+
 ## Done
 
 | What | Where | How it was checked |
@@ -22,6 +33,7 @@ money) and 3 (scale) have not started.
 | A real model on one machine: GLM-4.7-Flash in four pieces, identical output to the whole model, almost no speed loss in-process | `docs/phase0-findings.md`, `docs/logs/real-model-*.log` | `scripts/real-model-bench.sh`, `scripts/real-model-contention.sh` |
 | Two machines over WiFi: identical output; the gap to one machine is the WiFi round trip | `docs/phase0-findings.md`, `docs/logs/lan-pod-*.log` | `scripts/lan-pod.sh` with a MacBook Air as the second machine |
 | **Phase 1: the encrypted chain** | | |
+| Tor by default: onion-only discovery and inference, authenticated TLS streams, new request identities, no direct fallback, local API protections | `docs/anonymity.md`, `crates/dfin-net/src/stream.rs`, `crates/dfin/src/network.rs` | Privacy regression tests and full tiny-model inference through real Tor on Windows and Linux; `scripts/test-tor-local.py` |
 | Node identities (Ed25519), QUIC with certificates pinned to node keys, sealed per-hop route records, chain forwarding stage to stage, three return modes, `dfin relay` | `crates/dfin-net`, `crates/dfin-proto`, protocol sections 1 to 6 | End-to-end tests in every return mode; GLM-4.7-Flash through the chain with identical text and under a millisecond of chain overhead per token (`docs/phase1-findings.md`) |
 | Linux build, a CPU-only container image, continuous integration | `Dockerfile`, `.github/workflows/ci.yml` | Every push builds and runs the whole suite on Linux |
 | Signed directory: `dfin hub`, node announcements with reachability checks, client-side route choice, a cache for hub outages, rerouting when a stage dies | protocol section 8 | End-to-end test that kills a stage and watches the client move |
@@ -53,7 +65,7 @@ money) and 3 (scale) have not started.
 | **Smaller items, any phase** | | |
 | Tool-call parsing in the OpenAI layer | Requests with `tools` are accepted, calls are not parsed | A parser per chat template |
 | Micro-batching across sessions on a stage | A stage serving several sessions reads its weights once per step instead of once per session; this is the economic engine of the design | A batching scheduler in the stage engine |
-| More than one hub, directory mirroring, fetching the directory through a relay or Tor | One hub is one point of failure and one observer of who asks | Hub peering and a relay path for `DirectoryGet` |
+| More than one hub and directory mirroring | One hub is still one point of failure and one observer of directory queries; fetching over Tor now exists | Hub peering, independent directory sources, and a client selection policy |
 | Probes signing their answers, clients querying probes directly, reputation | The client trusts the hub for everything in the directory today | A signature on each probe answer and a client path to ask probes |
 
 ## Known limitations

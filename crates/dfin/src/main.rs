@@ -16,6 +16,7 @@ mod client;
 mod config;
 mod fetch;
 mod hub;
+mod network;
 mod pod;
 mod probe;
 mod relay;
@@ -31,6 +32,8 @@ use clap::{Parser, Subcommand};
     about = "Decentralized pipeline-parallel inference node"
 )]
 struct Cli {
+    #[command(flatten)]
+    network: network::Network,
     /// Log filter, e.g. `info`, `debug`, `dfin=debug,llama=warn`.
     #[arg(long, env = "DFIN_LOG", default_value = "info", global = true)]
     log: String,
@@ -63,15 +66,31 @@ enum Cmd {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log);
+    let network = cli.network;
+    network.validate()?;
+    if network.private() {
+        tracing::info!("strict Tor mode: onion connections only; no direct fallback");
+    } else {
+        tracing::warn!("direct network mode: IP addresses are exposed; anonymity is disabled");
+    }
     match cli.cmd {
-        Cmd::Stage(args) => stage::run(args).await,
-        Cmd::Client(args) => client::run(args).await,
-        Cmd::Relay(args) => relay::run(args).await,
-        Cmd::Hub(args) => hub::run(args).await,
-        Cmd::Fetch(args) => fetch::run(args).await,
-        Cmd::Probe(args) => probe::run(args).await,
-        Cmd::Pod(args) => pod::run(args).await,
-        Cmd::Bench(args) => bench::run(args).await,
+        Cmd::Stage(args) => stage::run(args, network).await,
+        Cmd::Client(args) => client::run(args, network).await,
+        Cmd::Relay(args) => relay::run(args, network).await,
+        Cmd::Hub(args) => hub::run(args, network).await,
+        Cmd::Fetch(args) => fetch::run(args, network).await,
+        Cmd::Probe(args) => {
+            network.require_direct("probe")?;
+            probe::run(args).await
+        }
+        Cmd::Pod(args) => {
+            network.require_direct("pod")?;
+            pod::run(args).await
+        }
+        Cmd::Bench(args) => {
+            network.require_direct("bench")?;
+            bench::run(args).await
+        }
     }
 }
 

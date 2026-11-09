@@ -5,8 +5,8 @@
 #   git submodule update --init          # vendor/llama.cpp must be checked out
 #   docker build -t dfin .
 #   docker run --rm dfin --help
-#   docker run --rm -v $PWD/models:/models -p 8080:8080 dfin \
-#       pod --model /models/tiny-llama-f32.gguf --split 2,5 --listen 0.0.0.0:8080
+#   docker run --rm -v $PWD/models:/models -p 127.0.0.1:8080:8080 dfin \
+#       --network direct pod --model /models/tiny-llama-f32.gguf --split 2,5 --listen 0.0.0.0:8080
 #
 # Stage 1 builds the vendored, layer-range patched llama.cpp (Release, CPU backend) and
 # the Rust workspace; stage 2 is a Debian slim image with just the `dfin` binary, the
